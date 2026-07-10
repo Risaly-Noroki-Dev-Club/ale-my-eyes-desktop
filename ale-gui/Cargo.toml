@@ -24,8 +24,6 @@ snow = "0.9"
 tokio-tungstenite = "0.24"
 uuid = { version = "1", features = ["v4", "serde"] }
 
-# Desktop-only dependencies (Linux, Windows, macOS)
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 slint = "1.16"
 cpal = "0.15"
 rodio = "0.19"
@@ -37,46 +35,9 @@ local-ip-address = "0.6"
 mdns-sd = "0.11"
 qrcode = "0.14"
 
-# Android-only dependencies
-[target.'cfg(target_os = "android")'.dependencies]
-slint = { version = "1.16", features = ["backend-android-activity-06"] }
-oboe = "0.6"
-jni = "0.21"
-ndk-context = "0.1"
-mdns-sd = "0.11"
-
-# iOS-only dependencies
-[target.'cfg(target_os = "ios")'.dependencies]
-slint = "1.16"
-cpal = "0.15"
-objc2 = "0.6"
-objc2-foundation = "0.3"
-objc2-av-foundation = "0.3"
-
 [[bin]]
 name = "ale-gui"
 path = "src/main.rs"
 
 [build-dependencies]
 slint-build = "1.16"
-
-[package.metadata.android]
-package = "com.alemyeyes"
-build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
-
-[package.metadata.android.sdk]
-min_sdk_version = 26
-target_sdk_version = 34
-
-[package.metadata.android.application]
-label = "Ale, My Eyes!"
-theme = "@android:style/Theme.Material.Light.NoActionBar"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.RECORD_AUDIO"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.MODIFY_AUDIO_SETTINGS"

@@ -1,5 +1,3 @@
-#![cfg_attr(not(target_os = "android"), allow(dead_code))]
-
 use ale_core::remote::RemoteMessage;
 use snow::{Builder, TransportState};
 
@@ -46,19 +44,6 @@ pub fn device_name() -> String {
         .unwrap_or_else(|_| "Ale Device".to_string())
 }
 
-pub fn fingerprint(session_id: &str, code: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(session_id.as_bytes());
-    hasher.update(code.as_bytes());
-    let digest = hasher.finalize();
-    digest[..6]
-        .iter()
-        .map(|byte| format!("{:02X}", byte))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn psk_from_code(code: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -68,24 +53,9 @@ fn psk_from_code(code: &str) -> [u8; 32] {
 }
 
 fn noise_params() -> Result<snow::params::NoiseParams, String> {
-    let params: snow::params::NoiseParams = NOISE_PATTERN
+    NOISE_PATTERN
         .parse()
-        .map_err(|error: snow::Error| error.to_string())?;
-    Ok(params)
-}
-
-pub fn client_handshake_message(code: &str) -> Result<(snow::HandshakeState, Vec<u8>), String> {
-    let psk = psk_from_code(code);
-    let mut noise = Builder::new(noise_params()?)
-        .psk(0, &psk)
-        .build_initiator()
-        .map_err(|error| error.to_string())?;
-    let mut message = vec![0u8; 1024];
-    let len = noise
-        .write_message(&[], &mut message)
-        .map_err(|error| error.to_string())?;
-    message.truncate(len);
-    Ok((noise, message))
+        .map_err(|error: snow::Error| error.to_string())
 }
 
 pub fn server_handshake_reply(
@@ -111,18 +81,4 @@ pub fn server_handshake_reply(
         .into_transport_mode()
         .map_err(|error| error.to_string())?;
     Ok((SecureChannel { transport }, reply))
-}
-
-pub fn client_finish_handshake(
-    mut noise: snow::HandshakeState,
-    server_message: &[u8],
-) -> Result<SecureChannel, String> {
-    let mut scratch = vec![0u8; 1024];
-    noise
-        .read_message(server_message, &mut scratch)
-        .map_err(|error| error.to_string())?;
-    let transport = noise
-        .into_transport_mode()
-        .map_err(|error| error.to_string())?;
-    Ok(SecureChannel { transport })
 }
