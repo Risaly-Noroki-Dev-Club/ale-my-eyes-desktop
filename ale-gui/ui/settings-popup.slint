@@ -1,4 +1,4 @@
-import { LineEdit, Button, CheckBox, ScrollView, Palette } from "std-widgets.slint";
+import { LineEdit, Button, CheckBox, ComboBox, ScrollView, Palette } from "std-widgets.slint";
 import { AppTheme } from "widgets.slint";
 
 export component SettingsPopup inherits Rectangle {
@@ -6,29 +6,35 @@ export component SettingsPopup inherits Rectangle {
     in property <string> api-key: "";
     in property <string> api-url: "";
     in property <string> model: "";
+    in property <string> wire-api: "chat_completions";
+    in property <string> reasoning-effort: "";
+    in property <bool> store-responses: false;
     in property <string> max-tokens-str: "4000";
     in property <bool> auto-speak: true;
     in property <bool> show-api-key: false;
     in property <bool> is-busy: false;
     in property <string> config-path: "";
-    in property <string> remote-address: "";
-    in property <string> remote-code: "";
     in property <string> remote-status: "";
     in property <bool> remote-connected: false;
-    in property <string> remote-pairing-info: "";
+    in property <image> remote-pairing-qr;
+    in property <image> remote-scan-preview;
+    in property <bool> remote-scanning: false;
+    in property <bool> is-mobile: false;
 
     callback provider-changed(string);
     callback api-key-changed(string);
     callback api-url-changed(string);
     callback model-changed(string);
+    callback wire-api-changed(string);
+    callback reasoning-effort-changed(string);
+    callback store-responses-changed(bool);
     callback max-tokens-changed(string);
     callback auto-speak-changed(bool);
     callback toggle-api-key-visible();
     callback save-settings();
     callback test-connection();
-    callback remote-address-changed(string);
-    callback remote-code-changed(string);
-    callback connect-remote();
+    callback scan-remote();
+    callback cancel-remote-scan();
     callback disconnect-remote();
     callback close-settings();
 
@@ -124,6 +130,36 @@ export component SettingsPopup inherits Rectangle {
                         edited(text) => { root.model-changed(text); }
                     }
 
+                    Text {
+                        text: "API 协议";
+                        font-size: AppTheme.base-font - 2px;
+                        color: Palette.foreground.transparentize(0.3);
+                    }
+                    ComboBox {
+                        model: ["chat_completions", "responses"];
+                        current-value: root.wire-api;
+                        selected(value) => { root.wire-api-changed(value); }
+                    }
+
+                    if root.wire-api == "responses" : VerticalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "Reasoning effort（留空使用模型默认值）";
+                            font-size: AppTheme.base-font - 2px;
+                            color: Palette.foreground.transparentize(0.3);
+                        }
+                        ComboBox {
+                            model: ["", "none", "minimal", "low", "medium", "high", "xhigh", "max"];
+                            current-value: root.reasoning-effort;
+                            selected(value) => { root.reasoning-effort-changed(value); }
+                        }
+                        CheckBox {
+                            checked: root.store-responses;
+                            text: "允许 API 服务端存储响应";
+                            toggled => { root.store-responses-changed(self.checked); }
+                        }
+                    }
+
                     // Token 预算
                     Text { text: "Token 预算"; font-size: AppTheme.base-font; font-weight: 600; color: Palette.foreground; }
                     Text {
@@ -155,40 +191,29 @@ export component SettingsPopup inherits Rectangle {
                         color: root.remote-connected ? Palette.accent-background : Palette.foreground.transparentize(0.3);
                         wrap: word-wrap;
                     }
-                    if root.remote-pairing-info != "" : Text {
-                        text: root.remote-pairing-info;
-                        font-size: AppTheme.base-font - 4px;
-                        color: Palette.foreground.transparentize(0.5);
-                        wrap: word-wrap;
+                    if !root.is-mobile : Image {
+                        source: root.remote-pairing-qr;
+                        width: 240px;
+                        height: 240px;
+                        image-fit: contain;
                     }
-                    Text {
-                        text: "桌面地址";
-                        font-size: AppTheme.base-font - 2px;
-                        color: Palette.foreground.transparentize(0.3);
-                    }
-                    LineEdit {
-                        text: root.remote-address;
-                        placeholder-text: "ws://192.168.1.10:37654 或 ale-my-eyes://pair?...";
-                        edited(text) => { root.remote-address-changed(text); }
-                    }
-                    Text {
-                        text: "配对码";
-                        font-size: AppTheme.base-font - 2px;
-                        color: Palette.foreground.transparentize(0.3);
-                    }
-                    LineEdit {
-                        text: root.remote-code;
-                        placeholder-text: "123456";
-                        edited(text) => { root.remote-code-changed(text); }
+                    if root.is-mobile && root.remote-scanning : Image {
+                        source: root.remote-scan-preview;
+                        width: 240px;
+                        height: 180px;
+                        image-fit: cover;
                     }
                     HorizontalLayout {
                         spacing: 8px;
-                        Button {
-                            text: "连接桌面";
-                            enabled: !root.is-busy;
-                            clicked => { root.connect-remote(); }
+                        if root.is-mobile : Button {
+                            text: root.remote-scanning ? "取消扫描" : "扫描二维码";
+                            enabled: root.remote-scanning || !root.is-busy;
+                            clicked => {
+                                if root.remote-scanning { root.cancel-remote-scan(); }
+                                else { root.scan-remote(); }
+                            }
                         }
-                        Button {
+                        if root.is-mobile : Button {
                             text: "断开";
                             enabled: root.remote-connected;
                             clicked => { root.disconnect-remote(); }

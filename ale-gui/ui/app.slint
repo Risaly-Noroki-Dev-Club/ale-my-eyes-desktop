@@ -1,4 +1,4 @@
-import { CompactScreen } from "compact.slint";
+import { PairingScreen } from "pairing-screen.slint";
 import { SettingsPopup } from "settings-popup.slint";
 import { AppTheme } from "widgets.slint";
 import { Palette } from "std-widgets.slint";
@@ -7,9 +7,10 @@ export { AppTheme }
 
 export component AppWindow inherits Window {
     title: "Ale, My Eyes!";
-    preferred-width: 360px;
-    // 移动端需要更多垂直空间（触控友好布局）
-    preferred-height: 280px;
+    preferred-width: 420px;
+    preferred-height: 520px;
+    min-width: 390px;
+    min-height: 500px;
     background: Palette.background;
 
     in-out property <string> status-text: "初始化中...";
@@ -33,15 +34,18 @@ export component AppWindow inherits Window {
     in-out property <string> api-key: "";
     in-out property <string> api-url: "";
     in-out property <string> model: "";
+    in-out property <string> wire-api: "chat_completions";
+    in-out property <string> reasoning-effort: "";
+    in-out property <bool> store-responses: false;
     in-out property <string> max-tokens-str: "4000";
     in-out property <bool> auto-speak: true;
     in-out property <bool> show-api-key: false;
     in-out property <string> config-path: "";
-    in-out property <string> remote-address: "";
-    in-out property <string> remote-code: "";
     in-out property <string> remote-status: "未连接桌面端";
     in-out property <bool> remote-connected: false;
-    in-out property <string> remote-pairing-info: "";
+    in-out property <image> remote-pairing-qr;
+    in-out property <image> remote-scan-preview;
+    in-out property <bool> remote-scanning: false;
     // 由 Rust 侧根据 target_os 设置
     in-out property <bool> is-mobile: false;
 
@@ -55,14 +59,16 @@ export component AppWindow inherits Window {
     callback api-key-changed(string);
     callback api-url-changed(string);
     callback model-changed(string);
+    callback wire-api-changed(string);
+    callback reasoning-effort-changed(string);
+    callback store-responses-changed(bool);
     callback max-tokens-changed(string);
     callback auto-speak-changed(bool);
     callback toggle-api-key-visible();
     callback save-settings();
     callback test-connection();
-    callback remote-address-changed(string);
-    callback remote-code-changed(string);
-    callback connect-remote();
+    callback scan-remote();
+    callback cancel-remote-scan();
     callback disconnect-remote();
 
     // 将 is-mobile 传递给 AppTheme 全局单例
@@ -75,27 +81,10 @@ export component AppWindow inherits Window {
         AppTheme.is-mobile = root.is-mobile;
     }
 
-    CompactScreen {
-        status-text: root.status-text;
-        status-type: root.status-type;
-        vad-state: root.vad-state;
-        transcription: root.transcription;
-        ai-response: root.ai-response;
-        action-steps: root.action-steps;
-        show-confirmation: root.show-confirmation;
-        confirmation-text: root.confirmation-text;
-        is-busy: root.is-busy;
-        engine-ready: root.engine-ready;
-        listening-enabled: root.listening-enabled;
-        capability-text: root.capability-text;
-        session-tokens: root.session-tokens;
-        max-tokens-budget: root.max-tokens-budget;
-        text-input: root.text-input;
-
-        text-submitted(text) => { root.text-submitted(text); }
-        toggle-listening => { root.toggle-listening(); }
-        confirm-action => { root.confirm-action(); }
-        cancel-action => { root.cancel-action(); }
+    PairingScreen {
+        remote-status: root.remote-status;
+        remote-connected: root.remote-connected;
+        pairing-qr: root.remote-pairing-qr;
         open-settings => { root.open-settings(); }
     }
 
@@ -104,29 +93,35 @@ export component AppWindow inherits Window {
         api-key: root.api-key;
         api-url: root.api-url;
         model: root.model;
+        wire-api: root.wire-api;
+        reasoning-effort: root.reasoning-effort;
+        store-responses: root.store-responses;
         max-tokens-str: root.max-tokens-str;
         auto-speak: root.auto-speak;
         show-api-key: root.show-api-key;
         is-busy: root.is-busy;
         config-path: root.config-path;
-        remote-address: root.remote-address;
-        remote-code: root.remote-code;
         remote-status: root.remote-status;
         remote-connected: root.remote-connected;
-        remote-pairing-info: root.remote-pairing-info;
+        remote-pairing-qr: root.remote-pairing-qr;
+        remote-scan-preview: root.remote-scan-preview;
+        remote-scanning: root.remote-scanning;
+        is-mobile: root.is-mobile;
 
         provider-changed(text) => { root.provider-changed(text); }
         api-key-changed(text) => { root.api-key-changed(text); }
         api-url-changed(text) => { root.api-url-changed(text); }
         model-changed(text) => { root.model-changed(text); }
+        wire-api-changed(value) => { root.wire-api-changed(value); }
+        reasoning-effort-changed(value) => { root.reasoning-effort-changed(value); }
+        store-responses-changed(value) => { root.store-responses-changed(value); }
         max-tokens-changed(text) => { root.max-tokens-changed(text); }
         auto-speak-changed(val) => { root.auto-speak-changed(val); }
         toggle-api-key-visible => { root.toggle-api-key-visible(); }
         save-settings => { root.save-settings(); }
         test-connection => { root.test-connection(); }
-        remote-address-changed(text) => { root.remote-address-changed(text); }
-        remote-code-changed(text) => { root.remote-code-changed(text); }
-        connect-remote => { root.connect-remote(); }
+        scan-remote => { root.scan-remote(); }
+        cancel-remote-scan => { root.cancel-remote-scan(); }
         disconnect-remote => { root.disconnect-remote(); }
         close-settings => { root.close-settings(); }
     }

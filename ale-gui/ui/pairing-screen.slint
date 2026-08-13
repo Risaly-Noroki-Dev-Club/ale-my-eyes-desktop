@@ -1,0 +1,103 @@
+import { Palette } from "std-widgets.slint";
+import { AppTheme, StatusDot } from "widgets.slint";
+
+export component PairingScreen inherits Rectangle {
+    in property <string> remote-status: "正在启动桌面端服务...";
+    in property <bool> remote-connected: false;
+    in property <image> pairing-qr;
+    callback open-settings();
+
+    background: Palette.background;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 18px;
+
+        HorizontalLayout {
+            height: 36px;
+            alignment: center;
+
+            Text {
+                text: "Ale, My Eyes!";
+                font-size: 22px;
+                font-weight: 700;
+                color: Palette.foreground;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: "连接移动端";
+            font-size: 17px;
+            font-weight: 600;
+            color: Palette.foreground;
+            horizontal-alignment: center;
+        }
+
+        qr-row := HorizontalLayout {
+            height: 316px;
+            alignment: center;
+
+            Rectangle {
+                width: 316px;
+                height: 316px;
+                background: white;
+                border-width: 1px;
+                border-color: Palette.border;
+                border-radius: 6px;
+
+                if root.remote-connected : Image {
+                    source: root.pairing-qr;
+                    x: 8px;
+                    y: 8px;
+                    width: 300px;
+                    height: 300px;
+                    image-fit: contain;
+                }
+
+                if !root.remote-connected : Text {
+                    text: "正在准备二维码...";
+                    color: Palette.foreground.transparentize(0.45);
+                    font-size: AppTheme.base-font;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            StatusDot {
+                state: root.remote-connected ? "ready" : "processing";
+            }
+            Text {
+                text: root.remote-status;
+                font-size: AppTheme.base-font;
+                color: root.remote-connected
+                    ? Palette.foreground
+                    : Palette.foreground.transparentize(0.35);
+                vertical-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 34px;
+            border-radius: 6px;
+            background: settings-touch.has-hover ? Palette.control-background : transparent;
+            accessible-role: button;
+            accessible-label: "设置云端 API";
+
+            Text {
+                text: "设置云端 API";
+                font-size: AppTheme.base-font - 1px;
+                color: Palette.foreground.transparentize(0.35);
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            settings-touch := TouchArea { clicked => { root.open-settings(); } }
+        }
+    }
+}
