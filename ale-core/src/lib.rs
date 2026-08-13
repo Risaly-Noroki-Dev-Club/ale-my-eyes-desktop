@@ -175,6 +175,9 @@ impl AleEngine {
             api_key: config.api_key.clone(),
             api_url: config.api_url.clone(),
             model: config.model.clone(),
+            wire_api: config.wire_api.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
+            store_responses: config.store_responses,
             max_tokens: config.max_tokens,
             timeout: std::time::Duration::from_secs(config.timeout as u64),
             retry_count: 3,
@@ -322,18 +325,17 @@ impl AleEngine {
 
     /// 检查云端 API 是否可用。
     pub async fn test_cloud_api(&self) -> Result<bool> {
-        if self
-            .config_manager
-            .config()
-            .cloud_api
-            .api_key
-            .trim()
-            .is_empty()
-        {
+        Self::test_cloud_api_config(&self.config_manager.config().cloud_api).await
+    }
+
+    /// Test a cloud configuration without persisting it.
+    pub async fn test_cloud_api_config(config: &config::CloudApiConfig) -> Result<bool> {
+        config::ConfigValidator::validate_cloud_api(config)?;
+        if config.api_key.trim().is_empty() {
             return Err(AleError::ConfigError("API key is required".to_string()));
         }
 
-        let cloud_config = Self::cloud_config_from_app(&self.config_manager.config().cloud_api);
+        let cloud_config = Self::cloud_config_from_app(config);
         let cloud_api = cloud::CloudApiFactory::create(cloud_config);
         cloud_api.health_check().await
     }
@@ -608,6 +610,9 @@ mod tests {
             api_key: "sk-test".to_string(),
             api_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
+            wire_api: "responses".to_string(),
+            reasoning_effort: "xhigh".to_string(),
+            store_responses: false,
             max_tokens: 512,
             timeout: 60,
         };
@@ -618,6 +623,9 @@ mod tests {
         ));
         assert_eq!(cloud_config.api_key, "sk-test");
         assert_eq!(cloud_config.model, "gpt-4o");
+        assert_eq!(cloud_config.wire_api, "responses");
+        assert_eq!(cloud_config.reasoning_effort, "xhigh");
+        assert!(!cloud_config.store_responses);
         assert_eq!(cloud_config.max_tokens, 512);
     }
 

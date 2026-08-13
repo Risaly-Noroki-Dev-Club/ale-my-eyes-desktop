@@ -11,8 +11,8 @@ use ale_core::remote::{
 use ale_core::AleEngine;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use local_ip_address::list_afinet_netifas;
-use qrcode::render::unicode;
+use local_ip_address::local_ip;
+use qrcode::types::Color;
 use qrcode::QrCode;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -22,18 +22,16 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 pub struct RemoteServerHandle {
-    pub pairing: PairingInfo,
-    pub qr_text: String,
+    pub qr_image: slint::Image,
 }
 
 pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, String> {
     let code = remote_crypto::pairing_code();
     let session_id = remote_crypto::session_id();
     let name = remote_crypto::device_name();
-    let host = local_addresses()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = local_ip()
+        .map_err(|_| "未找到可用于移动端连接的局域网地址".to_string())?
+        .to_string();
     let pairing = PairingInfo {
         host,
         port: DEFAULT_REMOTE_PORT,
@@ -41,7 +39,7 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         code,
         name,
     };
-    let qr_text = render_qr(&pairing.uri()).unwrap_or_else(|_| pairing.uri());
+    let qr_image = render_qr(&pairing.uri())?;
 
     let listener = TcpListener::bind(("0.0.0.0", DEFAULT_REMOTE_PORT))
         .await
@@ -51,7 +49,6 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let server_pairing = pairing.clone();
 
     tokio::spawn(async move {
-        advertise_mdns(&server_pairing);
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
@@ -73,7 +70,7 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         }
     });
 
-    Ok(RemoteServerHandle { pairing, qr_text })
+    Ok(RemoteServerHandle { qr_image })
 }
 
 async fn handle_connection(
@@ -317,51 +314,55 @@ async fn send_secure(
         .map_err(|error| error.to_string())
 }
 
-fn local_addresses() -> Vec<String> {
-    list_afinet_netifas()
-        .map(|interfaces| {
-            interfaces
-                .into_iter()
-                .filter_map(|(_, ip)| {
-                    if ip.is_ipv4() && !ip.is_loopback() {
-                        Some(ip.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn render_qr(uri: &str) -> Result<String, String> {
+fn render_qr(uri: &str) -> Result<slint::Image, String> {
     let code = QrCode::new(uri.as_bytes()).map_err(|error| error.to_string())?;
-    Ok(code.render::<unicode::Dense1x2>().build())
+    const QUIET_ZONE: usize = 4;
+    const SCALE: usize = 6;
+    let module_width = code.width();
+    let image_width = (module_width + QUIET_ZONE * 2) * SCALE;
+    let mut pixels =
+        slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(image_width as u32, image_width as u32);
+    let bytes = pixels.make_mut_bytes();
+    bytes.fill(255);
+    for (index, color) in code.to_colors().into_iter().enumerate() {
+        if color != Color::Dark {
+            continue;
+        }
+        let module_x = index % module_width;
+        let module_y = index / module_width;
+        for y in 0..SCALE {
+            for x in 0..SCALE {
+                let pixel_x = (module_x + QUIET_ZONE) * SCALE + x;
+                let pixel_y = (module_y + QUIET_ZONE) * SCALE + y;
+                let offset = (pixel_y * image_width + pixel_x) * 3;
+                bytes[offset..offset + 3].fill(0);
+            }
+        }
+    }
+    Ok(slint::Image::from_rgb8(pixels))
 }
 
-fn advertise_mdns(pairing: &PairingInfo) {
-    let pairing = pairing.clone();
-    std::thread::spawn(move || {
-        let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
-            return;
-        };
-        let properties = [
-            ("sid", pairing.session_id.as_str()),
-            ("name", pairing.name.as_str()),
-        ];
-        let Ok(info) = mdns_sd::ServiceInfo::new(
-            "_ale-my-eyes._tcp.local.",
-            &pairing.name,
-            &format!("{}.local.", pairing.name.replace(' ', "-")),
-            &pairing.host,
-            pairing.port,
-            &properties[..],
-        ) else {
-            return;
-        };
-        let _ = daemon.register(info);
-        loop {
-            std::thread::park();
-        }
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_qr_decodes_to_original_uri() {
+        let uri = format!(
+            "ale-my-eyes://pair?host=192.168.1.2&port=37654&sid={}&code=123456&name=Desktop",
+            uuid::Uuid::new_v4()
+        );
+        let image = render_qr(&uri).unwrap().to_rgb8().unwrap();
+        let gray = image
+            .as_bytes()
+            .chunks_exact(3)
+            .map(|pixel| pixel[0])
+            .collect::<Vec<_>>();
+        let mut decoder = quircs::Quirc::default();
+        let decoded = decoder
+            .identify(image.width() as usize, image.height() as usize, &gray)
+            .find_map(|code| code.ok()?.decode().ok())
+            .expect("rendered QR should decode");
+        assert_eq!(decoded.payload, uri.as_bytes());
+    }
 }

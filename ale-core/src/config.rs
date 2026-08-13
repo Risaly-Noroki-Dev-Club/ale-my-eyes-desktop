@@ -13,6 +13,12 @@ pub struct CloudApiConfig {
     pub api_key: String,
     pub api_url: String,
     pub model: String,
+    /// OpenAI-compatible transport: "chat_completions" or "responses".
+    pub wire_api: String,
+    /// Optional reasoning effort for the Responses API.
+    pub reasoning_effort: String,
+    /// Allow the provider to retain Responses API results.
+    pub store_responses: bool,
     pub max_tokens: usize,
     pub timeout: u32,
 }
@@ -24,6 +30,9 @@ impl Default for CloudApiConfig {
             api_key: String::new(),
             api_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
+            wire_api: "chat_completions".to_string(),
+            reasoning_effort: String::new(),
+            store_responses: false,
             max_tokens: 1024,
             timeout: 30,
         }
@@ -422,6 +431,24 @@ impl ConfigValidator {
             return Err(AleError::ConfigError("Model name is required".to_string()));
         }
 
+        let valid_wire_apis = ["chat_completions", "responses"];
+        if !valid_wire_apis.contains(&config.wire_api.as_str()) {
+            return Err(AleError::ConfigError(format!(
+                "Invalid wire API: {}. Must be one of: {:?}",
+                config.wire_api, valid_wire_apis
+            )));
+        }
+
+        let valid_reasoning_efforts = [
+            "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ];
+        if !valid_reasoning_efforts.contains(&config.reasoning_effort.as_str()) {
+            return Err(AleError::ConfigError(format!(
+                "Invalid reasoning effort: {}",
+                config.reasoning_effort
+            )));
+        }
+
         if config.timeout == 0 {
             return Err(AleError::ConfigError(
                 "Timeout must be greater than 0".to_string(),
@@ -543,6 +570,9 @@ mod tests {
         assert_eq!(config.cloud_api.provider, "openai");
         assert_eq!(config.cloud_api.api_url, "https://api.openai.com/v1");
         assert_eq!(config.cloud_api.model, "gpt-4o");
+        assert_eq!(config.cloud_api.wire_api, "chat_completions");
+        assert!(config.cloud_api.reasoning_effort.is_empty());
+        assert!(!config.cloud_api.store_responses);
         assert_eq!(config.cloud_api.max_tokens, 1024);
         assert_eq!(config.cloud_api.timeout, 30);
         assert_eq!(config.ui.language, "zh-CN");
@@ -588,6 +618,26 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate_cloud_api(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_cloud_api_rejects_unknown_wire_api() {
+        let config = CloudApiConfig {
+            api_key: "sk-test".to_string(),
+            wire_api: "completions".to_string(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_cloud_api(&config).is_err());
+    }
+
+    #[test]
+    fn test_validate_cloud_api_rejects_unknown_reasoning_effort() {
+        let config = CloudApiConfig {
+            api_key: "sk-test".to_string(),
+            reasoning_effort: "extreme".to_string(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate_cloud_api(&config).is_err());
     }
 
     #[test]

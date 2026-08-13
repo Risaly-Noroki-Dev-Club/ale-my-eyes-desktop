@@ -98,18 +98,10 @@ pub fn setup_app(app: &AppWindow) {
                     };
                     match remote_server::start(engine).await {
                         Ok(handle) => {
+                            app.set_show_settings(false);
                             app.set_remote_connected(true);
-                            app.set_remote_status(slint::format!(
-                                "桌面端监听中: {}",
-                                handle.pairing.websocket_url()
-                            ));
-                            app.set_remote_address(handle.pairing.websocket_url().into());
-                            app.set_remote_code(handle.pairing.code.clone().into());
-                            app.set_remote_pairing_info(slint::format!(
-                                "配对链接: {}\n\n{}",
-                                handle.pairing.uri(),
-                                handle.qr_text
-                            ));
+                            app.set_remote_status("桌面端已就绪，请使用移动端扫描二维码".into());
+                            app.set_remote_pairing_qr(handle.qr_image);
                         }
                         Err(error) => {
                             app.set_remote_status(slint::format!("桌面端服务启动失败: {}", error));
@@ -627,6 +619,33 @@ pub fn setup_app(app: &AppWindow) {
     }
     {
         let app_weak = app_weak.clone();
+        app.on_wire_api_changed(move |value| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            app.set_wire_api(value);
+        });
+    }
+    {
+        let app_weak = app_weak.clone();
+        app.on_reasoning_effort_changed(move |value| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            app.set_reasoning_effort(value);
+        });
+    }
+    {
+        let app_weak = app_weak.clone();
+        app.on_store_responses_changed(move |value| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            app.set_store_responses(value);
+        });
+    }
+    {
+        let app_weak = app_weak.clone();
         app.on_max_tokens_changed(move |text| {
             let Some(app) = app_weak.upgrade() else {
                 return;
@@ -655,98 +674,6 @@ pub fn setup_app(app: &AppWindow) {
                 return;
             };
             app.set_show_api_key(!app.get_show_api_key());
-        });
-    }
-    {
-        let app_weak = app_weak.clone();
-        app.on_remote_address_changed(move |text| {
-            let Some(app) = app_weak.upgrade() else {
-                return;
-            };
-            app.set_remote_address(text);
-        });
-    }
-    {
-        let app_weak = app_weak.clone();
-        app.on_remote_code_changed(move |text| {
-            let Some(app) = app_weak.upgrade() else {
-                return;
-            };
-            app.set_remote_code(text);
-        });
-    }
-    {
-        #[cfg(target_os = "android")]
-        let state = state.clone();
-        let app_weak = app_weak.clone();
-        app.on_connect_remote(move || {
-            #[cfg(target_os = "android")]
-            let state = state.clone();
-            let app_weak = app_weak.clone();
-            spawn_local_task(async move {
-                let Some(app) = app_weak.upgrade() else {
-                    return;
-                };
-                app.set_is_busy(true);
-                #[cfg(target_os = "android")]
-                {
-                    let mut code = app.get_remote_code().to_string();
-                    let address = app.get_remote_address().to_string();
-                    let url = if address.trim().is_empty() {
-                        match remote_client::discover_first(code.clone()) {
-                            Some(info) => {
-                                app.set_remote_address(info.websocket_url().into());
-                                app.set_remote_pairing_info(info.uri().into());
-                                info.websocket_url()
-                            }
-                            None => {
-                                app.set_remote_status(
-                                    "未自动发现桌面端，请手动输入地址或粘贴二维码链接".into(),
-                                );
-                                app.set_remote_connected(false);
-                                app.set_is_busy(false);
-                                return;
-                            }
-                        }
-                    } else if address.starts_with("ale-my-eyes://") {
-                        match ale_core::remote::PairingInfo::from_uri(&address) {
-                            Ok(info) => {
-                                code = info.code.clone();
-                                app.set_remote_code(code.clone().into());
-                                info.websocket_url()
-                            }
-                            Err(error) => {
-                                app.set_remote_status(slint::format!("配对链接无效: {}", error));
-                                app.set_remote_connected(false);
-                                app.set_is_busy(false);
-                                return;
-                            }
-                        }
-                    } else {
-                        address
-                    };
-
-                    let client = remote_client::RemoteClient::new(url.clone(), code);
-                    match client.test().await {
-                        Ok(name) => {
-                            state.lock().await.remote_client = Some(client);
-                            app.set_remote_address(url.into());
-                            app.set_remote_status(slint::format!("已加密连接: {}", name));
-                            app.set_remote_connected(true);
-                        }
-                        Err(error) => {
-                            app.set_remote_status(slint::format!("连接失败: {}", error));
-                            app.set_remote_connected(false);
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "android"))]
-                {
-                    app.set_remote_status("桌面端已经在本机监听，无需连接自己".into());
-                    app.set_remote_connected(true);
-                }
-                app.set_is_busy(false);
-            });
         });
     }
     {
@@ -868,9 +795,13 @@ pub fn setup_app(app: &AppWindow) {
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
+                let config = {
+                    let engine = engine.lock().await;
+                    config_from_app(&app, engine.config())
+                };
                 app.set_is_busy(true);
 
-                let result = test_connection(engine).await;
+                let result = test_connection(&config).await;
                 let Some(app) = app_weak.upgrade() else {
                     return;
                 };
@@ -930,6 +861,9 @@ fn apply_config_to_app(app: &AppWindow, config: &AppConfig) {
     app.set_api_key(config.cloud_api.api_key.clone().into());
     app.set_api_url(config.cloud_api.api_url.clone().into());
     app.set_model(config.cloud_api.model.clone().into());
+    app.set_wire_api(config.cloud_api.wire_api.clone().into());
+    app.set_reasoning_effort(config.cloud_api.reasoning_effort.clone().into());
+    app.set_store_responses(config.cloud_api.store_responses);
     app.set_max_tokens_str(config.cloud_api.max_tokens.to_string().into());
     app.set_auto_speak(config.ui.auto_speak);
 }
@@ -976,6 +910,9 @@ fn config_from_app(app: &AppWindow, base: &AppConfig) -> AppConfig {
         .trim_end_matches('/')
         .to_string();
     config.cloud_api.model = app.get_model().to_string();
+    config.cloud_api.wire_api = app.get_wire_api().to_string();
+    config.cloud_api.reasoning_effort = app.get_reasoning_effort().to_string();
+    config.cloud_api.store_responses = app.get_store_responses();
     if let Ok(budget) = app.get_max_tokens_str().to_string().parse::<usize>() {
         config.cloud_api.max_tokens = budget;
     }
@@ -1004,11 +941,9 @@ async fn save_settings(
     create_engine().await
 }
 
-async fn test_connection(engine: Arc<Mutex<AleEngine>>) -> Result<bool, String> {
-    let engine = engine.lock().await;
-    ensure_api_key(engine.config())?;
-    engine
-        .test_cloud_api()
+async fn test_connection(config: &AppConfig) -> Result<bool, String> {
+    ensure_api_key(config)?;
+    AleEngine::test_cloud_api_config(&config.cloud_api)
         .await
         .map_err(|error| error.to_string())
 }
