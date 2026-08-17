@@ -35,14 +35,17 @@ require 'validate_cloud_api_transport' ale-core/src/config.rs P1-4-https-validat
 require 'test_validate_cloud_api_rejects_public_http' ale-core/src/config.rs P1-4-url-test
 require 'mock_openai_timeout_is_reported' ale-core/src/cloud.rs P1-5-http-tests
 require 'vlm_coordinates_to_confirmation_to_automation_chain' ale-gui/src/remote_server.rs P1-5-automation-chain
-require 'real_pc_handler_completes_noise_preview_confirm_status_loopback' ale-gui/src/remote_server.rs P1-5-real-loopback
-require 'REMOTE_PROTOCOL_VERSION: u32 = 2' ale-core/src/remote.rs remote-v2-version
-require 'AudioStart' ale-core/src/remote.rs remote-v2-audio-start
-require 'AudioAssembler' ale-gui/src/remote_server.rs remote-v2-desktop-assembler
-require 'AUDIO_HASH_MISMATCH' ale-gui/src/remote_server.rs remote-v2-integrity
-require 'protocol_v2_matches_golden_fixture' ale-core/src/remote.rs remote-v2-golden-fixture
-require 'production desktop build uses the OpenAI-compatible' README.md P2-1-product-scope
-require 'mode: "cloud"' ale-core/src/config.rs P2-1-cloud-default
+require 'spawned_modeld_authenticates_and_serves_health_over_unix_socket' ale-modeld/tests/ipc_process.rs modeld-real-process
+require 'REMOTE_PROTOCOL_VERSION: u32 = 3' ale-core/src/remote.rs remote-v3-version
+require 'AudioStart' ale-core/src/remote.rs remote-v3-audio-start
+require 'DecisionRequest' ale-core/src/remote.rs remote-v3-decision
+require 'AssistantOutput' ale-core/src/remote.rs remote-v3-output
+require 'AudioAssembler' ale-gui/src/remote_server.rs remote-v3-desktop-assembler
+require 'AUDIO_HASH_MISMATCH' ale-gui/src/remote_server.rs remote-v3-integrity
+require 'protocol_v3_matches_golden_fixture' ale-core/src/remote.rs remote-v3-golden-fixture
+require 'ale-modeld' README.md model-scheduler-product-scope
+require 'mode: "adaptive"' ale-core/src/config.rs model-scheduler-default
+require 'real_pc_handler_does_not_bypass_disabled_model_scheduler' ale-gui/src/remote_server.rs model-scheduler-no-bypass
 require 'Cargo.lock' scripts/create-release.sh P2-2-lockfile
 require 'vendor' scripts/create-release.sh P2-2-vendored-patch
 require 'Icon=ale-my-eyes' scripts/package-linux.sh P2-2-linux-icon

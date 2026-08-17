@@ -188,10 +188,10 @@ impl CloudApi for OpenAIApi {
             .map_err(|e| AleError::CloudApiError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(AleError::CloudApiError(format!(
-                "API error: {}",
-                error_text
+                "API error {status}: {error_text}"
             )));
         }
 
@@ -228,10 +228,10 @@ impl CloudApi for OpenAIApi {
             .map_err(|e| AleError::CloudApiError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(AleError::CloudApiError(format!(
-                "API error: {}",
-                error_text
+                "API error {status}: {error_text}"
             )));
         }
 
@@ -276,10 +276,10 @@ impl CloudApi for OpenAIApi {
             .map_err(|e| AleError::CloudApiError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(AleError::CloudApiError(format!(
-                "API error: {}",
-                error_text
+                "API error {status}: {error_text}"
             )));
         }
 
@@ -350,10 +350,10 @@ impl CloudApi for OpenAIApi {
             .map_err(|e| AleError::CloudApiError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(AleError::CloudApiError(format!(
-                "API error: {}",
-                error_text
+                "API error {status}: {error_text}"
             )));
         }
 
@@ -421,10 +421,10 @@ impl CloudApi for OpenAIApi {
             .map_err(|e| AleError::CloudApiError(format!("Request failed: {}", e)))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(AleError::CloudApiError(format!(
-                "API error: {}",
-                error_text
+                "API error {status}: {error_text}"
             )));
         }
 

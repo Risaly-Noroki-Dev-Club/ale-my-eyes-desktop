@@ -30,6 +30,62 @@ impl Default for CloudApiConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RemoteRoutingConfig {
+    pub backup: Option<CloudApiConfig>,
+    pub backup_enabled: bool,
+    pub backup_pre_authorized: bool,
+    pub circuit_failure_threshold: u32,
+    pub circuit_open_seconds: u32,
+}
+
+impl Default for RemoteRoutingConfig {
+    fn default() -> Self {
+        Self {
+            backup: None,
+            backup_enabled: false,
+            backup_pre_authorized: false,
+            circuit_failure_threshold: 3,
+            circuit_open_seconds: 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelSchedulerConfig {
+    pub enabled: bool,
+    pub require_download_consent: bool,
+    pub local_vlm_gpu_only: bool,
+    pub idle_ttl_seconds: u32,
+    pub minimum_default_vram_bytes: u64,
+    pub minimum_large_vram_bytes: u64,
+    pub qwen_model: String,
+    pub qwen_large_model: String,
+    pub grounding_model: String,
+    pub grounding_fallback_model: String,
+    pub full_screenshot_requires_confirmation: bool,
+}
+
+impl Default for ModelSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            require_download_consent: true,
+            local_vlm_gpu_only: true,
+            idle_ttl_seconds: 120,
+            minimum_default_vram_bytes: crate::model_scheduler::MIN_DEFAULT_VRAM_BYTES,
+            minimum_large_vram_bytes: crate::model_scheduler::MIN_LARGE_VRAM_BYTES,
+            qwen_model: "Qwen2.5-VL-3B-Instruct".to_string(),
+            qwen_large_model: "Qwen2.5-VL-7B-Instruct".to_string(),
+            grounding_model: "ShowUI-2B".to_string(),
+            grounding_fallback_model: "UI-TARS-1.5-7B".to_string(),
+            full_screenshot_requires_confirmation: true,
+        }
+    }
+}
+
 /// 模型配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,7 +100,7 @@ pub struct ModelsConfig {
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            auto_download: true,
+            auto_download: false,
             max_download_size: 500 * 1024 * 1024, // 500MB
             preferred_quality: "balanced".to_string(),
             offline_mode: false,
@@ -66,8 +122,8 @@ pub struct InferenceConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            mode: "cloud".to_string(),
-            prefer_cloud: true,
+            mode: "adaptive".to_string(),
+            prefer_cloud: false,
             timeout: 30,
             fallback_to_local: false,
         }
@@ -158,6 +214,8 @@ impl Default for UiConfig {
 #[serde(default)]
 pub struct AppConfig {
     pub cloud_api: CloudApiConfig,
+    pub remote_routing: RemoteRoutingConfig,
+    pub model_scheduler: ModelSchedulerConfig,
     pub models: ModelsConfig,
     pub inference: InferenceConfig,
     pub audio: AudioConfig,
@@ -196,7 +254,7 @@ impl ConfigManager {
         let content = std::fs::read_to_string(&self.config_path)?;
         self.config = serde_json::from_str(&content)?;
         #[cfg(not(feature = "local-inference"))]
-        if self.config.inference.mode != "cloud" {
+        if !self.config.model_scheduler.enabled && self.config.inference.mode != "cloud" {
             tracing::warn!(
                 "Inference mode '{}' requires the experimental local-inference feature; using cloud",
                 self.config.inference.mode
@@ -213,6 +271,14 @@ impl ConfigManager {
             self.secret_store
                 .set_api_key(&self.config.cloud_api.api_key)?;
         }
+        if let Some(backup) = self.config.remote_routing.backup.as_mut() {
+            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
+            if backup.api_key.trim().is_empty() {
+                backup.api_key = self.secret_store.get_backup_api_key()?.unwrap_or_default();
+            } else {
+                self.secret_store.set_backup_api_key(&backup.api_key)?;
+            }
+        }
         self.save()?;
         Ok(())
     }
@@ -220,6 +286,9 @@ impl ConfigManager {
     /// 保存配置
     pub fn save(&self) -> Result<()> {
         ConfigValidator::validate_cloud_api_transport(&self.config.cloud_api.api_url)?;
+        if let Some(backup) = &self.config.remote_routing.backup {
+            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
+        }
         // 确保目录存在
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -238,10 +307,19 @@ impl ConfigManager {
     /// 更新配置
     pub fn update_config(&mut self, config: AppConfig) -> Result<()> {
         ConfigValidator::validate_cloud_api_transport(&config.cloud_api.api_url)?;
+        if let Some(backup) = &config.remote_routing.backup {
+            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
+        }
         if config.cloud_api.api_key.trim().is_empty() {
             self.secret_store.delete_api_key()?;
         } else {
             self.secret_store.set_api_key(&config.cloud_api.api_key)?;
+        }
+        match config.remote_routing.backup.as_ref() {
+            Some(backup) if !backup.api_key.trim().is_empty() => {
+                self.secret_store.set_backup_api_key(&backup.api_key)?;
+            }
+            _ => self.secret_store.delete_backup_api_key()?,
         }
         self.config = config;
         self.save()
@@ -490,14 +568,6 @@ impl ConfigValidator {
             )));
         }
 
-        #[cfg(not(feature = "local-inference"))]
-        if config.mode != "cloud" {
-            return Err(AleError::ConfigError(
-                "Local and adaptive inference are experimental and require the local-inference feature"
-                    .to_string(),
-            ));
-        }
-
         Ok(())
     }
 
@@ -540,6 +610,24 @@ impl ConfigValidator {
         Self::validate_models(&config.models)?;
         Self::validate_inference(&config.inference)?;
         Self::validate_asr(&config.asr)?;
+        if config.remote_routing.backup_enabled {
+            let backup = config.remote_routing.backup.as_ref().ok_or_else(|| {
+                AleError::ConfigError(
+                    "Backup cloud endpoint is enabled but not configured".to_string(),
+                )
+            })?;
+            Self::validate_cloud_api(backup)?;
+            if !config.remote_routing.backup_pre_authorized {
+                return Err(AleError::ConfigError(
+                    "Backup cloud endpoint requires explicit pre-authorization".to_string(),
+                ));
+            }
+        }
+        if config.model_scheduler.idle_ttl_seconds == 0 {
+            return Err(AleError::ConfigError(
+                "Model scheduler idle TTL must be greater than zero".to_string(),
+            ));
+        }
 
         if config.ui.font_size == 0 {
             return Err(AleError::ConfigError(
@@ -772,7 +860,7 @@ mod tests {
 
         assert_eq!(config.cloud_api.api_key, "sk-test");
         assert_eq!(config.cloud_api.provider, "openai");
-        assert_eq!(config.inference.mode, "cloud");
+        assert_eq!(config.inference.mode, "adaptive");
         assert_eq!(config.audio.sample_rate, 16000);
         assert!(config.ui.auto_speak);
     }

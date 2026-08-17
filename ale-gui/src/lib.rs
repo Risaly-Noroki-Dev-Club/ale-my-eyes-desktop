@@ -8,6 +8,7 @@ pub mod screen_capture;
 
 pub mod automation;
 
+mod modeld;
 mod platform;
 mod remote_crypto;
 

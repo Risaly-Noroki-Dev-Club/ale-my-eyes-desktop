@@ -2,7 +2,7 @@ use crate::actions::ActionPlan;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 2;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_REMOTE_PORT: u16 = 37654;
 pub const MAX_AUDIO_CHUNK_BYTES: usize = 24_576;
 pub const MAX_RECORDING_SECONDS: u64 = 60;
@@ -32,6 +32,10 @@ pub enum RemoteMessage {
     AudioEnd(AudioEnd),
     CancelRequest(CancelRequest),
     CommandPreview(CommandPreview),
+    ProgressUpdate(ProgressUpdate),
+    DecisionRequest(DecisionRequest),
+    DecisionResponse(DecisionResponse),
+    AssistantOutput(AssistantOutput),
     ConfirmExecution(ConfirmExecution),
     ExecutionStatus(ExecutionStatus),
     Ping(Ping),
@@ -106,6 +110,69 @@ pub struct CommandPreview {
     pub confirmation_text: String,
     pub requires_confirmation: bool,
     pub has_plan: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressUpdate {
+    pub request_id: String,
+    pub stage: ProgressStage,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressStage {
+    Transcribing,
+    CapturingState,
+    Summarizing,
+    Planning,
+    Grounding,
+    AwaitingDecision,
+    Executing,
+    Verifying,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionRequest {
+    pub request_id: String,
+    pub decision_id: String,
+    pub kind: DecisionKind,
+    pub prompt: String,
+    pub expires_in_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionKind {
+    UseRemoteModel,
+    UploadFullScreenshot,
+    RiskChanged,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionResponse {
+    pub request_id: String,
+    pub decision_id: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantOutput {
+    pub request_id: Option<String>,
+    pub kind: AssistantOutputKind,
+    pub display_text: String,
+    pub speech_text: String,
+    pub interrupt: bool,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantOutputKind {
+    Information,
+    Confirmation,
+    Error,
+    Result,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,14 +362,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_matches_golden_fixture() {
+    fn protocol_v3_matches_golden_fixture() {
         let messages = vec![
             RemoteMessage::ClientHello(ClientHello {
-                protocol_version: 2,
+                protocol_version: 3,
                 device_name: "Android".into(),
             }),
             RemoteMessage::ServerHello(ServerHello {
-                protocol_version: 2,
+                protocol_version: 3,
                 device_name: "Desktop".into(),
                 session_id: "session".into(),
             }),
@@ -340,6 +407,31 @@ mod tests {
                 requires_confirmation: false,
                 has_plan: false,
             }),
+            RemoteMessage::ProgressUpdate(ProgressUpdate {
+                request_id: "audio".into(),
+                stage: ProgressStage::Planning,
+                message: "planning".into(),
+            }),
+            RemoteMessage::DecisionRequest(DecisionRequest {
+                request_id: "audio".into(),
+                decision_id: "decision".into(),
+                kind: DecisionKind::UseRemoteModel,
+                prompt: "use remote".into(),
+                expires_in_seconds: 30,
+            }),
+            RemoteMessage::DecisionResponse(DecisionResponse {
+                request_id: "audio".into(),
+                decision_id: "decision".into(),
+                approved: true,
+            }),
+            RemoteMessage::AssistantOutput(AssistantOutput {
+                request_id: Some("audio".into()),
+                kind: AssistantOutputKind::Information,
+                display_text: "display".into(),
+                speech_text: "speech".into(),
+                interrupt: false,
+                sensitive: false,
+            }),
             RemoteMessage::ConfirmExecution(ConfirmExecution {
                 request_id: "audio".into(),
                 approved: true,
@@ -359,7 +451,7 @@ mod tests {
             }),
         ];
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/remote-v2.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/remote-v3.json")).unwrap();
         assert_eq!(serde_json::to_value(messages).unwrap(), expected);
     }
 }

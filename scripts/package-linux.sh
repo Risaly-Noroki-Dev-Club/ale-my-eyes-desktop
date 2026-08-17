@@ -9,14 +9,14 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     exit 1
 fi
 
-cargo build --release --locked -p ale-cli -p ale-gui
+cargo build --release --locked -p ale-cli -p ale-gui -p ale-modeld
 
 package_dir="$repo_root/ale-my-eyes-linux"
 archive="$repo_root/ale-my-eyes-linux.tar.gz"
 rm -rf "$package_dir" "$archive"
 mkdir -p "$package_dir/bin" "$package_dir/share/applications" \
     "$package_dir/share/icons/hicolor/scalable/apps"
-cp target/release/ale-cli target/release/ale-gui "$package_dir/bin/"
+cp target/release/ale-cli target/release/ale-gui target/release/ale-modeld "$package_dir/bin/"
 cp assets/icon.svg "$package_dir/share/icons/hicolor/scalable/apps/ale-my-eyes.svg"
 
 cat > "$package_dir/share/applications/ale-my-eyes.desktop" <<'EOF'
@@ -37,7 +37,8 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 exec "$script_dir/bin/ale-gui" "$@"
 EOF
-chmod +x "$package_dir/run-gui.sh" "$package_dir/bin/ale-cli" "$package_dir/bin/ale-gui"
+chmod +x "$package_dir/run-gui.sh" "$package_dir/bin/ale-cli" "$package_dir/bin/ale-gui" \
+    "$package_dir/bin/ale-modeld"
 
 cat > "$package_dir/README.md" <<'EOF'
 # Ale, My Eyes! Linux

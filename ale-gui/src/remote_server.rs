@@ -1,14 +1,17 @@
 use crate::audit;
 use crate::conversation::automation_tools;
+use crate::modeld::SupervisedModeldClient;
 use crate::platform::{self, ExecutionControl, PlatformService};
 use crate::remote_crypto;
 use ale_core::actions::{parse_action_plan_arguments, ActionPlan};
+use ale_core::model_scheduler::{validate_semantic_plan, SemanticPlan};
 use ale_core::remote::{
-    AudioChunk, AudioEnd, AudioFormat, AudioStart, CancelRequest, ClientHello, CommandInput,
-    CommandPreview, CommandRequest, ConfirmExecution, ExecutionState, ExecutionStatus, PairingInfo,
-    Ping, Pong, RemoteError, RemoteMessage, ServerHello, DEFAULT_REMOTE_PORT,
-    MAX_AUDIO_CHUNK_BYTES, MAX_RECORDING_SECONDS, MAX_SAMPLE_RATE_HZ, MIN_SAMPLE_RATE_HZ,
-    REMOTE_PROTOCOL_VERSION,
+    AssistantOutput, AssistantOutputKind, AudioChunk, AudioEnd, AudioFormat, AudioStart,
+    CancelRequest, ClientHello, CommandInput, CommandPreview, CommandRequest, ConfirmExecution,
+    DecisionKind, DecisionRequest, DecisionResponse, ExecutionState, ExecutionStatus, PairingInfo,
+    Ping, Pong, ProgressStage, ProgressUpdate, RemoteError, RemoteMessage, ServerHello,
+    DEFAULT_REMOTE_PORT, MAX_AUDIO_CHUNK_BYTES, MAX_RECORDING_SECONDS, MAX_SAMPLE_RATE_HZ,
+    MIN_SAMPLE_RATE_HZ, REMOTE_PROTOCOL_VERSION,
 };
 use ale_core::AleEngine;
 use base64::Engine;
@@ -217,16 +220,37 @@ struct ConnectionContext {
     request_slots: Arc<Semaphore>,
     request_limiter: Arc<std::sync::Mutex<ClientRequestLimiter>>,
     pairing_limiter: Arc<std::sync::Mutex<PairingLimiter>>,
+    modeld: Option<SupervisedModeldClient>,
+    scheduler_enabled: bool,
+    explicit_cloud_mode: bool,
+    local_planning_available: bool,
+}
+
+struct DeferredRequest {
+    request_id: String,
+    decision_id: String,
+    kind: DecisionKind,
+    payload: RequestPayload,
+    expires_at: Instant,
 }
 
 struct ProcessingRequest {
     request_id: String,
     task: JoinHandle<()>,
+    modeld: Option<SupervisedModeldClient>,
 }
 
 impl Drop for ProcessingRequest {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(modeld) = self.modeld.clone() {
+            let request_id = self.request_id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = modeld.cancel(&request_id).await {
+                    tracing::debug!(%request_id, %error, "modeld cancellation was not acknowledged");
+                }
+            });
+        }
     }
 }
 
@@ -273,6 +297,7 @@ enum ConfirmAction {
 }
 
 enum ProcessingOutcome {
+    Progress(ProgressStage, String),
     Complete(CommandPreview, Option<ActionPlan>),
     Error { code: &'static str, message: String },
 }
@@ -309,6 +334,31 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         .await
         .map_err(|error| error.to_string())?;
     let platform: Arc<dyn PlatformService> = Arc::from(platform::create_platform());
+    let app_config = engine.lock().await.config().clone();
+    let scheduler_enabled = app_config.model_scheduler.enabled;
+    let explicit_cloud_mode = app_config.inference.mode == "cloud";
+    let modeld = if scheduler_enabled {
+        let client = SupervisedModeldClient::start(&app_config).await;
+        if let Some(error) = client.initial_error().await {
+            tracing::warn!("Model scheduler unavailable: {}", error);
+        }
+        Some(client)
+    } else {
+        None
+    };
+    let local_planning_available = if let Some(client) = &modeld {
+        client
+            .health()
+            .await
+            .map(|health| {
+                health
+                    .available_capabilities
+                    .contains(&ale_core::model_scheduler::ModelCapability::LocalPlanning)
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let server_pairing = pairing.clone();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let request_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
@@ -348,6 +398,10 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
                         request_slots: request_slots.clone(),
                         request_limiter: request_limiter.clone(),
                         pairing_limiter: pairing_limiter.clone(),
+                        modeld: modeld.clone(),
+                        scheduler_enabled,
+                        explicit_cloud_mode,
+                        local_planning_available,
                     };
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
@@ -384,6 +438,10 @@ async fn handle_connection(
         request_slots,
         request_limiter,
         pairing_limiter,
+        modeld,
+        scheduler_enabled,
+        explicit_cloud_mode,
+        local_planning_available,
     } = context;
     let websocket_config = WebSocketConfig {
         max_message_size: Some(remote_crypto::MAX_ENCRYPTED_FRAME_BYTES),
@@ -457,18 +515,49 @@ async fn handle_connection(
     let mut active_audio: Option<AudioAssembler> = None;
     let (processing_tx, mut processing_rx) = mpsc::unbounded_channel::<ProcessingResult>();
     let mut processing: Option<ProcessingRequest> = None;
+    let mut deferred: Option<DeferredRequest> = None;
     let (execution_tx, mut execution_rx) = mpsc::unbounded_channel::<RemoteExecutionEvent>();
     let mut execution: Option<RemoteExecution> = None;
+    let mut decision_maintenance = tokio::time::interval(Duration::from_millis(250));
+    decision_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut unexpected_messages = 0_u8;
     loop {
         let frame = tokio::select! {
+            _ = decision_maintenance.tick(), if deferred.is_some() => {
+                if deferred
+                    .as_ref()
+                    .is_some_and(|decision| decision.expires_at <= Instant::now())
+                {
+                    let expired = deferred.take().expect("deferred request checked");
+                    send_assistant_output(
+                        &mut socket,
+                        &mut secure,
+                        Some(expired.request_id.clone()),
+                        AssistantOutputKind::Error,
+                        "等待决定超时，当前请求已取消",
+                        true,
+                    )
+                    .await?;
+                    send_remote_error(
+                        &mut socket,
+                        &mut secure,
+                        Some(expired.request_id),
+                        "DECISION_TIMEOUT",
+                        "等待决定超时",
+                    )
+                    .await?;
+                }
+                continue;
+            }
             result = processing_rx.recv(), if processing.is_some() => {
                 let result = result.ok_or_else(|| "PROCESSING_CHANNEL_CLOSED".to_string())?;
                 if processing
                     .as_ref()
                     .is_some_and(|request| request.request_id == result.request_id)
                 {
-                    processing.take();
+                    if !matches!(&result.outcome, ProcessingOutcome::Progress(_, _)) {
+                        processing.take();
+                    }
                     publish_processing_result(
                         result,
                         &mut pending,
@@ -563,30 +652,63 @@ async fn handle_connection(
                     send_remote_error(&mut socket, &mut secure, Some(request_id), code, message)
                         .await?;
                     true
-                } else {
-                    match start_remote_request(
-                        engine.clone(),
-                        platform.clone(),
-                        request_slots.clone(),
-                        request.request_id,
-                        RequestPayload::Text(match request.input {
-                            CommandInput::Text { text } => text,
-                        }),
-                        processing_tx.clone(),
-                        processing.is_some() || execution.is_some(),
-                    ) {
-                        Ok(request) => processing = Some(request),
-                        Err((code, message)) => {
-                            send_remote_error(
+                } else if deferred.is_some() || processing.is_some() || execution.is_some() {
+                    send_remote_error(
+                        &mut socket,
+                        &mut secure,
+                        Some(request_id),
+                        "SERVER_BUSY",
+                        "当前连接正在处理另一请求",
+                    )
+                    .await?;
+                    true
+                } else if scheduler_enabled {
+                    let payload = RequestPayload::Text(match request.input {
+                        CommandInput::Text { text } => text,
+                    });
+                    if modeld.is_none() {
+                        send_assistant_output(
+                            &mut socket,
+                            &mut secure,
+                            Some(request_id.clone()),
+                            AssistantOutputKind::Error,
+                            "桌面模型调度器不可用，未切换到旧的直连路径",
+                            true,
+                        )
+                        .await?;
+                        send_remote_error(
+                            &mut socket,
+                            &mut secure,
+                            Some(request_id),
+                            "MODEL_SCHEDULER_UNAVAILABLE",
+                            "桌面模型调度器不可用",
+                        )
+                        .await?;
+                    } else {
+                        let (kind, prompt) =
+                            initial_model_decision(explicit_cloud_mode, local_planning_available);
+                        deferred = Some(
+                            send_decision_request(
                                 &mut socket,
                                 &mut secure,
-                                Some(request_id),
-                                code,
-                                message,
+                                request_id,
+                                payload,
+                                kind,
+                                prompt,
                             )
-                            .await?;
-                        }
+                            .await?,
+                        );
                     }
+                    true
+                } else {
+                    send_remote_error(
+                        &mut socket,
+                        &mut secure,
+                        Some(request_id),
+                        "MODEL_SCHEDULER_DISABLED",
+                        "桌面模型调度器已关闭；远程请求不会使用旧直连路径",
+                    )
+                    .await?;
                     true
                 }
             }
@@ -601,7 +723,11 @@ async fn handle_connection(
                         "请求过于频繁",
                     )
                     .await?;
-                } else if active_audio.is_some() || processing.is_some() || execution.is_some() {
+                } else if active_audio.is_some()
+                    || deferred.is_some()
+                    || processing.is_some()
+                    || execution.is_some()
+                {
                     send_remote_error(
                         &mut socket,
                         &mut secure,
@@ -651,26 +777,52 @@ async fn handle_connection(
                     .and_then(|upload| upload.finish(&end));
                 match result {
                     Ok(wav) => {
-                        match start_remote_request(
-                            engine.clone(),
-                            platform.clone(),
-                            request_slots.clone(),
-                            request_id.clone(),
-                            RequestPayload::AudioWav(wav),
-                            processing_tx.clone(),
-                            processing.is_some() || execution.is_some(),
-                        ) {
-                            Ok(request) => processing = Some(request),
-                            Err((code, message)) => {
+                        let payload = RequestPayload::AudioWav(wav);
+                        if scheduler_enabled {
+                            if modeld.is_none() {
+                                send_assistant_output(
+                                    &mut socket,
+                                    &mut secure,
+                                    Some(request_id.clone()),
+                                    AssistantOutputKind::Error,
+                                    "桌面模型调度器不可用，未切换到旧的直连路径",
+                                    true,
+                                )
+                                .await?;
                                 send_remote_error(
                                     &mut socket,
                                     &mut secure,
                                     Some(request_id),
-                                    code,
-                                    message,
+                                    "MODEL_SCHEDULER_UNAVAILABLE",
+                                    "桌面模型调度器不可用",
                                 )
                                 .await?;
+                            } else {
+                                let (kind, prompt) = initial_model_decision(
+                                    explicit_cloud_mode,
+                                    local_planning_available,
+                                );
+                                deferred = Some(
+                                    send_decision_request(
+                                        &mut socket,
+                                        &mut secure,
+                                        request_id,
+                                        payload,
+                                        kind,
+                                        prompt,
+                                    )
+                                    .await?,
+                                );
                             }
+                        } else {
+                            send_remote_error(
+                                &mut socket,
+                                &mut secure,
+                                Some(request_id),
+                                "MODEL_SCHEDULER_DISABLED",
+                                "桌面模型调度器已关闭；远程请求不会使用旧直连路径",
+                            )
+                            .await?;
                         }
                     }
                     Err(error) => send_remote_error_value(&mut socket, &mut secure, error).await?,
@@ -696,6 +848,12 @@ async fn handle_connection(
                 {
                     execution.take();
                 }
+                if deferred
+                    .as_ref()
+                    .is_some_and(|request| request.request_id == request_id)
+                {
+                    deferred.take();
+                }
                 if let Some(plan) = pending.take(&request_id, Instant::now()) {
                     audit::record("cancelled", "remote", &plan, None);
                 }
@@ -714,14 +872,26 @@ async fn handle_connection(
                 } else {
                     match prepare_confirm(confirm, &mut pending) {
                         ConfirmAction::Immediate(status) => {
-                            send_secure(
+                            let request_id = status.request_id.clone();
+                            publish_execution_outcome(
                                 &mut socket,
                                 &mut secure,
-                                &RemoteMessage::ExecutionStatus(status),
+                                request_id,
+                                RemoteExecutionOutcome::Status(status),
                             )
                             .await?;
                         }
                         ConfirmAction::Execute { request_id, plan } => {
+                            send_secure(
+                                &mut socket,
+                                &mut secure,
+                                &RemoteMessage::ProgressUpdate(ProgressUpdate {
+                                    request_id: request_id.clone(),
+                                    stage: ProgressStage::Executing,
+                                    message: "正在执行已确认的操作".to_string(),
+                                }),
+                            )
+                            .await?;
                             execution = Some(start_remote_execution(
                                 request_id,
                                 plan,
@@ -733,6 +903,22 @@ async fn handle_connection(
                 }
                 true
             }
+            RemoteMessage::DecisionResponse(response) => {
+                handle_decision_response(
+                    response,
+                    &mut deferred,
+                    &mut processing,
+                    &mut socket,
+                    &mut secure,
+                    engine.clone(),
+                    platform.clone(),
+                    modeld.clone(),
+                    request_slots.clone(),
+                    processing_tx.clone(),
+                    execution.is_some(),
+                )
+                .await?
+            }
             RemoteMessage::Ping(Ping { nonce }) => {
                 send_secure(
                     &mut socket,
@@ -743,6 +929,9 @@ async fn handle_connection(
                 true
             }
             RemoteMessage::Pong(_) => true,
+            RemoteMessage::ProgressUpdate(_)
+            | RemoteMessage::DecisionRequest(_)
+            | RemoteMessage::AssistantOutput(_) => false,
             _ => false,
         };
         if handled {
@@ -765,19 +954,199 @@ fn allow_request(limiter: &Arc<std::sync::Mutex<ClientRequestLimiter>>, address:
         .unwrap_or(false)
 }
 
+fn initial_model_decision(
+    explicit_cloud_mode: bool,
+    local_planning_available: bool,
+) -> (DecisionKind, &'static str) {
+    if explicit_cloud_mode {
+        return (
+            DecisionKind::UploadFullScreenshot,
+            "当前配置使用远端模型。是否允许本次上传完整桌面截图？",
+        );
+    }
+    if !local_planning_available {
+        return (
+            DecisionKind::UseRemoteModel,
+            "本地 Qwen 或定位模型不可用。是否改用远端大模型？",
+        );
+    }
+    (
+        DecisionKind::UseRemoteModel,
+        "本地模型无法可靠完成当前任务。是否升级到远端大模型？",
+    )
+}
+
+async fn send_decision_request(
+    socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    secure: &mut remote_crypto::SecureChannel,
+    request_id: String,
+    payload: RequestPayload,
+    kind: DecisionKind,
+    prompt: &str,
+) -> Result<DeferredRequest, String> {
+    let decision_id = uuid::Uuid::new_v4().to_string();
+    send_secure(
+        socket,
+        secure,
+        &RemoteMessage::ProgressUpdate(ProgressUpdate {
+            request_id: request_id.clone(),
+            stage: ProgressStage::AwaitingDecision,
+            message: "等待你的决定".to_string(),
+        }),
+    )
+    .await?;
+    send_secure(
+        socket,
+        secure,
+        &RemoteMessage::DecisionRequest(DecisionRequest {
+            request_id: request_id.clone(),
+            decision_id: decision_id.clone(),
+            kind,
+            prompt: prompt.to_string(),
+            expires_in_seconds: 30,
+        }),
+    )
+    .await?;
+    Ok(DeferredRequest {
+        request_id,
+        decision_id,
+        kind,
+        payload,
+        expires_at: Instant::now() + Duration::from_secs(30),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_decision_response(
+    response: DecisionResponse,
+    deferred: &mut Option<DeferredRequest>,
+    processing: &mut Option<ProcessingRequest>,
+    socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    secure: &mut remote_crypto::SecureChannel,
+    engine: Arc<Mutex<AleEngine>>,
+    platform: Arc<dyn PlatformService>,
+    modeld: Option<SupervisedModeldClient>,
+    request_slots: Arc<Semaphore>,
+    results: mpsc::UnboundedSender<ProcessingResult>,
+    execution_busy: bool,
+) -> Result<bool, String> {
+    let Some(waiting) = deferred.take() else {
+        return Ok(false);
+    };
+    if response.request_id != waiting.request_id || response.decision_id != waiting.decision_id {
+        *deferred = Some(waiting);
+        return Ok(false);
+    }
+    if waiting.expires_at <= Instant::now() {
+        send_remote_error(
+            socket,
+            secure,
+            Some(waiting.request_id),
+            "DECISION_TIMEOUT",
+            "决定已过期",
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    match waiting.kind {
+        DecisionKind::UseRemoteModel if !response.approved => {
+            send_assistant_output(
+                socket,
+                secure,
+                Some(waiting.request_id.clone()),
+                AssistantOutputKind::Result,
+                "已取消使用远端模型",
+                true,
+            )
+            .await?;
+            send_remote_error(
+                socket,
+                secure,
+                Some(waiting.request_id),
+                "CANCELLED",
+                "用户拒绝使用远端模型",
+            )
+            .await?;
+        }
+        DecisionKind::UseRemoteModel => {
+            if let Some(modeld) = &modeld {
+                modeld.retry_after_user_request().await;
+            }
+            *deferred = Some(
+                send_decision_request(
+                    socket,
+                    secure,
+                    waiting.request_id,
+                    waiting.payload,
+                    DecisionKind::UploadFullScreenshot,
+                    "是否允许本次向远端模型上传完整桌面截图？拒绝后只发送文字信息。",
+                )
+                .await?,
+            );
+        }
+        DecisionKind::RiskChanged if !response.approved => {
+            send_remote_error(
+                socket,
+                secure,
+                Some(waiting.request_id),
+                "CANCELLED",
+                "用户拒绝风险变化",
+            )
+            .await?;
+        }
+        DecisionKind::UploadFullScreenshot | DecisionKind::RiskChanged => {
+            let allow_full_screenshot =
+                waiting.kind == DecisionKind::UploadFullScreenshot && response.approved;
+            let Some(modeld) = modeld else {
+                send_remote_error(
+                    socket,
+                    secure,
+                    Some(waiting.request_id),
+                    "MODEL_SCHEDULER_UNAVAILABLE",
+                    "桌面模型调度器不可用",
+                )
+                .await?;
+                return Ok(true);
+            };
+            match start_remote_request(
+                engine,
+                platform,
+                Some(modeld),
+                request_slots,
+                waiting.request_id.clone(),
+                waiting.payload,
+                results,
+                processing.is_some() || execution_busy,
+                allow_full_screenshot,
+            ) {
+                Ok(request) => *processing = Some(request),
+                Err((code, message)) => {
+                    send_remote_error(socket, secure, Some(waiting.request_id), code, message)
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 enum RequestPayload {
     Text(String),
     AudioWav(Vec<u8>),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_remote_request(
     engine: Arc<Mutex<AleEngine>>,
     platform: Arc<dyn PlatformService>,
+    modeld: Option<SupervisedModeldClient>,
     request_slots: Arc<Semaphore>,
     request_id: String,
     payload: RequestPayload,
     results: mpsc::UnboundedSender<ProcessingResult>,
     connection_busy: bool,
+    allow_full_screenshot: bool,
 ) -> Result<ProcessingRequest, (&'static str, &'static str)> {
     if connection_busy {
         return Err(("SERVER_BUSY", "当前连接正在处理另一请求"));
@@ -786,11 +1155,21 @@ fn start_remote_request(
         return Err(("SERVER_BUSY", "服务器正忙"));
     };
     let task_request_id = request_id.clone();
+    let cancel_modeld = modeld.clone();
     let task = tokio::spawn(async move {
         let _request_permit = request_permit;
+        let progress = results.clone();
         let outcome = match tokio::time::timeout(
             REQUEST_TIMEOUT,
-            handle_request(engine, platform, &task_request_id, payload),
+            handle_request(
+                engine,
+                platform,
+                &task_request_id,
+                payload,
+                Some(&progress),
+                modeld.as_ref(),
+                allow_full_screenshot,
+            ),
         )
         .await
         {
@@ -809,7 +1188,11 @@ fn start_remote_request(
             outcome,
         });
     });
-    Ok(ProcessingRequest { request_id, task })
+    Ok(ProcessingRequest {
+        request_id,
+        task,
+        modeld: cancel_modeld,
+    })
 }
 
 async fn publish_processing_result(
@@ -819,7 +1202,19 @@ async fn publish_processing_result(
     secure: &mut remote_crypto::SecureChannel,
 ) -> Result<(), String> {
     match result.outcome {
-        ProcessingOutcome::Complete(preview, plan) => {
+        ProcessingOutcome::Progress(stage, message) => {
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::ProgressUpdate(ProgressUpdate {
+                    request_id: result.request_id,
+                    stage,
+                    message,
+                }),
+            )
+            .await
+        }
+        ProcessingOutcome::Complete(mut preview, plan) => {
             if let Some(plan) = plan {
                 audit::record("created", "remote", &plan, None);
                 if pending
@@ -836,9 +1231,68 @@ async fn publish_processing_result(
                     .await;
                 }
             }
-            send_secure(socket, secure, &RemoteMessage::CommandPreview(preview)).await
+            let sanitized_response = sanitize_speech_text(&preview.response_text);
+            let sanitized_confirmation = sanitize_speech_text(&preview.confirmation_text);
+            let mut sensitive = sanitized_response != preview.response_text
+                || sanitized_confirmation != preview.confirmation_text;
+            preview.response_text = sanitized_response;
+            preview.confirmation_text = sanitized_confirmation;
+            preview.action_steps = preview
+                .action_steps
+                .into_iter()
+                .map(|step| {
+                    let sanitized = sanitize_speech_text(&step);
+                    sensitive |= sanitized != step;
+                    sanitized
+                })
+                .collect();
+            let speech_source = if preview.confirmation_text.is_empty() {
+                preview.response_text.clone()
+            } else {
+                format!("{}。{}", preview.response_text, preview.confirmation_text)
+            };
+            let speech_text = sanitize_speech_text(&speech_source);
+            sensitive |= speech_text != speech_source;
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::CommandPreview(preview.clone()),
+            )
+            .await?;
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::AssistantOutput(AssistantOutput {
+                    request_id: Some(result.request_id),
+                    kind: if preview.has_plan {
+                        AssistantOutputKind::Confirmation
+                    } else {
+                        AssistantOutputKind::Information
+                    },
+                    display_text: preview.response_text,
+                    speech_text,
+                    interrupt: preview.has_plan,
+                    sensitive,
+                }),
+            )
+            .await
         }
         ProcessingOutcome::Error { code, message } => {
+            let speech_text = sanitize_speech_text(&message);
+            let sensitive = speech_text != message;
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::AssistantOutput(AssistantOutput {
+                    request_id: Some(result.request_id.clone()),
+                    kind: AssistantOutputKind::Error,
+                    display_text: speech_text.clone(),
+                    speech_text,
+                    interrupt: true,
+                    sensitive,
+                }),
+            )
+            .await?;
             send_remote_error(socket, secure, Some(result.request_id), code, &message).await
         }
     }
@@ -854,7 +1308,7 @@ async fn handle_command(
     let payload = match input {
         CommandInput::Text { text } => RequestPayload::Text(text.clone()),
     };
-    handle_request(engine, platform, request_id, payload).await
+    handle_request(engine, platform, request_id, payload, None, None, true).await
 }
 
 async fn handle_request(
@@ -862,27 +1316,71 @@ async fn handle_request(
     platform: Arc<dyn PlatformService>,
     request_id: &str,
     input: RequestPayload,
+    progress: Option<&mpsc::UnboundedSender<ProcessingResult>>,
+    modeld: Option<&SupervisedModeldClient>,
+    allow_full_screenshot: bool,
 ) -> Result<(CommandPreview, Option<ActionPlan>), String> {
     let request_id = request_id.to_string();
     let question = match input {
         RequestPayload::Text(text) => text,
         RequestPayload::AudioWav(audio) => {
-            let engine = engine.lock().await;
-            engine
-                .transcribe(&audio)
-                .await
-                .map_err(|error| error.to_string())?
+            report_progress(
+                progress,
+                &request_id,
+                ProgressStage::Transcribing,
+                "正在识别语音",
+            );
+            if let Some(client) = modeld {
+                client.transcribe_wav(&request_id, &audio, true).await?.text
+            } else {
+                let engine = engine.lock().await;
+                engine
+                    .transcribe(&audio)
+                    .await
+                    .map_err(|error| error.to_string())?
+            }
         }
     };
 
-    let image = platform.capture_image();
-    let response = if let Some(ref image) = image {
+    report_progress(
+        progress,
+        &request_id,
+        ProgressStage::CapturingState,
+        "正在获取桌面状态",
+    );
+    let image = allow_full_screenshot
+        .then(|| platform.capture_image())
+        .flatten();
+    report_progress(
+        progress,
+        &request_id,
+        ProgressStage::Planning,
+        "正在规划操作",
+    );
+    let mut response = if let Some(client) = modeld {
+        let prepared_question = {
+            let engine = engine.lock().await;
+            engine.prepare_vision_question(&question)
+        };
+        let mut result = client
+            .remote_plan(
+                &request_id,
+                prepared_question,
+                image.as_ref().map(|image| image.jpeg_data.as_slice()),
+                image.as_ref().map(|_| semantic_automation_tools()),
+            )
+            .await?;
+        if let Some(notice) = result.failover_notice.take() {
+            result.response.content = format!("{notice}。{}", result.response.content);
+        }
+        result.response
+    } else if let Some(ref image) = image {
         let engine = engine.lock().await;
         engine
             .ask_about_image_with_tools(&image.jpeg_data, &question, automation_tools())
             .await
             .map_err(|error| error.to_string())?
-    } else {
+    } else if modeld.is_none() {
         let engine = engine.lock().await;
         let response = engine
             .ask_text(&question)
@@ -899,11 +1397,28 @@ async fn handle_request(
             },
             None,
         ));
+    } else {
+        unreachable!("modeld branch handled above")
     };
 
     let mut action_steps = Vec::new();
     let mut plan = None;
-    if let Some(calls) = response.tool_calls {
+    if modeld.is_some() {
+        if let Some(calls) = response.tool_calls.as_ref() {
+            let semantic = calls
+                .iter()
+                .filter(|call| call.function.name == "propose_semantic_plan")
+                .collect::<Vec<_>>();
+            if semantic.len() == 1 {
+                if let Ok(parsed) = parse_semantic_plan_arguments(&semantic[0].function.arguments) {
+                    action_steps = parsed.describe_steps();
+                    response.content.push_str(
+                        "\n\n已生成语义计划；本地 ShowUI/UI-TARS 未返回可信定位，未创建可执行坐标。",
+                    );
+                }
+            }
+        }
+    } else if let Some(calls) = response.tool_calls {
         let executable = calls
             .iter()
             .filter(|call| call.function.name == "execute_action_plan")
@@ -944,6 +1459,56 @@ async fn handle_request(
         },
         plan,
     ))
+}
+
+fn parse_semantic_plan_arguments(arguments: &str) -> Result<SemanticPlan, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+    let plan_value = value.get("plan").cloned().unwrap_or(value);
+    let plan: SemanticPlan =
+        serde_json::from_value(plan_value).map_err(|error| error.to_string())?;
+    validate_semantic_plan(plan).map_err(|error| error.to_string())
+}
+
+fn semantic_automation_tools() -> Vec<serde_json::Value> {
+    vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "propose_semantic_plan",
+            "description": "Propose semantic desktop steps. Do not return coordinates. Every step must include an observable postcondition.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": { "type": "string" },
+                    "application_id": { "type": ["string", "null"] },
+                    "steps": {
+                        "type": "array",
+                        "maxItems": 20,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "operation": { "type": "string" },
+                                "target": {
+                                    "type": ["object", "null"],
+                                    "properties": {
+                                        "node_id": { "type": ["string", "null"] },
+                                        "role": { "type": ["string", "null"] },
+                                        "label": { "type": ["string", "null"] },
+                                        "visual_description": { "type": ["string", "null"] }
+                                    }
+                                },
+                                "input_summary": { "type": ["string", "null"] },
+                                "expected_state": { "type": "string" },
+                                "risk": { "type": "string", "enum": ["low", "medium", "high"] }
+                            },
+                            "required": ["operation", "expected_state", "risk"]
+                        }
+                    }
+                },
+                "required": ["goal", "steps"]
+            }
+        }
+    })]
 }
 
 fn prepare_confirm(confirm: ConfirmExecution, pending: &mut PendingPlans) -> ConfirmAction {
@@ -1034,13 +1599,114 @@ async fn publish_execution_outcome(
     outcome: RemoteExecutionOutcome,
 ) -> Result<(), String> {
     match outcome {
-        RemoteExecutionOutcome::Status(status) => {
-            send_secure(socket, secure, &RemoteMessage::ExecutionStatus(status)).await
+        RemoteExecutionOutcome::Status(mut status) => {
+            let speech_text = sanitize_speech_text(&status.message);
+            let sensitive = speech_text != status.message;
+            status.message = speech_text.clone();
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::ExecutionStatus(status.clone()),
+            )
+            .await?;
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::AssistantOutput(AssistantOutput {
+                    request_id: Some(request_id),
+                    kind: AssistantOutputKind::Result,
+                    display_text: speech_text.clone(),
+                    speech_text,
+                    interrupt: false,
+                    sensitive,
+                }),
+            )
+            .await
         }
         RemoteExecutionOutcome::Error { code, message } => {
+            let speech_text = sanitize_speech_text(&message);
+            let sensitive = speech_text != message;
+            send_secure(
+                socket,
+                secure,
+                &RemoteMessage::AssistantOutput(AssistantOutput {
+                    request_id: Some(request_id.clone()),
+                    kind: AssistantOutputKind::Error,
+                    display_text: speech_text.clone(),
+                    speech_text,
+                    interrupt: true,
+                    sensitive,
+                }),
+            )
+            .await?;
             send_remote_error(socket, secure, Some(request_id), code, &message).await
         }
     }
+}
+
+fn report_progress(
+    sender: Option<&mpsc::UnboundedSender<ProcessingResult>>,
+    request_id: &str,
+    stage: ProgressStage,
+    message: &str,
+) {
+    if let Some(sender) = sender {
+        let _ = sender.send(ProcessingResult {
+            request_id: request_id.to_string(),
+            outcome: ProcessingOutcome::Progress(stage, message.to_string()),
+        });
+    }
+}
+
+fn sanitize_speech_text(text: &str) -> String {
+    let mut redacted = Vec::new();
+    for token in text.split_whitespace().take(300) {
+        let lower = token.to_ascii_lowercase();
+        let looks_like_secret = lower.starts_with("sk-")
+            || lower.starts_with("bearer")
+            || lower.contains("password=")
+            || lower.contains("api_key=")
+            || (token.len() >= 24
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte)));
+        let looks_like_path = token.starts_with('/')
+            || (token.len() > 3
+                && token.as_bytes().get(1) == Some(&b':')
+                && matches!(token.as_bytes().get(2), Some(b'\\') | Some(b'/')));
+        if looks_like_secret {
+            redacted.push("[敏感信息已隐藏]");
+        } else if looks_like_path {
+            redacted.push("[路径已隐藏]");
+        } else {
+            redacted.push(token);
+        }
+    }
+    redacted.join(" ")
+}
+
+async fn send_assistant_output(
+    socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    secure: &mut remote_crypto::SecureChannel,
+    request_id: Option<String>,
+    kind: AssistantOutputKind,
+    text: &str,
+    interrupt: bool,
+) -> Result<(), String> {
+    let speech_text = sanitize_speech_text(text);
+    send_secure(
+        socket,
+        secure,
+        &RemoteMessage::AssistantOutput(AssistantOutput {
+            request_id,
+            kind,
+            display_text: speech_text.clone(),
+            sensitive: speech_text != text,
+            speech_text,
+            interrupt,
+        }),
+    )
+    .await
 }
 
 fn execute_confirm(
@@ -1092,13 +1758,14 @@ async fn send_remote_error(
     code: &str,
     message: &str,
 ) -> Result<(), String> {
+    let message = sanitize_speech_text(message);
     send_secure(
         socket,
         secure,
         &RemoteMessage::Error(RemoteError {
             request_id,
             code: code.to_string(),
-            message: message.to_string(),
+            message,
         }),
     )
     .await
@@ -1521,6 +2188,7 @@ mod tests {
 
     fn write_test_config(path: &Path, api_url: String, model: &str) -> AppConfig {
         let mut config = AppConfig::default();
+        config.model_scheduler.enabled = false;
         config.cloud_api.api_url = api_url;
         config.cloud_api.model = model.to_string();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1618,22 +2286,26 @@ mod tests {
         let request = start_remote_request(
             Arc::new(Mutex::new(engine)),
             platform,
+            None,
             Arc::new(Semaphore::new(1)),
             "cancel-request".to_string(),
             RequestPayload::Text("wait".to_string()),
             results,
             false,
+            true,
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(request);
-        let received = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
-        assert!(matches!(received, Err(_) | Ok(None)));
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while let Ok(Some(result)) = tokio::time::timeout_at(deadline, receiver.recv()).await {
+            assert!(matches!(result.outcome, ProcessingOutcome::Progress(_, _)));
+        }
         endpoint.abort();
     }
 
     #[tokio::test]
-    async fn real_pc_handler_completes_noise_preview_confirm_status_loopback() {
+    async fn real_pc_handler_does_not_bypass_disabled_model_scheduler() {
         let action_arguments = serde_json::json!({
             "actions": [{"type": "click", "x": 49.5, "y": 49.5, "button": "left"}],
             "risk_level": "low",
@@ -1690,6 +2362,10 @@ mod tests {
                 MAX_TRACKED_REQUEST_CLIENTS,
             ))),
             pairing_limiter: Arc::new(std::sync::Mutex::new(PairingLimiter::default())),
+            modeld: None,
+            scheduler_enabled: false,
+            explicit_cloud_mode: true,
+            local_planning_available: false,
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1763,7 +2439,7 @@ mod tests {
             socket.send(Message::Binary(frame)).await.unwrap();
         }
 
-        let preview = loop {
+        let rejection = loop {
             let frame = socket.next().await.unwrap().unwrap().into_data();
             if let Some(message) = secure
                 .decrypt_frame(&frame, remote_crypto::MAX_SECURE_MESSAGE_BYTES)
@@ -1772,45 +2448,16 @@ mod tests {
                 break message;
             }
         };
-        let RemoteMessage::CommandPreview(preview) = preview else {
-            panic!("expected command preview");
+        let RemoteMessage::Error(rejection) = rejection else {
+            panic!("expected scheduler-disabled error");
         };
-        assert_eq!(preview.request_id, "loopback-request");
-        assert_eq!(preview.response_text, "ready");
-        assert!(preview.has_plan);
-        assert!(preview.requires_confirmation);
-        assert_eq!(preview.action_steps.len(), 1);
-
-        for frame in secure
-            .encrypt_message(&RemoteMessage::ConfirmExecution(ConfirmExecution {
-                request_id: preview.request_id,
-                approved: true,
-            }))
-            .unwrap()
-        {
-            socket.send(Message::Binary(frame)).await.unwrap();
-        }
-        let status = loop {
-            let frame = socket.next().await.unwrap().unwrap().into_data();
-            if let Some(message) = secure
-                .decrypt_frame(&frame, remote_crypto::MAX_SECURE_MESSAGE_BYTES)
-                .unwrap()
-            {
-                break message;
-            }
-        };
-        let RemoteMessage::ExecutionStatus(status) = status else {
-            panic!("expected execution status");
-        };
-        assert_eq!(status.request_id, "loopback-request");
-        assert_eq!(status.state, ExecutionState::Completed);
-        assert_eq!(status.actions_executed, 1);
-        assert_eq!(platform.executed.load(Ordering::SeqCst), 1);
+        assert_eq!(rejection.request_id.as_deref(), Some("loopback-request"));
+        assert_eq!(rejection.code, "MODEL_SCHEDULER_DISABLED");
+        assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
 
         socket.close(None).await.unwrap();
         assert!(server.await.unwrap().is_ok());
-        let api_request = api_request.await.unwrap();
-        assert!(api_request.contains(r#""model":"loopback-model""#));
+        api_request.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1827,6 +2474,17 @@ mod tests {
         assert!(session_a
             .take("request", now + Duration::from_secs(3))
             .is_none());
+    }
+
+    #[test]
+    fn assistant_output_redacts_secrets_and_sensitive_paths() {
+        let output = sanitize_speech_text(
+            "key sk-abcdefghijklmnopqrstuvwxyz path /Users/alice/private.txt ok",
+        );
+        assert!(!output.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(!output.contains("/Users/alice/private.txt"));
+        assert!(output.contains("[敏感信息已隐藏]"));
+        assert!(output.contains("[路径已隐藏]"));
     }
 
     #[test]

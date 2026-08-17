@@ -7,6 +7,8 @@ pub mod error;
 pub mod inference;
 pub mod manager;
 pub mod memory;
+pub mod model_ipc;
+pub mod model_scheduler;
 pub mod remote;
 pub mod secret_store;
 pub mod types;
@@ -205,6 +207,10 @@ impl AleEngine {
             "请结合随附图片和以下上下文回答。若用户要求执行操作，请使用可用工具生成操作计划。\n\n{}",
             context
         )
+    }
+
+    pub fn prepare_vision_question(&self, question: &str) -> String {
+        self.vision_question_with_context(question)
     }
 
     /// 设置云端API
@@ -551,6 +557,33 @@ impl AleEngine {
     pub async fn download_model(&self, model_id: &str) -> Result<std::path::PathBuf> {
         let mut manager = self.model_manager.lock().await;
         manager.download_model(model_id).await
+    }
+
+    pub async fn model_package_consent(
+        &self,
+        manifest: &model_scheduler::ModelManifest,
+        package_id: &str,
+    ) -> Result<downloader::ModelInstallConsent> {
+        let manager = self.model_manager.lock().await;
+        manager.package_install_consent(manifest, package_id)
+    }
+
+    pub async fn install_model_package(
+        &self,
+        manifest: &model_scheduler::ModelManifest,
+        consent: &downloader::ModelInstallConsent,
+    ) -> Result<downloader::InstalledModelPackage> {
+        let manager = self.model_manager.lock().await;
+        manager.install_pinned_package(manifest, consent).await
+    }
+
+    pub async fn verify_model_package(
+        &self,
+        manifest: &model_scheduler::ModelManifest,
+        package_id: &str,
+    ) -> Result<downloader::InstalledModelPackage> {
+        let manager = self.model_manager.lock().await;
+        manager.verify_pinned_package(manifest, package_id)
     }
 
     /// 删除模型

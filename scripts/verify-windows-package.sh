@@ -10,6 +10,7 @@ objdump=${WINDOWS_OBJDUMP:-x86_64-w64-mingw32-objdump}
 strings_tool=${WINDOWS_STRINGS:-x86_64-w64-mingw32-strings}
 
 for path in "$archive" "$package_dir/ale-gui.exe" "$package_dir/ale-cli.exe" \
+    "$package_dir/ale-modeld.exe" \
     "$package_dir/start-gui.bat" "$package_dir/README.txt" "$package_dir/LICENSE"; do
     test -s "$path"
 done

@@ -18,18 +18,20 @@ The code-level P0 and P1 remediation is implemented and covered by automated tes
 | P1-2 remote limits and isolation | Connection/request/rate/frame/text/audio/pending limits, TTL, pairing throttling, per-session plans, and bounded-client stress pass | LAN interruption and concurrent-client native run | Automated complete |
 | P1-3 API key exposure | Password input, timed reveal, and capture suspension while sensitive UI is visible | Confirm packaged GUI behavior and screen-capture exclusion | Automated complete |
 | P1-4 public HTTP endpoint | Public HTTP is rejected and loopback HTTP is allowed; configuration tests pass | None | Complete |
-| P1-5 main-flow integration | Mock HTTP success/failure tests, Noise loopback, coordinate-to-confirmation chain, and cancellation regression pass | Full Android v2 to real desktop workflow | Automated complete |
-| P2-1 experimental product claims | Production defaults and README describe cloud-only supported behavior | None | Complete |
+| P1-5 main-flow integration | Mock HTTP success/failure tests, Noise loopback, coordinate-to-confirmation chain, and cancellation regression pass | Full Android v3 to real desktop workflow | Automated complete |
+| P2-1 experimental product claims | Production defaults and README distinguish the scheduler safety path from unavailable local VLM runtimes | Native GPU runtime acceptance remains pending | In progress |
 | P2-2 packaging and release | Windows/Linux/source scripts, Windows verifier, Linux smoke, Nix Flake/module, and release workflow updated | Native Windows package, Linux Xvfb, and `nix flake check`/build/module evaluation | Pending native evidence |
 
-## Remote protocol v2
+## Remote protocol v3
 
-- Desktop and Android use protocol version 2 and identical golden JSON fixtures.
+- Desktop and Android use protocol version 3 and identical golden JSON fixtures.
 - The wire protocol supports persistent Noise-over-WebSocket sessions, text commands, PCM16 `AudioStart`/`AudioChunk`/`AudioEnd`, cancellation, confirmation, errors, and ping/pong.
 - Audio is mono PCM16 at 8-96 kHz, with 24,576-byte decoded chunks and a 60-second limit.
 - The desktop validates sequence, byte limits, total frames, and SHA-256 before creating a WAV or invoking ASR.
 - Inference runs in a cancellable per-connection task. The connection continues to process cancellation and heartbeat messages; dropping or disconnecting the request prevents a late preview.
-- Protocol v1 has no fallback. A version mismatch returns `PROTOCOL_INCOMPATIBLE`.
+- Older protocol versions have no fallback. A version mismatch returns `PROTOCOL_INCOMPATIBLE`.
+- v3 adds progress updates, explicit yes/no decisions, and separately redacted display and speech output.
+- Model scheduling implementation status is tracked in `docs/MODEL-SCHEDULER-STATUS.md`.
 
 ## Automated evidence
 
@@ -37,7 +39,7 @@ The code-level P0 and P1 remediation is implemented and covered by automated tes
 | --- | --- |
 | `cargo fmt --all -- --check` | Passed |
 | `cargo check --workspace --locked` | Passed |
-| `cargo test --workspace --locked` | Passed: 71 core, 40 GUI; one real-display test ignored |
+| `cargo test --workspace --locked` | Passed: 85 core, 44 GUI, 9 modeld unit tests, and 1 real-process IPC test; one real-display test ignored |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | Passed |
 | `scripts/verify-pc-issues.sh` | Passed |
 | `scripts/stress-pc-io.sh` | Passed |
@@ -59,4 +61,4 @@ Record the OS version, hardware, display topology/scaling, microphone format, pa
 | Windows | Package launch; 100/150/200% scaling; right and negative monitors; 44.1/48 kHz microphones; ten-minute listening | Pending |
 | Linux | Package launch under X11/Xvfb and a real desktop; CLI status; TCP 37654; microphone and automation smoke | Pending |
 | NixOS | `nix flake check --all-systems`, x86_64 package build, aarch64 evaluation, module evaluation, GUI/CLI launch | Pending |
-| Android interoperability | Scan desktop v2 QR, 1/10/60-second audio, preview, reject/confirm, cancel, timeout, and disconnect | Owned by the independent Android validation task |
+| Android interoperability | Scan desktop v3 QR, 1/10/60-second audio, preview, decisions, reject/confirm, TTS, cancel, timeout, and disconnect | Owned by the independent Android validation task |

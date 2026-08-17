@@ -58,8 +58,10 @@
           nativeBuildInputs = with pkgs; [ clang makeWrapper pkg-config ];
           buildInputs = runtimeLibraries;
           LIBCLANG_PATH = "${lib.getLib pkgs.llvmPackages.libclang}/lib";
-          cargoBuildFlags = [ "--workspace" ];
-          cargoTestFlags = [ "--workspace" ];
+          # sherpa-rs downloads native archives during its build script, which is
+          # incompatible with the Nix sandbox until those archives are packaged.
+          cargoBuildFlags = [ "--workspace" "--no-default-features" ];
+          cargoTestFlags = [ "--workspace" "--no-default-features" ];
           preCheck = ''
             export HOME="$TMPDIR"
           '';
@@ -67,6 +69,7 @@
             runHook preInstall
             install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/ale-cli "$out/bin/ale-cli"
             install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/ale-gui "$out/bin/ale-gui"
+            install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/ale-modeld "$out/bin/ale-modeld"
             wrapProgram "$out/bin/ale-gui" \
               --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibraries}
             runHook postInstall

@@ -26,6 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 walkdir = "2"
 log = "0.4"
 async-trait = "0.1"
+prost = { workspace = true }
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
 tokio-stream = "0.1"
 futures = "0.3"

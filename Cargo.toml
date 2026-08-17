@@ -3,6 +3,7 @@ members = [
     "ale-core",
     "ale-cli",
     "ale-gui",
+    "ale-modeld",
 ]
 resolver = "2"
 
@@ -22,6 +23,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 walkdir = "2"
 async-trait = "0.1"
+prost = "0.13"
 
 [patch.crates-io]
 i-slint-backend-winit = { path = "vendor/i-slint-backend-winit-1.16.1" }

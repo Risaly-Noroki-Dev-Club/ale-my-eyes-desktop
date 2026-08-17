@@ -4,11 +4,13 @@ Desktop application for Ale, My Eyes!, providing continuous voice interaction, s
 
 This repository is intentionally independent from the mobile application. It owns its GUI, desktop runtime, CLI, and a private copy of `ale-core`; it has no source or Cargo dependency on `ale-my-eyes-mobile`.
 
-## Supported inference
+## Model scheduler
 
-The production desktop build uses the OpenAI-compatible cloud transport. Custom endpoints must implement that protocol; provider labels such as Anthropic, Google, or Azure do not enable their native APIs.
+The desktop owns the `ale-modeld` child process and communicates with it only through a private Unix socket or Windows named pipe. IPC is authenticated with a one-time token passed through inherited stdin. Remote credentials are loaded from the OS secret store and sent only over that authenticated session.
 
-Local ASR and ONNX image description are experimental and available only when explicitly built with `ale-core/local-inference`. Local text generation, visual question answering, automation planning, and automatic cloud/local fallback are not production-supported and are not exposed in the standard desktop UI.
+SenseVoiceSmall ASR is supported through sherpa-onnx and resamples mono PCM16 input to 16 kHz. Qwen2.5-VL, ShowUI, and UI-TARS remain gated until their GPU runtimes and pinned model packages are installed; missing local capability is reported to Android and never silently replaced by cloud inference. A remote model may return only a semantic plan, never executable coordinates.
+
+See [model scheduler status](docs/MODEL-SCHEDULER-STATUS.md) for implemented boundaries and remaining native acceptance work.
 
 ## Development
 
@@ -36,6 +38,6 @@ programs.ale-my-eyes.enable = true;
 
 It does not create a service, enable autostart, or place API credentials in the Nix store. macOS packaging and support have been removed.
 
-The desktop remote server implements protocol v2 for the Android arm64 client. Protocol v1 peers are rejected without fallback.
+The desktop remote server implements protocol v3 for the Android arm64 client. Older peers are rejected without fallback. Protocol v3 adds progress, explicit privacy/risk decisions, and separately redacted display and speech output.
 
 See the mobile client at https://github.com/Risaly-Noroki-Dev-Club/ale-my-eyes-mobile.

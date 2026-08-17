@@ -1,5 +1,8 @@
+use crate::model_scheduler::{ModelArtifact, ModelManifest};
 use crate::{AleError, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -32,6 +35,21 @@ pub struct DownloadProgress {
 /// 进度回调函数类型
 pub type ProgressCallback = Box<dyn Fn(DownloadProgress) + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInstallConsent {
+    pub package_id: String,
+    pub license: String,
+    pub download_size_bytes: u64,
+    pub required_disk_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledModelPackage {
+    pub package_id: String,
+    pub directory: PathBuf,
+    pub artifacts: Vec<PathBuf>,
+}
+
 /// 模型下载器
 pub struct ModelDownloader {
     models_dir: PathBuf,
@@ -58,6 +76,180 @@ impl ModelDownloader {
     /// 设置进度回调
     pub fn set_progress_callback(&mut self, callback: ProgressCallback) {
         self.progress_callback = Some(callback);
+    }
+
+    pub fn package_consent(
+        manifest: &ModelManifest,
+        package_id: &str,
+    ) -> Result<ModelInstallConsent> {
+        let package = manifest.package(package_id)?;
+        Ok(ModelInstallConsent {
+            package_id: package.id.clone(),
+            license: package.license.clone(),
+            download_size_bytes: package.download_size_bytes()?,
+            required_disk_bytes: package.required_disk_bytes()?,
+        })
+    }
+
+    pub async fn install_package(
+        &self,
+        manifest: &ModelManifest,
+        consent: &ModelInstallConsent,
+    ) -> Result<InstalledModelPackage> {
+        let package = manifest.package(&consent.package_id)?;
+        let expected = Self::package_consent(manifest, &package.id)?;
+        if !package.requires_explicit_consent || consent != &expected {
+            return Err(AleError::ConfigError(
+                "model download consent does not match the pinned package metadata".to_string(),
+            ));
+        }
+
+        let package_dir = self.models_dir.join(&package.id);
+        std::fs::create_dir_all(&package_dir)?;
+        let mut installed = Vec::with_capacity(package.artifacts.len());
+        for artifact in &package.artifacts {
+            let target = package_dir.join(&artifact.filename);
+            if target.is_file() {
+                verify_artifact(&target, artifact)?;
+            } else {
+                self.download_pinned_artifact(&package.id, artifact, &target)
+                    .await?;
+            }
+            installed.push(target);
+        }
+        Ok(InstalledModelPackage {
+            package_id: package.id.clone(),
+            directory: package_dir,
+            artifacts: installed,
+        })
+    }
+
+    pub fn verify_package(
+        &self,
+        manifest: &ModelManifest,
+        package_id: &str,
+    ) -> Result<InstalledModelPackage> {
+        let package = manifest.package(package_id)?;
+        let directory = self.models_dir.join(&package.id);
+        let artifacts = package
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let path = directory.join(&artifact.filename);
+                verify_artifact(&path, artifact)?;
+                Ok(path)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(InstalledModelPackage {
+            package_id: package.id.clone(),
+            directory,
+            artifacts,
+        })
+    }
+
+    async fn download_pinned_artifact(
+        &self,
+        package_id: &str,
+        artifact: &ModelArtifact,
+        target: &Path,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .get(&artifact.url)
+            .send()
+            .await
+            .map_err(|error| {
+                AleError::Other(anyhow::anyhow!("Download request failed: {error}"))
+            })?;
+        if !response.status().is_success() {
+            return Err(AleError::Other(anyhow::anyhow!(
+                "Download failed with status: {}",
+                response.status()
+            )));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length != artifact.size_bytes)
+        {
+            return Err(AleError::Other(anyhow::anyhow!(
+                "Pinned artifact size does not match Content-Length"
+            )));
+        }
+
+        let temp = target.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
+        let result = async {
+            let mut file = std::fs::File::create(&temp)?;
+            let mut hasher = Sha256::new();
+            let mut downloaded = 0_u64;
+            let started = std::time::Instant::now();
+            let mut stream = response.bytes_stream();
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk
+                    .map_err(|error| AleError::Other(anyhow::anyhow!("Download error: {error}")))?;
+                downloaded = downloaded.checked_add(chunk.len() as u64).ok_or_else(|| {
+                    AleError::Other(anyhow::anyhow!("Downloaded artifact size overflow"))
+                })?;
+                if downloaded > artifact.size_bytes {
+                    return Err(AleError::Other(anyhow::anyhow!(
+                        "Downloaded artifact exceeds pinned size"
+                    )));
+                }
+                file.write_all(&chunk)?;
+                hasher.update(&chunk);
+                self.report_package_progress(package_id, artifact.size_bytes, downloaded, started);
+            }
+            file.sync_all()?;
+            if downloaded != artifact.size_bytes {
+                return Err(AleError::Other(anyhow::anyhow!(
+                    "Downloaded artifact is shorter than pinned size"
+                )));
+            }
+            let actual = format!("{:x}", hasher.finalize());
+            if !actual.eq_ignore_ascii_case(&artifact.sha256) {
+                return Err(AleError::Other(anyhow::anyhow!(
+                    "Downloaded artifact SHA-256 mismatch"
+                )));
+            }
+            std::fs::rename(&temp, target)?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn report_package_progress(
+        &self,
+        package_id: &str,
+        total_bytes: u64,
+        downloaded_bytes: u64,
+        started: std::time::Instant,
+    ) {
+        let elapsed = started.elapsed().as_secs_f32();
+        let speed = if elapsed > 0.0 {
+            downloaded_bytes as f32 / elapsed
+        } else {
+            0.0
+        };
+        let remaining = total_bytes.saturating_sub(downloaded_bytes);
+        let eta = if speed > 0.0 {
+            (remaining as f32 / speed) as u32
+        } else {
+            0
+        };
+        if let Some(callback) = &self.progress_callback {
+            callback(DownloadProgress {
+                model_id: package_id.to_string(),
+                total_bytes,
+                downloaded_bytes,
+                progress: downloaded_bytes as f32 / total_bytes as f32,
+                speed,
+                eta,
+            });
+        }
     }
 
     /// 默认的已知模型列表
@@ -310,6 +502,39 @@ impl ModelDownloader {
     }
 }
 
+fn verify_artifact(path: &Path, artifact: &ModelArtifact) -> Result<()> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        AleError::Other(anyhow::anyhow!(
+            "Pinned model artifact is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.len() != artifact.size_bytes {
+        return Err(AleError::Other(anyhow::anyhow!(
+            "Pinned model artifact size mismatch at {}",
+            path.display()
+        )));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(&artifact.sha256) {
+        return Err(AleError::Other(anyhow::anyhow!(
+            "Pinned model artifact SHA-256 mismatch at {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// 模型下载管理器（带缓存和并发控制）
 pub struct ModelDownloadManager {
     downloader: Arc<Mutex<ModelDownloader>>,
@@ -370,5 +595,58 @@ impl ModelDownloadManager {
         }
 
         Ok(all_paths)
+    }
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::*;
+    use crate::model_scheduler::{ModelCapability, ModelPackage};
+
+    fn manifest(bytes: &[u8]) -> ModelManifest {
+        ModelManifest {
+            schema_version: 1,
+            packages: vec![ModelPackage {
+                id: "test-model".to_string(),
+                display_name: "Test Model".to_string(),
+                license: "Apache-2.0".to_string(),
+                capabilities: vec![ModelCapability::StateSummary],
+                minimum_vram_bytes: 0,
+                requires_explicit_consent: true,
+                artifacts: vec![ModelArtifact {
+                    filename: "model.bin".to_string(),
+                    url: "https://example.invalid/model.bin".to_string(),
+                    revision: "0123456789abcdef".to_string(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                    size_bytes: bytes.len() as u64,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn consent_is_bound_to_license_and_sizes() {
+        let manifest = manifest(b"model");
+        let consent = ModelDownloader::package_consent(&manifest, "test-model").unwrap();
+        assert_eq!(consent.license, "Apache-2.0");
+        assert_eq!(consent.download_size_bytes, 5);
+        assert_eq!(consent.required_disk_bytes, 10);
+    }
+
+    #[test]
+    fn installed_package_is_reverified_before_use() {
+        let root = std::env::temp_dir().join(format!("ale-model-{}", uuid::Uuid::new_v4()));
+        let package_dir = root.join("test-model");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("model.bin"), b"model").unwrap();
+        let downloader = ModelDownloader::new(&root);
+        assert!(downloader
+            .verify_package(&manifest(b"model"), "test-model")
+            .is_ok());
+        std::fs::write(package_dir.join("model.bin"), b"tampered").unwrap();
+        assert!(downloader
+            .verify_package(&manifest(b"model"), "test-model")
+            .is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

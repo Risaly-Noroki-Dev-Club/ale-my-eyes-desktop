@@ -1,5 +1,6 @@
-use crate::downloader::{ModelDownloader, ModelInfo};
+use crate::downloader::{InstalledModelPackage, ModelDownloader, ModelInfo, ModelInstallConsent};
 use crate::inference::{DevicePerformance, NetworkStatus};
+use crate::model_scheduler::ModelManifest;
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             strategy: ModelStrategy::Smart,
-            auto_download: true,
+            auto_download: false,
             max_download_size: 500 * 1024 * 1024, // 500MB
             preferred_quality: "balanced".to_string(),
             offline_mode: false,
@@ -309,6 +310,30 @@ impl SmartModelManager {
         Ok(path)
     }
 
+    pub fn package_install_consent(
+        &self,
+        manifest: &ModelManifest,
+        package_id: &str,
+    ) -> Result<ModelInstallConsent> {
+        ModelDownloader::package_consent(manifest, package_id)
+    }
+
+    pub async fn install_pinned_package(
+        &self,
+        manifest: &ModelManifest,
+        consent: &ModelInstallConsent,
+    ) -> Result<InstalledModelPackage> {
+        self.downloader.install_package(manifest, consent).await
+    }
+
+    pub fn verify_pinned_package(
+        &self,
+        manifest: &ModelManifest,
+        package_id: &str,
+    ) -> Result<InstalledModelPackage> {
+        self.downloader.verify_package(manifest, package_id)
+    }
+
     /// 删除模型
     pub fn delete_model(&mut self, model_id: &str) -> Result<()> {
         self.downloader.delete_model(model_id)?;
@@ -393,21 +418,21 @@ impl ModelManagerFactory {
         let config = match device_performance {
             DevicePerformance::Low => ModelConfig {
                 strategy: ModelStrategy::Smart,
-                auto_download: true,
+                auto_download: false,
                 max_download_size: 200 * 1024 * 1024, // 200MB
                 preferred_quality: "low".to_string(),
                 offline_mode: false,
             },
             DevicePerformance::Medium => ModelConfig {
                 strategy: ModelStrategy::Smart,
-                auto_download: true,
+                auto_download: false,
                 max_download_size: 500 * 1024 * 1024, // 500MB
                 preferred_quality: "balanced".to_string(),
                 offline_mode: false,
             },
             DevicePerformance::High => ModelConfig {
                 strategy: ModelStrategy::Smart,
-                auto_download: true,
+                auto_download: false,
                 max_download_size: 2 * 1024 * 1024 * 1024, // 2GB
                 preferred_quality: "high".to_string(),
                 offline_mode: false,
@@ -421,7 +446,7 @@ impl ModelManagerFactory {
     pub fn create_offline(models_dir: &Path) -> SmartModelManager {
         let config = ModelConfig {
             strategy: ModelStrategy::LocalOnly,
-            auto_download: true,
+            auto_download: false,
             max_download_size: 2 * 1024 * 1024 * 1024, // 2GB
             preferred_quality: "high".to_string(),
             offline_mode: true,

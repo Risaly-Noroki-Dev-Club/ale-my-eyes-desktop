@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Path $extractRoot, $profileRoot | Out-Null
 try {
     Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
     $package = Join-Path $extractRoot 'ale-my-eyes-windows'
-    foreach ($name in @('ale-gui.exe', 'ale-cli.exe', 'start-gui.bat', 'README.txt', 'LICENSE')) {
+    foreach ($name in @('ale-gui.exe', 'ale-cli.exe', 'ale-modeld.exe', 'start-gui.bat', 'README.txt', 'LICENSE')) {
         if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
             throw "Missing Windows package file: $name"
         }

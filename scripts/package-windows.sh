@@ -15,7 +15,7 @@ if [[ -n "$windows_target" && "$windows_target" != *windows* ]]; then
     exit 1
 fi
 
-build_args=(--release --locked -p ale-cli -p ale-gui)
+build_args=(--release --locked -p ale-cli -p ale-gui -p ale-modeld)
 binary_dir="$repo_root/target/release"
 if [[ -n "$windows_target" ]]; then
     build_args+=(--target "$windows_target")
@@ -29,7 +29,7 @@ package_dir="$repo_root/ale-my-eyes-windows"
 archive="$repo_root/ale-my-eyes-windows.zip"
 rm -rf "$package_dir" "$archive"
 mkdir -p "$package_dir"
-cp "$binary_dir/ale-cli.exe" "$binary_dir/ale-gui.exe" LICENSE "$package_dir/"
+cp "$binary_dir/ale-cli.exe" "$binary_dir/ale-gui.exe" "$binary_dir/ale-modeld.exe" LICENSE "$package_dir/"
 
 cat > "$package_dir/start-gui.bat" <<'EOF'
 @echo off

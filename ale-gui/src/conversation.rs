@@ -87,7 +87,7 @@ async fn ask_question(
         let response = {
             let engine = engine.lock().await;
             engine
-                .ask_about_image_with_tools(&image_data.jpeg_data, question, automation_tools())
+                .ask_about_image(&image_data.jpeg_data, question)
                 .await
                 .map_err(|error| error.to_string())?
         };
@@ -95,7 +95,7 @@ async fn ask_question(
         return Ok(AssistantReply {
             content: response.content,
             tokens_used: response.tokens_used,
-            tool_calls: response.tool_calls,
+            tool_calls: None,
         });
     }
 

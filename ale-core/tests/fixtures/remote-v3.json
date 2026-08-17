@@ -1,0 +1,19 @@
+[
+  {"type":"client_hello","protocol_version":3,"device_name":"Android"},
+  {"type":"server_hello","protocol_version":3,"device_name":"Desktop","session_id":"session"},
+  {"type":"command_request","request_id":"text","input":{"input":"text","text":"hello"}},
+  {"type":"audio_start","request_id":"audio","format":"pcm_s16le","sample_rate_hz":48000,"channels":1},
+  {"type":"audio_chunk","request_id":"audio","sequence":0,"pcm_base64":"AAA="},
+  {"type":"audio_end","request_id":"audio","chunk_count":1,"total_frames":1,"sha256":"digest"},
+  {"type":"cancel_request","request_id":"audio"},
+  {"type":"command_preview","request_id":"audio","response_text":"ready","action_steps":[],"confirmation_text":"","requires_confirmation":false,"has_plan":false},
+  {"type":"progress_update","request_id":"audio","stage":"planning","message":"planning"},
+  {"type":"decision_request","request_id":"audio","decision_id":"decision","kind":"use_remote_model","prompt":"use remote","expires_in_seconds":30},
+  {"type":"decision_response","request_id":"audio","decision_id":"decision","approved":true},
+  {"type":"assistant_output","request_id":"audio","kind":"information","display_text":"display","speech_text":"speech","interrupt":false,"sensitive":false},
+  {"type":"confirm_execution","request_id":"audio","approved":true},
+  {"type":"execution_status","request_id":"audio","state":"completed","message":"done","actions_executed":1},
+  {"type":"ping","nonce":1},
+  {"type":"pong","nonce":1},
+  {"type":"error","request_id":"audio","code":"TEST","message":"failed"}
+]

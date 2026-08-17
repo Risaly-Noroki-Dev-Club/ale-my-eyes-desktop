@@ -12,17 +12,19 @@ rm -rf "$release_dir"
 mkdir -p "$source_dir"
 
 cp Cargo.toml Cargo.lock flake.nix flake.lock README.md LICENSE AGENTS.md "$source_dir/"
-cp -R ale-core ale-cli ale-gui scripts vendor assets docs "$source_dir/"
+cp -R ale-core ale-cli ale-gui ale-modeld scripts vendor assets docs "$source_dir/"
 
 cat > "$source_dir/BUILD.md" <<'EOF'
 # Build
 
-The production desktop build uses the OpenAI-compatible cloud path.
+The desktop routes local and remote inference through the bundled ale-modeld process.
 
 ```bash
 cargo check --workspace --locked
-cargo build --release --locked -p ale-cli -p ale-gui
+cargo build --release --locked -p ale-cli -p ale-gui -p ale-modeld
 ```
+
+The offline source check uses `--no-default-features` because the optional sherpa runtime obtains platform-native archives during its build. A networked default build enables SenseVoice on supported targets.
 
 Runtime configuration is created in the operating system user configuration directory under `ale-my-eyes/config.json`. API keys are stored through the system credential store; no package-local configuration file is used.
 
