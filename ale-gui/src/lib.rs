@@ -22,6 +22,7 @@ use ale_core::{AleEngine, AleEngineFactory};
 use conversation::handle_question_response;
 use platform::PlatformService;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
@@ -35,7 +36,8 @@ pub struct AppState {
     engine: Option<Arc<Mutex<AleEngine>>>,
     recorder: Option<audio::Recorder>,
     recording_started: Option<Instant>,
-    vad_sample_offset: usize,
+    vad_sample_cursor: u64,
+    vad_pending_samples: Vec<f32>,
     auto_speak: bool,
     vad: VoiceActivityDetector,
     vad_active: bool,
@@ -43,6 +45,8 @@ pub struct AppState {
     listening_enabled: bool,
     platform: Option<Box<dyn PlatformService>>,
     pending_plan: Option<ActionPlan>,
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    remote_server: Option<remote_server::RemoteServerHandle>,
     #[cfg(target_os = "android")]
     pending_remote_request_id: Option<String>,
     #[cfg(target_os = "android")]
@@ -61,7 +65,8 @@ impl AppState {
             engine: None,
             recorder: None,
             recording_started: None,
-            vad_sample_offset: 0,
+            vad_sample_cursor: 0,
+            vad_pending_samples: Vec::new(),
             auto_speak: true,
             vad: VoiceActivityDetector::with_default_config(),
             vad_active: false,
@@ -69,6 +74,8 @@ impl AppState {
             listening_enabled: true,
             platform: None,
             pending_plan: None,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            remote_server: None,
             #[cfg(target_os = "android")]
             pending_remote_request_id: None,
             #[cfg(target_os = "android")]
@@ -82,7 +89,7 @@ pub fn setup_app(app: &AppWindow) {
     #[cfg(target_os = "android")]
     app.set_is_mobile(true);
 
-    let state = Arc::new(Mutex::new(AppState::new()));
+    let state = Rc::new(Mutex::new(AppState::new()));
     let app_weak = app.as_weak();
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -98,18 +105,19 @@ pub fn setup_app(app: &AppWindow) {
                     };
                     match remote_server::start(engine).await {
                         Ok(handle) => {
+                            let websocket_url = handle.pairing.websocket_url();
+                            let code = handle.pairing.code.clone();
+                            let pairing_info =
+                                format!("配对链接: {}\n\n{}", handle.pairing.uri(), handle.qr_text);
                             app.set_remote_connected(true);
                             app.set_remote_status(slint::format!(
                                 "桌面端监听中: {}",
-                                handle.pairing.websocket_url()
+                                websocket_url
                             ));
-                            app.set_remote_address(handle.pairing.websocket_url().into());
-                            app.set_remote_code(handle.pairing.code.clone().into());
-                            app.set_remote_pairing_info(slint::format!(
-                                "配对链接: {}\n\n{}",
-                                handle.pairing.uri(),
-                                handle.qr_text
-                            ));
+                            app.set_remote_address(websocket_url.into());
+                            app.set_remote_code(code.into());
+                            app.set_remote_pairing_info(pairing_info.into());
+                            state.lock().await.remote_server = Some(handle);
                         }
                         Err(error) => {
                             app.set_remote_status(slint::format!("桌面端服务启动失败: {}", error));
@@ -208,31 +216,35 @@ pub fn setup_app(app: &AppWindow) {
                         return;
                     }
 
-                    let mut vad_sample_offset = st.vad_sample_offset;
+                    let mut vad_sample_cursor = st.vad_sample_cursor;
                     let samples = if let Some(ref recorder) = st.recorder {
-                        recorder.samples_since(&mut vad_sample_offset)
+                        recorder.samples_since(&mut vad_sample_cursor)
                     } else {
                         return;
                     };
-                    st.vad_sample_offset = vad_sample_offset;
+                    st.vad_sample_cursor = vad_sample_cursor;
 
                     if samples.is_empty() {
                         return;
                     }
 
-                    let pcm = ale_core::vad::pcm16_bytes_to_f32(&samples);
+                    st.vad_pending_samples.extend(samples);
+                    let frame_size = st.vad.config.frame_size;
+                    let complete_len = (st.vad_pending_samples.len() / frame_size) * frame_size;
+                    let pcm = st
+                        .vad_pending_samples
+                        .drain(..complete_len)
+                        .collect::<Vec<_>>();
                     let mut speech_ended = false;
-                    for chunk in pcm.chunks(st.vad.config.frame_size) {
-                        if chunk.len() == st.vad.config.frame_size {
-                            let vad_state = st.vad.process_frame(chunk);
-                            st.vad_frame_count += 1;
-                            // 每 ~10 秒自动适应一次阈值（500帧 x 20ms = 10s）
-                            if st.vad_frame_count % 500 == 0 {
-                                st.vad.adapt_threshold();
-                            }
-                            if vad_state == VadState::SpeechEnded {
-                                speech_ended = true;
-                            }
+                    for chunk in pcm.chunks_exact(frame_size) {
+                        let vad_state = st.vad.process_frame(chunk);
+                        st.vad_frame_count += 1;
+                        // 每 ~10 秒自动适应一次阈值（500帧 x 20ms = 10s）
+                        if st.vad_frame_count % 500 == 0 {
+                            st.vad.adapt_threshold();
+                        }
+                        if vad_state == VadState::SpeechEnded {
+                            speech_ended = true;
                         }
                     }
 
@@ -281,8 +293,7 @@ pub fn setup_app(app: &AppWindow) {
                     };
 
                     // Desktop captures the active screen; Android currently sends text-only input.
-                    let image_data: Option<Vec<u8>> =
-                        st.platform.as_ref().and_then(|p| p.capture_image());
+                    let image_data = st.platform.as_ref().and_then(|p| p.capture_image());
 
                     drop(st);
 
@@ -572,6 +583,10 @@ pub fn setup_app(app: &AppWindow) {
                     let eng = engine.lock().await;
                     apply_config_to_app(&app, eng.config());
                 }
+                if let Some(ref platform) = st.platform {
+                    platform.set_sensitive_ui_visible(true);
+                }
+                app.set_show_api_key(false);
                 app.set_show_settings(true);
             });
         });
@@ -579,12 +594,16 @@ pub fn setup_app(app: &AppWindow) {
 
     // Close settings
     {
+        let state = state.clone();
         let app_weak = app_weak.clone();
         app.on_close_settings(move || {
+            let state = state.clone();
             let Some(app) = app_weak.upgrade() else {
                 return;
             };
+            app.set_show_api_key(false);
             app.set_show_settings(false);
+            resume_capture_after_sensitive_ui_hidden(state, app.as_weak());
         });
     }
 
@@ -654,7 +673,16 @@ pub fn setup_app(app: &AppWindow) {
             let Some(app) = app_weak.upgrade() else {
                 return;
             };
-            app.set_show_api_key(!app.get_show_api_key());
+            let reveal = !app.get_show_api_key();
+            app.set_show_api_key(reveal);
+            if reveal {
+                let app_weak = app.as_weak();
+                slint::Timer::single_shot(std::time::Duration::from_secs(10), move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.set_show_api_key(false);
+                    }
+                });
+            }
         });
     }
     {
@@ -803,8 +831,7 @@ pub fn setup_app(app: &AppWindow) {
                 };
 
                 match result {
-                    Ok((new_engine, new_config)) => {
-                        st.engine = Some(new_engine);
+                    Ok(new_config) => {
                         // 应用弱语音模式 VAD 配置
                         if new_config.asr.weak_voice_mode {
                             let weak_vad = VadConfig::weak_voice();
@@ -838,9 +865,11 @@ pub fn setup_app(app: &AppWindow) {
                         );
                         st.platform = Some(platform);
                         apply_config_to_app(&app, &new_config);
+                        app.set_show_api_key(false);
                         app.set_status_text("就绪".into());
                         app.set_status_type("ready".into());
                         app.set_show_settings(false);
+                        resume_capture_after_sensitive_ui_hidden(state.clone(), app.as_weak());
                     }
                     Err(error) => {
                         app.set_status_text(slint::format!("保存失败: {}", error));
@@ -901,6 +930,25 @@ fn spawn_local_task(future: impl Future<Output = ()> + 'static) {
     }
 }
 
+fn resume_capture_after_sensitive_ui_hidden(
+    state: Rc<Mutex<AppState>>,
+    app_weak: slint::Weak<AppWindow>,
+) {
+    slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        if app.get_show_settings() {
+            return;
+        }
+        spawn_local_task(async move {
+            if let Some(ref platform) = state.lock().await.platform {
+                platform.set_sensitive_ui_visible(false);
+            }
+        });
+    });
+}
+
 fn start_continuous_listening(st: &mut AppState, app: &AppWindow) {
     if !st.listening_enabled || st.recorder.is_some() {
         return;
@@ -909,7 +957,8 @@ fn start_continuous_listening(st: &mut AppState, app: &AppWindow) {
         Ok(recorder) => {
             st.recorder = Some(recorder);
             st.recording_started = Some(Instant::now());
-            st.vad_sample_offset = 0;
+            st.vad_sample_cursor = 0;
+            st.vad_pending_samples.clear();
             st.vad.reset();
             st.vad_frame_count = 0;
             st.vad_active = true;
@@ -935,7 +984,7 @@ fn apply_config_to_app(app: &AppWindow, config: &AppConfig) {
 }
 
 #[cfg(target_os = "android")]
-async fn handle_remote_command(state: &Arc<Mutex<AppState>>, app: &AppWindow, input: CommandInput) {
+async fn handle_remote_command(state: &Rc<Mutex<AppState>>, app: &AppWindow, input: CommandInput) {
     let client = { state.lock().await.remote_client.clone() };
     let Some(client) = client else {
         app.set_ai_response("请先在设置中连接桌面端".into());
@@ -994,14 +1043,12 @@ async fn create_engine() -> Result<(Arc<Mutex<AleEngine>>, AppConfig), String> {
 async fn save_settings(
     engine: Arc<Mutex<AleEngine>>,
     config: AppConfig,
-) -> Result<(Arc<Mutex<AleEngine>>, AppConfig), String> {
-    {
-        let mut engine = engine.lock().await;
-        engine
-            .update_config(config)
-            .map_err(|error| error.to_string())?;
-    }
-    create_engine().await
+) -> Result<AppConfig, String> {
+    let mut engine = engine.lock().await;
+    engine
+        .update_config(config)
+        .map_err(|error| error.to_string())?;
+    Ok(engine.config().clone())
 }
 
 async fn test_connection(engine: Arc<Mutex<AleEngine>>) -> Result<bool, String> {
@@ -1018,4 +1065,48 @@ fn ensure_api_key(config: &AppConfig) -> Result<(), String> {
         return Err("API key 未配置".to_string());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppWindow;
+    use i_slint_backend_testing::ElementHandle;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    #[test]
+    fn visible_assistant_controls_reach_root_callbacks() {
+        i_slint_backend_testing::init_no_event_loop();
+        let app = AppWindow::new().unwrap();
+        app.set_engine_ready(true);
+        app.set_is_busy(false);
+        app.set_text_input("hello".into());
+        app.set_show_confirmation(true);
+
+        let submitted = Rc::new(RefCell::new(String::new()));
+        let submitted_callback = submitted.clone();
+        app.on_text_submitted(move |text| {
+            *submitted_callback.borrow_mut() = text.to_string();
+        });
+        let listening = Rc::new(Cell::new(false));
+        let listening_callback = listening.clone();
+        app.on_toggle_listening(move || listening_callback.set(true));
+        let confirmed = Rc::new(Cell::new(false));
+        let confirmed_callback = confirmed.clone();
+        app.on_confirm_action(move || confirmed_callback.set(true));
+        let cancelled = Rc::new(Cell::new(false));
+        let cancelled_callback = cancelled.clone();
+        app.on_cancel_action(move || cancelled_callback.set(true));
+
+        for label in ["提交", "切换监听", "确认", "取消"] {
+            let controls: Vec<_> = ElementHandle::find_by_accessible_label(&app, label).collect();
+            assert_eq!(controls.len(), 1, "expected one visible {label} control");
+            controls[0].invoke_accessible_default_action();
+        }
+
+        assert_eq!(&*submitted.borrow(), "hello");
+        assert!(listening.get());
+        assert!(confirmed.get());
+        assert!(cancelled.get());
+    }
 }

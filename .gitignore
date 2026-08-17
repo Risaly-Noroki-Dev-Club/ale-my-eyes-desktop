@@ -15,6 +15,10 @@ Thumbs.db
 # Build artifacts
 /release/
 /dist/
+/ale-my-eyes-linux/
+/ale-my-eyes-linux.tar.gz
+/ale-my-eyes-windows/
+/ale-my-eyes-windows.zip
 *.exe
 *.dll
 *.so

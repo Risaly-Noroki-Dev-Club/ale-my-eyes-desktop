@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Ale, My Eyes!">
+  <rect width="1024" height="1024" rx="220" fill="#087f8c"/>
+  <path d="M146 512c94-166 216-249 366-249s272 83 366 249c-94 166-216 249-366 249S240 678 146 512Z" fill="#f7fbfc"/>
+  <circle cx="512" cy="512" r="164" fill="#18323a"/>
+  <circle cx="512" cy="512" r="86" fill="#ff6b5f"/>
+  <circle cx="548" cy="470" r="30" fill="#f7fbfc"/>
+  <path d="M328 784c46 46 107 74 184 74s138-28 184-74" fill="none" stroke="#f7fbfc" stroke-width="48" stroke-linecap="round"/>
+</svg>

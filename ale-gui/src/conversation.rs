@@ -1,8 +1,10 @@
+use crate::platform::CapturedImage;
 use crate::{audit, tts_player, AppState, AppWindow};
 use ale_core::actions::parse_action_plan_arguments;
 use ale_core::cloud::ToolCall;
 use ale_core::AleEngine;
 use std::future::Future;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -13,15 +15,15 @@ struct AssistantReply {
 }
 
 pub async fn handle_question_response(
-    state: &Arc<Mutex<AppState>>,
+    state: &Rc<Mutex<AppState>>,
     app: &AppWindow,
     app_weak: &slint::Weak<AppWindow>,
     engine: Arc<Mutex<AleEngine>>,
     question: String,
-    image_data: Option<Vec<u8>>,
+    image_data: Option<CapturedImage>,
     auto_speak: bool,
 ) {
-    let result = ask_question(app, engine.clone(), &question, image_data).await;
+    let result = ask_question(app, engine.clone(), &question, image_data.as_ref()).await;
 
     match result {
         Ok(reply) => {
@@ -36,7 +38,7 @@ pub async fn handle_question_response(
             .await;
 
             if let Some(calls) = reply.tool_calls {
-                apply_tool_calls(state, app, &calls).await;
+                apply_tool_calls(state, app, &calls, image_data.as_ref()).await;
             } else {
                 state.lock().await.pending_plan = None;
                 app.set_action_steps("".into());
@@ -78,14 +80,14 @@ async fn ask_question(
     app: &AppWindow,
     engine: Arc<Mutex<AleEngine>>,
     question: &str,
-    image_data: Option<Vec<u8>>,
+    image_data: Option<&CapturedImage>,
 ) -> Result<AssistantReply, String> {
     if let Some(image_data) = image_data {
         app.set_status_text("分析画面...".into());
         let response = {
             let engine = engine.lock().await;
             engine
-                .ask_about_image_with_tools(&image_data, question, automation_tools())
+                .ask_about_image_with_tools(&image_data.jpeg_data, question, automation_tools())
                 .await
                 .map_err(|error| error.to_string())?
         };
@@ -129,7 +131,12 @@ async fn record_interaction(
     let _ = engine.learn_from_interaction(question, answer);
 }
 
-async fn apply_tool_calls(state: &Arc<Mutex<AppState>>, app: &AppWindow, calls: &[ToolCall]) {
+async fn apply_tool_calls(
+    state: &Rc<Mutex<AppState>>,
+    app: &AppWindow,
+    calls: &[ToolCall],
+    captured_image: Option<&CapturedImage>,
+) {
     let executable = calls
         .iter()
         .filter(|call| call.function.name == "execute_action_plan")
@@ -142,7 +149,18 @@ async fn apply_tool_calls(state: &Arc<Mutex<AppState>>, app: &AppWindow, calls: 
         return;
     }
 
-    if let Ok(plan) = parse_action_plan_arguments(&executable[0].function.arguments) {
+    let plan = match parse_action_plan_arguments(&executable[0].function.arguments) {
+        Ok(plan) => match captured_image {
+            Some(capture) => capture
+                .coordinate_space
+                .map_plan(plan)
+                .map_err(|error| error.to_string()),
+            None => Err("自动化计划缺少对应的屏幕坐标信息".to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+
+    if let Ok(plan) = plan {
         app.set_action_steps(plan.describe_steps().join("\n").into());
         let confirmation_text = plan.speak_text();
         audit::record("created", "local", &plan, None);
@@ -151,6 +169,7 @@ async fn apply_tool_calls(state: &Arc<Mutex<AppState>>, app: &AppWindow, calls: 
         app.set_show_confirmation(true);
     } else {
         state.lock().await.pending_plan = None;
+        app.set_action_steps("自动化坐标无效或已超出截图范围".into());
         app.set_confirmation_text("".into());
         app.set_show_confirmation(false);
     }

@@ -69,7 +69,7 @@ pub struct InferenceConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            mode: InferenceMode::Adaptive,
+            mode: InferenceMode::CloudOnly,
             device_performance: DevicePerformance::Medium,
             network_status: NetworkStatus::Normal,
             prefer_cloud: true,
@@ -112,6 +112,11 @@ impl AdaptiveInference {
     /// 设置云端API
     pub fn set_cloud_api(&mut self, api: Box<dyn crate::cloud::CloudApi>) {
         self.cloud_api = Some(api);
+    }
+
+    /// Remove the configured cloud provider when credentials are cleared.
+    pub fn clear_cloud_api(&mut self) {
+        self.cloud_api = None;
     }
 
     /// 设置本地 ASR 模型

@@ -1,6 +1,9 @@
+use crate::platform::ExecutionControl;
 use ale_core::actions::{Action, ActionPlan, FileOp, MouseButton};
 use ale_core::{AleError, Result};
-use enigo::{Button as EnigoButton, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+#[cfg(not(target_os = "windows"))]
+use enigo::Coordinate;
+use enigo::{Button as EnigoButton, Direction, Enigo, Key, Keyboard, Mouse, Settings};
 use std::path::{Component, Path, PathBuf};
 
 /// 自动化引擎配置
@@ -32,6 +35,15 @@ pub struct ExecutionResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg(any(target_os = "windows", test))]
+struct VirtualDesktopBounds {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
 /// 桌面自动化引擎
 pub struct AutomationEngine {
     enigo: Enigo,
@@ -48,6 +60,24 @@ impl AutomationEngine {
 
     /// 执行操作计划
     pub fn execute_plan(&mut self, plan: &ActionPlan, approved: bool) -> Result<ExecutionResult> {
+        self.execute_plan_inner(plan, approved, None)
+    }
+
+    pub fn execute_plan_controlled(
+        &mut self,
+        plan: &ActionPlan,
+        approved: bool,
+        control: &ExecutionControl,
+    ) -> Result<ExecutionResult> {
+        self.execute_plan_inner(plan, approved, Some(control))
+    }
+
+    fn execute_plan_inner(
+        &mut self,
+        plan: &ActionPlan,
+        approved: bool,
+        control: Option<&ExecutionControl>,
+    ) -> Result<ExecutionResult> {
         plan.validate()?;
         if plan.requires_confirmation && !approved {
             return Err(AleError::Other(anyhow::anyhow!(
@@ -58,13 +88,23 @@ impl AutomationEngine {
 
         let mut executed = 0;
         for action in &plan.actions {
+            if let Some(control) = control {
+                control.check()?;
+            }
             self.execute_action(action)?;
             executed += 1;
+            if let Some(control) = control {
+                control.check()?;
+            }
             if self.config.action_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(
                     self.config.action_delay_ms,
                 ));
             }
+        }
+
+        if let Some(control) = control {
+            control.check()?;
         }
 
         Ok(ExecutionResult {
@@ -162,9 +202,16 @@ impl AutomationEngine {
     }
 
     fn mouse_move(&mut self, x: f64, y: f64) -> Result<()> {
-        self.enigo
-            .move_mouse(x as i32, y as i32, Coordinate::Abs)
-            .map_err(|e| AleError::Other(anyhow::anyhow!("Mouse move failed: {}", e)))
+        #[cfg(target_os = "windows")]
+        {
+            move_mouse_on_windows_virtual_desktop(x, y)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.enigo
+                .move_mouse(x as i32, y as i32, Coordinate::Abs)
+                .map_err(|e| AleError::Other(anyhow::anyhow!("Mouse move failed: {}", e)))
+        }
     }
 
     fn mouse_click(&mut self, button: MouseButton) -> Result<()> {
@@ -177,6 +224,80 @@ impl AutomationEngine {
             .button(btn, Direction::Click)
             .map_err(|e| AleError::Other(anyhow::anyhow!("Mouse click failed: {}", e)))
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn normalize_virtual_desktop_point(
+    x: f64,
+    y: f64,
+    bounds: VirtualDesktopBounds,
+) -> Result<(i32, i32)> {
+    fn normalize_axis(value: f64, origin: i32, extent: i32) -> Result<i32> {
+        if !value.is_finite() || extent <= 0 {
+            return Err(AleError::ConfigError(
+                "Windows 虚拟桌面坐标空间无效".to_string(),
+            ));
+        }
+        let minimum = origin as f64;
+        let maximum = origin as f64 + extent as f64 - 1.0;
+        if value < minimum || value > maximum {
+            return Err(AleError::ConfigError(format!(
+                "自动化坐标 {value} 超出 Windows 虚拟桌面范围 {minimum}..={maximum}"
+            )));
+        }
+        if extent == 1 {
+            return Ok(0);
+        }
+        Ok((((value - minimum) * 65_535.0) / (extent as f64 - 1.0)).round() as i32)
+    }
+
+    Ok((
+        normalize_axis(x, bounds.x, bounds.width)?,
+        normalize_axis(y, bounds.y, bounds.height)?,
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn move_mouse_on_windows_virtual_desktop(x: f64, y: f64) -> Result<()> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    let bounds = unsafe {
+        VirtualDesktopBounds {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            width: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            height: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        }
+    };
+    let (dx, dy) = normalize_virtual_desktop_point(x, y, bounds)?;
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx,
+                dy,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        return Err(AleError::Other(anyhow::anyhow!(
+            "Windows SendInput mouse move failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// 解析按键名称为 Enigo Key
@@ -462,6 +583,39 @@ mod tests {
         let config = AutomationConfig::default();
         assert!(config.require_confirmation);
         assert_eq!(config.action_delay_ms, 100);
+    }
+
+    #[test]
+    fn windows_virtual_desktop_normalization_handles_negative_origins() {
+        let bounds = VirtualDesktopBounds {
+            x: -1920,
+            y: -200,
+            width: 3840,
+            height: 1280,
+        };
+        assert_eq!(
+            normalize_virtual_desktop_point(-1920.0, -200.0, bounds).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            normalize_virtual_desktop_point(1919.0, 1079.0, bounds).unwrap(),
+            (65_535, 65_535)
+        );
+        let (center_x, center_y) = normalize_virtual_desktop_point(-0.5, 439.5, bounds).unwrap();
+        assert_eq!((center_x, center_y), (32_768, 32_768));
+    }
+
+    #[test]
+    fn windows_virtual_desktop_normalization_rejects_out_of_bounds_points() {
+        let bounds = VirtualDesktopBounds {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        for point in [(-1.0, 0.0), (1920.0, 0.0), (0.0, -1.0), (0.0, 1080.0)] {
+            assert!(normalize_virtual_desktop_point(point.0, point.1, bounds).is_err());
+        }
     }
 
     #[test]

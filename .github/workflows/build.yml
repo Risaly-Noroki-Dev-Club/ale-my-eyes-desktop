@@ -1,191 +1,115 @@
-name: Build and Release
+name: Desktop build and release
 
 on:
   push:
-    branches:
-      - master
-      - main
-    tags:
-      - 'v*'
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
-    branches:
-      - master
-      - main
+    branches: [main, master]
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag for manual publishing; defaults to manual-<run number> when empty'
+        description: Optional release tag
         required: false
         type: string
-      build_target:
-        description: 'Build target for manual runs'
-        required: false
-        default: all
-        type: choice
-        options:
-          - all
-          - android
 
 permissions:
   contents: write
 
 jobs:
   check:
-    name: Check workspace
     runs-on: ubuntu-latest
-    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_target != 'android'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check workspace
-        run: cargo check --workspace
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev netcat-openbsd xvfb
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: ./scripts/verify-pc-issues.sh
+      - run: ./scripts/stress-pc-io.sh
+      - run: ./scripts/test-source-package.sh
+      - run: ./scripts/smoke-linux.sh
 
   build-windows:
-    name: Build Windows executable
+    name: Windows package and smoke test
     needs: check
-    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.build_target != 'android') || startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build
-        run: |
-          cargo build --release -p ale-gui
-          cp target/release/ale-gui.exe ale-my-eyes-windows.exe
-
-      - name: Upload Windows executable
-        uses: actions/upload-artifact@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test visible assistant controls
+        run: cargo test -p ale-gui visible_assistant_controls_reach_root_callbacks --locked
+      - run: ./scripts/package-windows.sh
+      - name: Smoke-test Windows package
+        shell: pwsh
+        run: ./scripts/test-windows-package.ps1
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
           name: ale-my-eyes-windows
-          path: ale-my-eyes-windows.exe
+          path: ale-my-eyes-windows.zip
 
   build-linux:
-    name: Build Ubuntu deb
     needs: check
-    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.build_target != 'android') || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Dependencies
-        run: sudo apt-get update && sudo apt-get install -y libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev
-
-      - name: Build
-        run: cargo build --release -p ale-cli -p ale-gui
-
-      - name: Create deb package
-        run: |
-          PACKAGE_ROOT="dist/deb/ale-my-eyes"
-          mkdir -p "${PACKAGE_ROOT}/DEBIAN" "${PACKAGE_ROOT}/usr/bin"
-          cp target/release/ale-cli "${PACKAGE_ROOT}/usr/bin/"
-          cp target/release/ale-gui "${PACKAGE_ROOT}/usr/bin/"
-          cat > "${PACKAGE_ROOT}/DEBIAN/control" <<'EOF'
-          Package: ale-my-eyes
-          Version: 0.1.0
-          Section: utils
-          Priority: optional
-          Architecture: amd64
-          Maintainer: Risaly Noroki Dev Club <erika@risnordev.org>
-          Description: Intelligent visual assistant with voice and screen understanding
-          EOF
-          dpkg-deb --build "${PACKAGE_ROOT}" ale-my-eyes_0.1.0_amd64.deb
-
-      - name: Upload Ubuntu deb
-        uses: actions/upload-artifact@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: ./scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         with:
           name: ale-my-eyes-linux
-          path: ale-my-eyes_0.1.0_amd64.deb
+          path: ale-my-eyes-linux.tar.gz
 
-  build-android:
-    name: Build Android package
-    env:
-      ANDROID_NDK_VERSION: 27.3.13750724
+  nix:
+    name: Nix package and module
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix flake check --all-systems --no-build
+      - run: nix build .#packages.x86_64-linux.default
+
+  source-package:
+    name: Source package
+    needs: check
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Java
-        uses: actions/setup-java@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - run: ./scripts/test-source-package.sh
+      - uses: actions/upload-artifact@v4
         with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Install Android targets
-        run: |
-          rustup target add aarch64-linux-android
-          rustup target add armv7-linux-androideabi
-
-      - name: Install cargo-apk
-        run: cargo install cargo-apk
-
-      - name: Install Android NDK
-        run: |
-          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
-          export ANDROID_HOME="${ANDROID_SDK_ROOT}"
-          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "ndk;${ANDROID_NDK_VERSION}"
-          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-30"
-          "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34"
-          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses
-
-      - name: Build
-        run: |
-          ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
-          export ANDROID_HOME="${ANDROID_SDK_ROOT}"
-          export ANDROID_NDK_VERSION="${ANDROID_NDK_VERSION}"
-          ./scripts/package-android.sh
-
-      - name: Upload Android apks
-        uses: actions/upload-artifact@v4
-        with:
-          name: ale-my-eyes-android
-          path: |
-            ale-my-eyes-android/ale-my-eyes-arm64.apk
-            ale-my-eyes-android/ale-my-eyes-armv7.apk
+          name: ale-my-eyes-source
+          path: release/*.tar.gz
 
   release:
-    name: Publish GitHub release
-    needs: [build-windows, build-linux, build-android]
+    needs: [build-windows, build-linux, nix, source-package]
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.release_tag || format('manual-{0}', github.run_number)) || github.ref_name }}
-          name: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.release_tag || format('manual-{0}', github.run_number)) || github.ref_name }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && (inputs.release_tag || format('manual-{0}', github.run_number)) || github.ref_name }}
           files: |
-            artifacts/ale-my-eyes-windows/ale-my-eyes-windows.exe
-            artifacts/ale-my-eyes-linux/ale-my-eyes_0.1.0_amd64.deb
-            artifacts/ale-my-eyes-android/ale-my-eyes-arm64.apk
-            artifacts/ale-my-eyes-android/ale-my-eyes-armv7.apk
-          draft: false
-          prerelease: false
+            artifacts/ale-my-eyes-windows/ale-my-eyes-windows.zip
+            artifacts/ale-my-eyes-linux/ale-my-eyes-linux.tar.gz
+            artifacts/ale-my-eyes-source/*.tar.gz

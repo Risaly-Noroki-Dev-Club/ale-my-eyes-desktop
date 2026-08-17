@@ -46,8 +46,20 @@ pub struct AleEngine {
 
 impl AleEngine {
     pub async fn new(config_path: &Path) -> Result<Self> {
+        Self::new_with_secret_store(config_path, Arc::new(secret_store::SystemSecretStore)).await
+    }
+
+    /// Create an engine with an explicit credential store.
+    ///
+    /// This keeps integration tests and embedded hosts isolated from the user's
+    /// system keychain while exercising the same configuration load path.
+    pub async fn new_with_secret_store(
+        config_path: &Path,
+        secret_store: Arc<dyn secret_store::SecretStore>,
+    ) -> Result<Self> {
         // 加载配置
-        let mut config_manager = config::ConfigManager::new(config_path);
+        let mut config_manager =
+            config::ConfigManager::with_secret_store(config_path, secret_store);
         config_manager.load()?;
 
         // 检测设备性能
@@ -488,7 +500,18 @@ impl AleEngine {
 
     /// 更新配置
     pub fn update_config(&mut self, config: config::AppConfig) -> Result<()> {
-        self.config_manager.update_config(config)
+        self.config_manager.update_config(config)?;
+        let cloud = &self.config_manager.config().cloud_api;
+        if cloud.api_key.trim().is_empty() {
+            self.inference_engine.clear_cloud_api();
+            self.cloud_api = false;
+        } else {
+            let cloud_config = Self::cloud_config_from_app(cloud);
+            self.inference_engine
+                .set_cloud_api(cloud::CloudApiFactory::create(cloud_config));
+            self.cloud_api = true;
+        }
+        Ok(())
     }
 
     /// 检查引擎状态

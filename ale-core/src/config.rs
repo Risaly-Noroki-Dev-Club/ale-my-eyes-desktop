@@ -66,10 +66,10 @@ pub struct InferenceConfig {
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
-            mode: "adaptive".to_string(),
+            mode: "cloud".to_string(),
             prefer_cloud: true,
             timeout: 30,
-            fallback_to_local: true,
+            fallback_to_local: false,
         }
     }
 }
@@ -195,6 +195,17 @@ impl ConfigManager {
 
         let content = std::fs::read_to_string(&self.config_path)?;
         self.config = serde_json::from_str(&content)?;
+        #[cfg(not(feature = "local-inference"))]
+        if self.config.inference.mode != "cloud" {
+            tracing::warn!(
+                "Inference mode '{}' requires the experimental local-inference feature; using cloud",
+                self.config.inference.mode
+            );
+            self.config.inference.mode = "cloud".to_string();
+            self.config.inference.prefer_cloud = true;
+            self.config.inference.fallback_to_local = false;
+        }
+        ConfigValidator::validate_cloud_api_transport(&self.config.cloud_api.api_url)?;
         if self.config.cloud_api.api_key.trim().is_empty() {
             self.config.cloud_api.api_key = self.secret_store.get_api_key()?.unwrap_or_default();
         } else {
@@ -208,6 +219,7 @@ impl ConfigManager {
 
     /// 保存配置
     pub fn save(&self) -> Result<()> {
+        ConfigValidator::validate_cloud_api_transport(&self.config.cloud_api.api_url)?;
         // 确保目录存在
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -225,6 +237,7 @@ impl ConfigManager {
 
     /// 更新配置
     pub fn update_config(&mut self, config: AppConfig) -> Result<()> {
+        ConfigValidator::validate_cloud_api_transport(&config.cloud_api.api_url)?;
         if config.cloud_api.api_key.trim().is_empty() {
             self.secret_store.delete_api_key()?;
         } else {
@@ -284,13 +297,7 @@ impl ConfigManager {
         }
 
         // 验证推理配置
-        let valid_modes = ["local", "cloud", "adaptive"];
-        if !valid_modes.contains(&self.config.inference.mode.as_str()) {
-            return Err(AleError::ConfigError(format!(
-                "Invalid inference mode: {}. Must be one of: {:?}",
-                self.config.inference.mode, valid_modes
-            )));
-        }
+        ConfigValidator::validate_inference(&self.config.inference)?;
 
         // 验证 ASR 配置
         ConfigValidator::validate_asr(&self.config.asr)?;
@@ -402,6 +409,33 @@ impl ConfigMigrator {
 pub struct ConfigValidator;
 
 impl ConfigValidator {
+    pub fn validate_cloud_api_transport(api_url: &str) -> Result<()> {
+        let parsed = url::Url::parse(api_url)
+            .map_err(|error| AleError::ConfigError(format!("Invalid API URL: {error}")))?;
+        match parsed.scheme() {
+            "https" => Ok(()),
+            "http" => {
+                let loopback = match parsed.host() {
+                    Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+                    Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                    Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                    None => false,
+                };
+                if loopback {
+                    Ok(())
+                } else {
+                    Err(AleError::ConfigError(
+                        "HTTP API URLs are allowed only for localhost or loopback addresses"
+                            .to_string(),
+                    ))
+                }
+            }
+            _ => Err(AleError::ConfigError(
+                "API URL must use HTTPS (HTTP is limited to loopback)".to_string(),
+            )),
+        }
+    }
+
     /// 验证云端API配置
     pub fn validate_cloud_api(config: &CloudApiConfig) -> Result<()> {
         if config.api_key.is_empty() {
@@ -412,11 +446,7 @@ impl ConfigValidator {
             return Err(AleError::ConfigError("API URL is required".to_string()));
         }
 
-        if !config.api_url.starts_with("http://") && !config.api_url.starts_with("https://") {
-            return Err(AleError::ConfigError(
-                "API URL must start with http:// or https://".to_string(),
-            ));
-        }
+        Self::validate_cloud_api_transport(&config.api_url)?;
 
         if config.model.is_empty() {
             return Err(AleError::ConfigError("Model name is required".to_string()));
@@ -458,6 +488,14 @@ impl ConfigValidator {
                 "Invalid inference mode: {}. Must be one of: {:?}",
                 config.mode, valid_modes
             )));
+        }
+
+        #[cfg(not(feature = "local-inference"))]
+        if config.mode != "cloud" {
+            return Err(AleError::ConfigError(
+                "Local and adaptive inference are experimental and require the local-inference feature"
+                    .to_string(),
+            ));
         }
 
         Ok(())
@@ -591,6 +629,52 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_cloud_api_rejects_public_http() {
+        for url in [
+            "http://example.com/v1",
+            "http://localhost.example.com/v1",
+            "http://192.168.1.20:8080/v1",
+            "http://10.0.0.2/v1",
+        ] {
+            assert!(
+                ConfigValidator::validate_cloud_api_transport(url).is_err(),
+                "public HTTP URL should be rejected: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_cloud_api_allows_loopback_http() {
+        for url in [
+            "http://localhost:8080/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.0.0.2:8080/v1",
+            "http://[::1]:8080/v1",
+            "http://[0:0:0:0:0:0:0:1]:8080/v1",
+        ] {
+            assert!(
+                ConfigValidator::validate_cloud_api_transport(url).is_ok(),
+                "loopback HTTP URL should be allowed: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_save_rejects_public_http_after_direct_section_update() {
+        let dir = std::env::temp_dir().join(format!("ale-config-http-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let mut manager =
+            ConfigManager::with_secret_store(&path, Arc::new(TestSecretStore::default()));
+        manager.update_cloud_api(CloudApiConfig {
+            api_url: "http://example.com/v1".to_string(),
+            ..Default::default()
+        });
+
+        assert!(manager.save().is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn test_validate_inference_invalid_mode() {
         let config = InferenceConfig {
             mode: "invalid".to_string(),
@@ -688,7 +772,7 @@ mod tests {
 
         assert_eq!(config.cloud_api.api_key, "sk-test");
         assert_eq!(config.cloud_api.provider, "openai");
-        assert_eq!(config.inference.mode, "adaptive");
+        assert_eq!(config.inference.mode, "cloud");
         assert_eq!(config.audio.sample_rate, 16000);
         assert!(config.ui.auto_speak);
     }
@@ -701,38 +785,48 @@ mod tests {
 
     #[test]
     fn test_validate_asr_rejects_bad_strategy() {
-        let mut config = AsrConfig::default();
-        config.sampling_strategy = "top_k".to_string();
+        let config = AsrConfig {
+            sampling_strategy: "top_k".to_string(),
+            ..Default::default()
+        };
         assert!(ConfigValidator::validate_asr(&config).is_err());
     }
 
     #[test]
     fn test_validate_asr_rejects_zero_beam_size() {
-        let mut config = AsrConfig::default();
-        config.sampling_strategy = "beam".to_string();
-        config.beam_size = 0;
+        let config = AsrConfig {
+            sampling_strategy: "beam".to_string(),
+            beam_size: 0,
+            ..Default::default()
+        };
         assert!(ConfigValidator::validate_asr(&config).is_err());
     }
 
     #[test]
     fn test_validate_asr_rejects_nan_temperature() {
-        let mut config = AsrConfig::default();
-        config.temperature = f32::NAN;
+        let config = AsrConfig {
+            temperature: f32::NAN,
+            ..Default::default()
+        };
         assert!(ConfigValidator::validate_asr(&config).is_err());
     }
 
     #[test]
     fn test_validate_asr_rejects_excessive_temperature() {
-        let mut config = AsrConfig::default();
-        config.temperature = 5.0;
+        let config = AsrConfig {
+            temperature: 5.0,
+            ..Default::default()
+        };
         assert!(ConfigValidator::validate_asr(&config).is_err());
     }
 
     #[test]
     fn test_validate_asr_rejects_large_beam_size() {
-        let mut config = AsrConfig::default();
-        config.sampling_strategy = "beam".to_string();
-        config.beam_size = 20;
+        let config = AsrConfig {
+            sampling_strategy: "beam".to_string(),
+            beam_size: 20,
+            ..Default::default()
+        };
         assert!(ConfigValidator::validate_asr(&config).is_err());
     }
 
@@ -742,5 +836,33 @@ mod tests {
         config.cloud_api.api_key = "sk-test".to_string();
         config.asr.temperature = f32::INFINITY;
         assert!(ConfigValidator::validate_all(&config).is_err());
+    }
+
+    #[test]
+    fn config_file_io_stress_preserves_latest_value_and_redacts_secret() {
+        let dir = std::env::temp_dir().join(format!("ale-config-stress-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let secret_store = Arc::new(TestSecretStore::default());
+        let mut manager = ConfigManager::with_secret_store(&path, secret_store.clone());
+
+        for iteration in 0..1_000 {
+            let mut config = manager.config().clone();
+            config.cloud_api.api_key = "stress-secret".to_string();
+            config.cloud_api.model = format!("model-{iteration}");
+            manager.update_config(config).unwrap();
+
+            let mut reloaded = ConfigManager::with_secret_store(&path, secret_store.clone());
+            reloaded.load().unwrap();
+            assert_eq!(
+                reloaded.config().cloud_api.model,
+                format!("model-{iteration}")
+            );
+            assert_eq!(reloaded.config().cloud_api.api_key, "stress-secret");
+            manager = reloaded;
+        }
+
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(!serialized.contains("stress-secret"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

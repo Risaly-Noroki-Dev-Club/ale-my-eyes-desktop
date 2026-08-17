@@ -1,6 +1,7 @@
-# Ale, My Eyes! Code Wiki
+# Ale, My Eyes! Code Wiki (Archived)
 
-> 本文档为项目完整的技术文档，涵盖项目架构、模块职责、关键类型/函数、依赖关系及运行方式。
+> [!WARNING]
+> 本文档是桌面与移动仓库拆分前的历史快照，不代表当前支持矩阵、构建方式或发布流程。当前桌面端仅支持 Windows 与 Linux/NixOS；Android 由独立移动仓库维护；macOS 与 iOS 不再支持。请以根目录 `README.md`、`AGENTS.md` 和 `docs/PC-ISSUES-STATUS.md` 为准，不要使用下文中的旧打包命令或产物名称。
 
 ---
 
@@ -56,7 +57,7 @@
 - **自适应推理**：根据设备性能和网络状态自动选择本地/云端推理
 - **长期记忆**：自动从对话中提取用户偏好并持久化
 
-**支持平台：** Windows、Linux（X11/Wayland）、Android（arm64/armv7）
+**历史快照所描述的平台：** Windows、Linux 与已拆分的 Android 实现；这不是当前支持声明。
 
 ---
 

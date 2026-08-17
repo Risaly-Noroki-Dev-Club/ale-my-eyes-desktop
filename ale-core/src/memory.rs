@@ -267,7 +267,7 @@ fn extract_explicit_preference(question: &str) -> Vec<MemoryEntry> {
         "尽量",
     ] {
         if let Some(tail) = extract_tail(question, marker) {
-            if let Some(content) = build_preference_from_tail(&tail) {
+            if let Some(content) = build_preference_from_tail(tail) {
                 memories.push(preference_memory(content, vec!["偏好"], 0.8));
             }
         }
@@ -378,7 +378,7 @@ fn extract_explicit_remember_request(question: &str) -> Vec<MemoryEntry> {
         "尽量",
     ] {
         if let Some(tail) = extract_tail(question, marker) {
-            if let Some(content) = build_preference_from_tail(&tail) {
+            if let Some(content) = build_preference_from_tail(tail) {
                 memories.push(preference_memory(content, vec!["显式记忆", "偏好"], 0.95));
             }
         }

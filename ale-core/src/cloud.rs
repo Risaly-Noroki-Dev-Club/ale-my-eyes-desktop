@@ -139,6 +139,31 @@ impl OpenAIApi {
             .map(str::to_string)
             .ok_or_else(|| AleError::CloudApiError("Missing transcription text".to_string()))
     }
+
+    fn vision_request_body(&self, image_data: &[u8], prompt: &str) -> serde_json::Value {
+        let image_base64 = general_purpose::STANDARD.encode(image_data);
+        serde_json::json!({
+            "model": self.config.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/jpeg;base64,{}", image_base64)
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": self.config.max_tokens,
+        })
+    }
 }
 
 #[async_trait]
@@ -190,30 +215,7 @@ impl CloudApi for OpenAIApi {
     async fn vision(&self, image_data: &[u8], prompt: &str) -> Result<CloudResponse> {
         let url = format!("{}/chat/completions", self.config.api_url);
 
-        // 将图像转换为base64
-        let image_base64 = general_purpose::STANDARD.encode(image_data);
-
-        let request_body = serde_json::json!({
-            "model": "gpt-4o",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:image/jpeg;base64,{}", image_base64)
-                            }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": self.config.max_tokens,
-        });
+        let request_body = self.vision_request_body(image_data, prompt);
 
         let response = self
             .client
@@ -467,6 +469,38 @@ impl CloudApiFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn mock_http_response(status: &str, body: &str, delay: Duration) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = vec![0; 32 * 1024];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(delay).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn mock_api(api_url: String, timeout: Duration) -> OpenAIApi {
+        OpenAIApi::new(CloudConfig {
+            api_key: "test".to_string(),
+            api_url,
+            timeout,
+            retry_count: 0,
+            ..Default::default()
+        })
+    }
 
     #[test]
     fn test_cloud_config_default() {
@@ -527,5 +561,91 @@ mod tests {
     fn test_transcription_text_rejects_missing_text() {
         let response = serde_json::json!({});
         assert!(OpenAIApi::transcription_text(&response).is_err());
+    }
+
+    #[test]
+    fn vision_description_uses_configured_model() {
+        let api = OpenAIApi::new(CloudConfig {
+            model: "custom-vision-model".to_string(),
+            ..Default::default()
+        });
+        let request = api.vision_request_body(b"jpeg", "describe this");
+        assert_eq!(request["model"], "custom-vision-model");
+        assert_eq!(
+            request["messages"][0]["content"][0]["text"],
+            "describe this"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_openai_chat_success() {
+        let url = mock_http_response(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"total_tokens":3}}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let response = mock_api(url, Duration::from_secs(1))
+            .chat(vec![CloudMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(response.content, "ok");
+        assert_eq!(response.tokens_used, 3);
+    }
+
+    #[tokio::test]
+    async fn mock_openai_transcription_success() {
+        let url = mock_http_response("200 OK", r#"{"text":"heard"}"#, Duration::ZERO).await;
+        let response = mock_api(url, Duration::from_secs(1))
+            .transcribe(b"RIFF-test-wav")
+            .await
+            .unwrap();
+        assert_eq!(response.content, "heard");
+    }
+
+    #[tokio::test]
+    async fn mock_openai_timeout_is_reported() {
+        let url = mock_http_response(
+            "200 OK",
+            r#"{"choices":[{"message":{"content":"late"}}]}"#,
+            Duration::from_millis(150),
+        )
+        .await;
+        let error = mock_api(url, Duration::from_millis(25))
+            .chat(Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Request failed"));
+    }
+
+    #[tokio::test]
+    async fn mock_openai_rate_limit_is_reported() {
+        let url = mock_http_response(
+            "429 Too Many Requests",
+            r#"{"error":"rate_limit"}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let error = mock_api(url, Duration::from_secs(1))
+            .chat(Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rate_limit"));
+    }
+
+    #[tokio::test]
+    async fn mock_openai_malformed_json_is_rejected() {
+        let url = mock_http_response("200 OK", "not-json", Duration::ZERO).await;
+        let error = mock_api(url, Duration::from_secs(1))
+            .chat(Vec::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Parse error"));
     }
 }

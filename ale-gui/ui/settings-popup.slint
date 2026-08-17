@@ -73,7 +73,7 @@ export component SettingsPopup inherits Rectangle {
                     Text { text: "云端 API"; font-size: AppTheme.base-font; font-weight: 600; color: Palette.foreground; }
 
                     Text {
-                        text: "Provider";
+                        text: "OpenAI-compatible Provider";
                         font-size: AppTheme.base-font - 2px;
                         color: Palette.foreground.transparentize(0.3);
                     }
@@ -93,6 +93,7 @@ export component SettingsPopup inherits Rectangle {
                         LineEdit {
                             text: root.api-key;
                             placeholder-text: "sk-...";
+                            input-type: root.show-api-key ? InputType.text : InputType.password;
                             edited(text) => { root.api-key-changed(text); }
                             horizontal-stretch: 1;
                         }

@@ -6,7 +6,7 @@ description = "Core functionality for Ale, My Eyes! - VLM, ASR, TTS integration"
 license = "MIT"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 tts = { version = "0.25", optional = true }

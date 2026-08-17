@@ -24,6 +24,15 @@ export component CompactScreen inherits Rectangle {
     callback cancel-action();
     callback open-settings();
 
+    public function activate-submit() {
+        if (root.engine-ready && !root.is-busy) {
+            root.text-submitted(root.text-input);
+        }
+    }
+    public function activate-listening-toggle() { root.toggle-listening(); }
+    public function activate-confirm() { root.confirm-action(); }
+    public function activate-cancel() { root.cancel-action(); }
+
     background: Palette.background;
 
     VerticalLayout {
@@ -59,13 +68,16 @@ export component CompactScreen inherits Rectangle {
                 height: AppTheme.touch-min;
                 border-radius: 8px;
                 background: listening-touch.has-hover ? Palette.control-background : transparent;
+                accessible-role: button;
+                accessible-label: "切换监听";
+                accessible-action-default => { root.activate-listening-toggle(); }
                 Text {
                     text: root.listening-enabled ? "||" : ">";
                     font-size: AppTheme.base-font - 2px;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
-                listening-touch := TouchArea { clicked => { root.toggle-listening(); } }
+                listening-touch := TouchArea { clicked => { root.activate-listening-toggle(); } }
             }
 
             // 设置按钮 — 触控友好尺寸
@@ -176,11 +188,11 @@ export component CompactScreen inherits Rectangle {
 
             Button {
                 text: "确认";
-                clicked => { root.confirm-action(); }
+                clicked => { root.activate-confirm(); }
             }
             Button {
                 text: "取消";
-                clicked => { root.cancel-action(); }
+                clicked => { root.activate-cancel(); }
             }
         }
 
@@ -213,7 +225,10 @@ export component CompactScreen inherits Rectangle {
                         placeholder-text: "打字提问...";
                         font-size: AppTheme.base-font - 2px;
                         edited(text) => { root.text-input = text; }
-                        accepted(text) => { root.text-submitted(text); }
+                        accepted(text) => {
+                            root.text-input = text;
+                            root.activate-submit();
+                        }
                     }
                 }
             }
@@ -224,6 +239,9 @@ export component CompactScreen inherits Rectangle {
                 height: AppTheme.touch-min;
                 border-radius: 8px;
                 background: root.engine-ready ? Palette.accent-background : Palette.border;
+                accessible-role: button;
+                accessible-label: "提交";
+                accessible-action-default => { root.activate-submit(); }
 
                 Text {
                     text: "📤";
@@ -233,11 +251,7 @@ export component CompactScreen inherits Rectangle {
                 }
 
                 TouchArea {
-                    clicked => {
-                        if (root.engine-ready && !root.is-busy) {
-                            root.text-submitted(root.text-input);
-                        }
-                    }
+                    clicked => { root.activate-submit(); }
                 }
             }
         }

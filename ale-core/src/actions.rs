@@ -209,11 +209,9 @@ impl ActionPlan {
                 | Action::DoubleClick { x, y }
                 | Action::MouseMove { x, y }
                 | Action::Scroll { x, y, .. }
-                    if !x.is_finite() || !y.is_finite() || *x < 0.0 || *y < 0.0 =>
+                    if !x.is_finite() || !y.is_finite() =>
                 {
-                    return Err(AleError::ConfigError(
-                        "自动化坐标必须是非负有限数".to_string(),
-                    ));
+                    return Err(AleError::ConfigError("自动化坐标必须是有限数".to_string()));
                 }
                 Action::Scroll {
                     delta_x, delta_y, ..
