@@ -4,9 +4,9 @@ use ale_core::model_ipc::{
     MODEL_IPC_VERSION,
 };
 use ale_core::model_scheduler::{
-    BoundingBox, CancelModelJob, GroundingJob, GroundingModel, GroundingResult, JobPrivacy,
-    LocalPlanningJob, LocalPlanningResult, ModelCapability, ModelJob, ModelRuntimeConfig,
-    SchedulerHealth, SchedulerPriority,
+    BoundingBox, CancelModelJob, GroundingJob, GroundingResult, JobPrivacy, LocalPlanningJob,
+    LocalPlanningResult, ModelCapability, ModelJob, ModelRuntimeConfig, SchedulerHealth,
+    SchedulerPriority,
 };
 use base64::Engine;
 use serde_json::{json, Value};
@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
             && health
                 .available_capabilities
                 .contains(&ModelCapability::ElementGrounding)
+            && health.hot_worker.is_none()
     });
     record_reply(
         &mut results,
@@ -186,10 +187,70 @@ async fn main() -> anyhow::Result<()> {
             serde_json::to_value(result)?;
     }
 
-    for (id, model) in [
-        ("MODELD-SHOWUI", GroundingModel::ShowUi),
-        ("MODELD-UITARS", GroundingModel::UiTars),
-    ] {
+    let cold_health_reply = call_json(
+        &mut stream,
+        "health-qwen-cold",
+        IpcRequestKind::Health,
+        &Value::Null,
+    )
+    .await?;
+    let cold_health: SchedulerHealth = decode_ok(&cold_health_reply)?;
+    let cold_worker = cold_health.hot_worker.clone();
+    let cold_pid = cold_worker.as_ref().map(|worker| worker.process_id);
+    results.last_mut().expect("Qwen result was just recorded")["worker_after"] =
+        serde_json::to_value(&cold_worker)?;
+
+    let warm_job = model_job(
+        "local-plan-warm",
+        ModelCapability::LocalPlanning,
+        "snapshot-acceptance",
+        RiskLevel::Medium,
+        serde_json::to_value(LocalPlanningJob {
+            question: "Activate the DOWNLOAD MODELS button using one semantic step.".to_string(),
+            image_base64: image_base64.clone(),
+            application_id: Some("ALE MODEL RUNTIME TEST".to_string()),
+        })?,
+        unix_millis() + 90_000,
+    );
+    let warm_started = Instant::now();
+    let warm_reply = call_json_with_envelope_id(
+        &mut stream,
+        "local-plan-warm",
+        IpcRequestKind::Schedule,
+        &warm_job,
+    )
+    .await?;
+    let warm_result = decode_ok::<LocalPlanningResult>(&warm_reply).ok();
+    let warm_health_reply = call_json(
+        &mut stream,
+        "health-qwen-warm",
+        IpcRequestKind::Health,
+        &Value::Null,
+    )
+    .await?;
+    let warm_health: SchedulerHealth = decode_ok(&warm_health_reply)?;
+    let warm_worker = warm_health.hot_worker.clone();
+    let warm_ok = warm_result.as_ref().is_some_and(|result| {
+        result.snapshot_id == "snapshot-acceptance"
+            && !result.plan.steps.is_empty()
+            && result.plan.has_observable_postconditions()
+    }) && cold_pid.is_some()
+        && warm_worker
+            .as_ref()
+            .is_some_and(|worker| Some(worker.process_id) == cold_pid && !worker.active);
+    record_reply(
+        &mut results,
+        "MODELD-QWEN-WARM-REUSE",
+        warm_started,
+        &warm_reply,
+        warm_ok,
+    );
+    results
+        .last_mut()
+        .expect("warm Qwen result was just recorded")["worker_after"] =
+        serde_json::to_value(&warm_worker)?;
+
+    for id in ["MODELD-SHOWUI"] {
         let request_id = id.to_ascii_lowercase();
         let grounding = GroundingJob {
             image_base64: image_base64.clone(),
@@ -202,7 +263,6 @@ async fn main() -> anyhow::Result<()> {
             image_width: 1280,
             image_height: 720,
             candidate_bounds: vec![bounds.clone()],
-            model,
         };
         let job = model_job(
             &request_id,
@@ -217,9 +277,25 @@ async fn main() -> anyhow::Result<()> {
             call_json_with_envelope_id(&mut stream, &request_id, IpcRequestKind::Schedule, &job)
                 .await?;
         let grounding_result = decode_ok::<GroundingResult>(&reply).ok();
-        let passed = grounding_result.as_ref().is_some_and(|result| {
+        let grounding_valid = grounding_result.as_ref().is_some_and(|result| {
             result.snapshot_id == "snapshot-acceptance" && result.selected.is_some()
         });
+        let grounding_health_reply = call_json(
+            &mut stream,
+            "health-showui",
+            IpcRequestKind::Health,
+            &Value::Null,
+        )
+        .await?;
+        let grounding_health: SchedulerHealth = decode_ok(&grounding_health_reply)?;
+        let grounding_worker = grounding_health.hot_worker.clone();
+        let passed = grounding_valid
+            && cold_pid.is_some()
+            && grounding_worker.as_ref().is_some_and(|worker| {
+                worker.model_id == "ShowUI-2B-Q4_K_M"
+                    && Some(worker.process_id) != cold_pid
+                    && !worker.active
+            });
         record_reply(&mut results, id, started, &reply, passed);
         if let Some(result) = grounding_result {
             results
@@ -227,7 +303,30 @@ async fn main() -> anyhow::Result<()> {
                 .expect("grounding result was just recorded")["evidence"] =
                 serde_json::to_value(result)?;
         }
+        results
+            .last_mut()
+            .expect("grounding result was just recorded")["worker_after"] =
+            serde_json::to_value(&grounding_worker)?;
     }
+
+    println!("waiting for the 120-second hot-worker idle eviction",);
+    let idle_started = Instant::now();
+    tokio::time::sleep(ale_core::model_scheduler::MODEL_IDLE_TTL + Duration::from_secs(6)).await;
+    let idle_health_reply = call_json(
+        &mut stream,
+        "health-idle",
+        IpcRequestKind::Health,
+        &Value::Null,
+    )
+    .await?;
+    let idle_health: SchedulerHealth = decode_ok(&idle_health_reply)?;
+    results.push(json!({
+        "id": "MODELD-IDLE-EVICTION",
+        "passed": idle_health.hot_worker.is_none(),
+        "duration_seconds": elapsed(idle_started),
+        "idle_ttl_seconds": ale_core::model_scheduler::MODEL_IDLE_TTL.as_secs(),
+        "worker_after": idle_health.hot_worker,
+    }));
 
     let cancel_id = "cancelled-model-job";
     let cancel_job = model_job(
@@ -249,6 +348,9 @@ async fn main() -> anyhow::Result<()> {
         serde_json::to_vec(&cancel_job)?,
     )
     .await?;
+    // Give the cold worker time to spawn so cancellation exercises process teardown,
+    // rather than only removing a job that has not yet been polled.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     write_envelope(
         &mut stream,
         "cancel-command",
@@ -267,11 +369,21 @@ async fn main() -> anyhow::Result<()> {
         && [&first, &second].iter().any(|reply| {
             reply.request_id == "cancel-command" && reply.status == IpcReplyStatus::Ok as i32
         });
+    let cancelled_health_reply = call_json(
+        &mut stream,
+        "health-after-cancel",
+        IpcRequestKind::Health,
+        &Value::Null,
+    )
+    .await?;
+    let cancelled_health: SchedulerHealth = decode_ok(&cancelled_health_reply)?;
+    let cancellation_ok = cancellation_ok && cancelled_health.hot_worker.is_none();
     results.push(json!({
         "id": "IPC-CANCEL",
         "passed": cancellation_ok,
         "duration_seconds": elapsed(cancel_started),
         "error_code": if cancellation_ok { Value::Null } else { json!("CANCEL_NOT_ACKNOWLEDGED") },
+        "worker_after": cancelled_health.hot_worker,
     }));
 
     let shutdown = call_json(
@@ -354,13 +466,11 @@ fn runtime_config(models_dir: &Path) -> ModelRuntimeConfig {
             .join("SenseVoiceSmall/tokens.txt")
             .to_string_lossy()
             .into_owned(),
-        llama_cli: text(runtime.join("tools/llama-b10472-vulkan/llama-cli.exe")),
+        llama_server: text(runtime.join("tools/llama-b10472-vulkan/llama-server.exe")),
         qwen_model: text(gguf.join("Qwen2.5-VL-7B-Instruct/model-q4_k_m.gguf")),
         qwen_mmproj: text(gguf.join("Qwen2.5-VL-7B-Instruct/mmproj-model-f16.gguf")),
         showui_model: text(gguf.join("ShowUI-2B/model-q4_k_m.gguf")),
         showui_mmproj: text(gguf.join("ShowUI-2B/mmproj-model-f16.gguf")),
-        uitars_model: text(gguf.join("UI-TARS-1.5-7B/model-q4_k_m.gguf")),
-        uitars_mmproj: text(gguf.join("UI-TARS-1.5-7B/mmproj-model-f16.gguf")),
         capability_manifest: text(runtime.join("runtime-capabilities.json")),
     }
 }

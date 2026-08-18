@@ -322,9 +322,9 @@ impl ModeldClient {
             }
         };
         let llama_name = if cfg!(windows) {
-            "llama-cli.exe"
+            "llama-server.exe"
         } else {
-            "llama-cli"
+            "llama-server"
         };
         let runtime = ModelRuntimeConfig {
             models_dir: models_dir.to_string_lossy().into_owned(),
@@ -338,7 +338,7 @@ impl ModeldClient {
                 .join("tokens.txt")
                 .to_string_lossy()
                 .into_owned(),
-            llama_cli: Some(
+            llama_server: Some(
                 runtime_dir
                     .join("tools")
                     .join("llama-b10472-vulkan")
@@ -368,20 +368,6 @@ impl ModeldClient {
             showui_mmproj: Some(
                 gguf_dir
                     .join(&config.model_scheduler.grounding_model)
-                    .join("mmproj-model-f16.gguf")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            uitars_model: Some(
-                gguf_dir
-                    .join(&config.model_scheduler.grounding_fallback_model)
-                    .join("model-q4_k_m.gguf")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            uitars_mmproj: Some(
-                gguf_dir
-                    .join(&config.model_scheduler.grounding_fallback_model)
                     .join("mmproj-model-f16.gguf")
                     .to_string_lossy()
                     .into_owned(),

@@ -64,7 +64,6 @@ pub struct ModelSchedulerConfig {
     pub qwen_model: String,
     pub qwen_large_model: String,
     pub grounding_model: String,
-    pub grounding_fallback_model: String,
     pub full_screenshot_requires_confirmation: bool,
 }
 
@@ -80,7 +79,6 @@ impl Default for ModelSchedulerConfig {
             qwen_model: "Qwen2.5-VL-3B-Instruct".to_string(),
             qwen_large_model: "Qwen2.5-VL-7B-Instruct".to_string(),
             grounding_model: "ShowUI-2B".to_string(),
-            grounding_fallback_model: "UI-TARS-1.5-7B".to_string(),
             full_screenshot_requires_confirmation: true,
         }
     }

@@ -18,7 +18,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
     def test_coordinate_uses_last_normalized_pair(self):
         self.assertEqual(RUNTIME.extract_coordinate("noise [12, 9] answer [0.8, 0.7]"), (0.8, 0.7))
 
-    def test_coordinate_accepts_parentheses_from_uitars_stdout(self):
+    def test_coordinate_accepts_parentheses(self):
         stdout = "(820,515)\n"
         verbose_stderr = "llama_context: preserved_tokens = [151657,151658]"
         self.assertEqual(RUNTIME.extract_coordinate(stdout), (820.0, 515.0))
@@ -73,14 +73,16 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                     **{
                         f"unique_{scale}": {
                             "file": f"unique-{scale}.png",
+                            "target": "DOWNLOAD MODELS button",
                             "image_size": [1280, 720],
                             "bbox_normalized": [0.68, 0.77, 0.91, 0.89],
                         }
                         for scale in ("100", "150", "200")
                     },
                     **{
-                        f"ambiguous_{scale}": {
-                            "file": f"ambiguous-{scale}.png",
+                        f"same_label_{scale}": {
+                            "file": f"same-label-{scale}.png",
+                            "target": "SAVE button inside the Settings dialog",
                             "image_size": [1280, 720],
                             "bbox_normalized": [0.63, 0.72, 0.76, 0.81],
                         }
@@ -102,7 +104,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                 json.dumps(
                     {
                         "llama_build": "test-build",
-                        "models": {key: dict(model_data) for key in ("qwen", "showui", "uitars")},
+                        "models": {key: dict(model_data) for key in ("qwen", "showui")},
                     }
                 ),
                 encoding="utf-8",
@@ -148,7 +150,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             summary = json.loads((report / "summary.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["passed"])
             self.assertTrue(all(item["passed"] for item in summary["tests"]))
-            self.assertEqual(summary["capabilities"]["uitars"]["selected_profile"], "absolute_center")
+            self.assertEqual(set(summary["capabilities"]), {"qwen", "showui"})
             self.assertNotIn("model_path", summary["models"]["qwen"])
 
 

@@ -19,7 +19,7 @@ pub fn probe() -> Vec<GpuDevice> {
 
 pub fn probe_with_runtime(runtime: Option<&ModelRuntimeConfig>) -> Vec<GpuDevice> {
     let mut devices = probe();
-    if let Some(cli) = runtime.and_then(|runtime| runtime.llama_cli.as_deref()) {
+    if let Some(cli) = runtime.and_then(|runtime| runtime.llama_server.as_deref()) {
         let output = Command::new(cli).arg("--list-devices").output();
         if let Ok(output) = output {
             if output.status.success() {

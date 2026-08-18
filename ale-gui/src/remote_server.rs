@@ -5,8 +5,8 @@ use crate::platform::{self, ExecutionControl, PlatformService};
 use crate::remote_crypto;
 use ale_core::actions::{parse_action_plan_arguments, Action, ActionPlan};
 use ale_core::model_scheduler::{
-    validate_semantic_plan, BoundingBox, GroundingJob, GroundingModel, ModelCapability,
-    SemanticPlan, StateVerificationJob, LOCAL_MEDIUM_RISK_THRESHOLD,
+    validate_semantic_plan, BoundingBox, GroundingJob, ModelCapability, SemanticPlan,
+    StateVerificationJob, LOCAL_MEDIUM_RISK_THRESHOLD,
 };
 use ale_core::remote::{
     AssistantOutput, AssistantOutputKind, AudioChunk, AudioEnd, AudioFormat, AudioStart,
@@ -1488,7 +1488,6 @@ async fn handle_request(
                 image_width: image.coordinate_space.image_width,
                 image_height: image.coordinate_space.image_height,
                 candidate_bounds: candidate_bounds.clone(),
-                model: GroundingModel::ShowUi,
             };
             match client.ground(&request_id, &snapshot_id, grounding).await {
                 Ok(grounded)
@@ -1539,30 +1538,9 @@ async fn handle_request(
                             .push_str("定位模型已运行，但桌面没有唯一 UIA 候选；未创建执行坐标。");
                     }
                 }
-                primary => {
-                    let fallback = GroundingJob {
-                        image_base64: base64::engine::general_purpose::STANDARD
-                            .encode(&image.jpeg_data),
-                        target,
-                        image_width: image.coordinate_space.image_width,
-                        image_height: image.coordinate_space.image_height,
-                        candidate_bounds,
-                        model: GroundingModel::UiTars,
-                    };
-                    let fallback_result = client
-                        .ground(&format!("{request_id}:uitars"), &snapshot_id, fallback)
-                        .await;
-                    response_text.push_str(match (primary, fallback_result) {
-                        (Ok(_), Ok(_)) => {
-                            "ShowUI 未得到唯一候选，UI-TARS 已复核；模型证据存在冲突，未创建执行坐标。"
-                        }
-                        (Err(_), Ok(_)) => {
-                            "ShowUI 失败，UI-TARS 仅作为复核证据；不使用最后一个模型强制执行。"
-                        }
-                        (_, Err(_)) => {
-                            "ShowUI/UI-TARS 未共同提供可信定位；未创建执行坐标。"
-                        }
-                    });
+                _ => {
+                    response_text
+                        .push_str("ShowUI 未返回满足阈值的唯一 UIA 候选；未创建执行坐标。");
                 }
             }
         }
@@ -1638,7 +1616,7 @@ async fn handle_request(
                 if let Ok(parsed) = parse_semantic_plan_arguments(&semantic[0].function.arguments) {
                     action_steps = parsed.describe_steps();
                     response.content.push_str(
-                        "\n\n已生成语义计划；本地 ShowUI/UI-TARS 未返回可信定位，未创建可执行坐标。",
+                        "\n\n已生成语义计划；本地 ShowUI 未返回可信定位，未创建可执行坐标。",
                     );
                 }
             }

@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 
 rem Download pinned model snapshots for Ale, My Eyes! on Windows.
-rem Usage: download-models.bat [all|sensevoice|qwen|showui|uitars] [--models-dir PATH] [--workers N] [--retry-hours N] [--yes|--unattended]
+rem Usage: download-models.bat [all|sensevoice|qwen|showui] [--models-dir PATH] [--workers N] [--retry-hours N] [--yes|--unattended]
 
 for %%I in ("%~dp0..") do set "REPO_ROOT=%%~fI"
 set "MODEL_ROOT=%REPO_ROOT%\models"
@@ -23,7 +23,7 @@ cls
 echo +------------------------------------------------------------------+
 echo ^|             Ale, My Eyes! - Pinned Model Downloader             ^|
 echo +------------------------------------------------------------------+
-echo ^|  Models: all pinned models - about 63 GB                        ^|
+echo ^|  Models: all pinned models - about 31 GB                        ^|
 echo ^|  Directory: repository models folder                            ^|
 echo ^|  Parallel workers: 8                                            ^|
 echo +------------------------------------------------------------------+
@@ -97,11 +97,6 @@ if /I "%~1"=="showui" (
     shift
     goto parse_args
 )
-if /I "%~1"=="uitars" (
-    set "MODE=uitars"
-    shift
-    goto parse_args
-)
 goto usage_error
 
 :args_done
@@ -127,11 +122,10 @@ if errorlevel 1 goto failed
 set "DOWNLOAD_LOG=%MODEL_ROOT%\.downloads\download-models.log"
 >> "%DOWNLOAD_LOG%" echo [%DATE% %TIME%] Started mode=%MODE% workers=%HF_WORKERS% retry_hours=%RETRY_HOURS%
 
-set "REQUIRED_GB=70"
+set "REQUIRED_GB=40"
 if /I "%MODE%"=="sensevoice" set "REQUIRED_GB=1"
 if /I "%MODE%"=="qwen" set "REQUIRED_GB=20"
 if /I "%MODE%"=="showui" set "REQUIRED_GB=16"
-if /I "%MODE%"=="uitars" set "REQUIRED_GB=38"
 set "ALE_MODEL_ROOT=%MODEL_ROOT%"
 
 where powershell.exe >nul 2>&1
@@ -154,7 +148,6 @@ if /I "%MODE%"=="all" (
     echo   SenseVoiceSmall INT8       about 0.2 GB   model license
     echo   Qwen2.5-VL-7B-Instruct     about 16.6 GB  Apache-2.0
     echo   ShowUI-2B                   about 13.3 GB  MIT
-    echo   UI-TARS-1.5-7B             about 33.2 GB  Apache-2.0
 )
 
 powershell.exe -NoProfile -Command "if ((Get-Item -LiteralPath $env:ALE_MODEL_ROOT).PSDrive.Free -lt %REQUIRED_GB%GB) { exit 1 }"
@@ -172,7 +165,6 @@ if /I "%MODE%"=="all" goto download_all
 if /I "%MODE%"=="sensevoice" goto download_sensevoice_only
 if /I "%MODE%"=="qwen" goto download_qwen_only
 if /I "%MODE%"=="showui" goto download_showui_only
-if /I "%MODE%"=="uitars" goto download_uitars_only
 goto usage_error
 
 :download_all
@@ -183,8 +175,6 @@ if errorlevel 1 goto failed
 call :run_with_retry download_qwen "Qwen2.5-VL-7B-Instruct"
 if errorlevel 1 goto failed
 call :run_with_retry download_showui "ShowUI-2B"
-if errorlevel 1 goto failed
-call :run_with_retry download_uitars "UI-TARS-1.5-7B"
 if errorlevel 1 goto failed
 goto success
 
@@ -204,13 +194,6 @@ goto success
 call :run_with_retry ensure_huggingface_hub "huggingface_hub setup"
 if errorlevel 1 goto failed
 call :run_with_retry download_showui "ShowUI-2B"
-if errorlevel 1 goto failed
-goto success
-
-:download_uitars_only
-call :run_with_retry ensure_huggingface_hub "huggingface_hub setup"
-if errorlevel 1 goto failed
-call :run_with_retry download_uitars "UI-TARS-1.5-7B"
 if errorlevel 1 goto failed
 goto success
 
@@ -239,10 +222,6 @@ exit /b %errorlevel%
 
 :download_showui
 call :download_hf_snapshot "ShowUI-2B" "showlab/ShowUI-2B" "cabec4fcc48d15ffd3efe0b33ea9bc7d41509d60"
-exit /b %errorlevel%
-
-:download_uitars
-call :download_hf_snapshot "UI-TARS-1.5-7B" "ByteDance-Seed/UI-TARS-1.5-7B" "683d002dd99d8f95104d31e70391a39348857f4e"
 exit /b %errorlevel%
 
 :download_hf_snapshot
@@ -369,13 +348,13 @@ exit /b %errorlevel%
 echo.
 echo Download completed successfully.
 echo Models directory: %MODEL_ROOT%
-echo NOTE: Qwen, ShowUI, and UI-TARS are downloaded but remain unavailable until their GPU runtimes are integrated.
+echo NOTE: Qwen and ShowUI become available only after the pinned Vulkan calibration passes.
 >> "%DOWNLOAD_LOG%" echo [%DATE% %TIME%] Completed mode=%MODE%.
 if "%PAUSE_ON_EXIT%"=="1" pause
 exit /b 0
 
 :usage_error
-echo Usage: %~nx0 [all^|sensevoice^|qwen^|showui^|uitars] [--models-dir PATH] [--workers 1-32] [--retry-hours N] [--yes^|--unattended]
+echo Usage: %~nx0 [all^|sensevoice^|qwen^|showui] [--models-dir PATH] [--workers 1-32] [--retry-hours N] [--yes^|--unattended]
 exit /b 64
 
 :failed

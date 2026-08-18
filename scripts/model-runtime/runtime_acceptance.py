@@ -211,7 +211,7 @@ def fixture_map(expected: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def acceptance_tests(fixtures: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     unique = sorted(name for name in fixtures if name.startswith("unique"))
-    ambiguous = sorted(name for name in fixtures if name.startswith("ambiguous"))
+    same_label = sorted(name for name in fixtures if name.startswith("same_label"))
     tests: list[dict[str, Any]] = [
         {
             "id": "QWEN-01",
@@ -227,10 +227,11 @@ def acceptance_tests(fixtures: dict[str, dict[str, Any]]) -> list[dict[str, Any]
             "validator": "semantic_plan",
         }
     ]
-    for name in unique:
+    for name in unique + same_label:
+        target = fixtures[name]["target"]
         tests.append(
             {
-                "id": f"SHOWUI-{name.rsplit('_', 1)[-1]}",
+                "id": f"SHOWUI-{name.replace('_', '-').upper()}",
                 "model": "showui",
                 "fixture": name,
                 "tokens": 48,
@@ -238,42 +239,12 @@ def acceptance_tests(fixtures: dict[str, dict[str, Any]]) -> list[dict[str, Any]
                     "Based on the screenshot of the page, I give a text description and you give its "
                     "corresponding location. The coordinate represents a clickable location [x, y] for an "
                     "element, which is a relative coordinate on the screenshot, scaled from 0 to 1. "
-                    "DOWNLOAD MODELS button"
+                    f"{target}"
                 ),
                 "validator": "coordinate",
                 "profile": "official_normalized",
             }
         )
-    profiles = {
-        "absolute_center": (
-            "You are a GUI grounding model. Locate the SAVE button inside the Settings dialog, not the "
-            "background SAVE button. The screenshot is exactly {width} by {height} pixels. Return only the "
-            "absolute pixel coordinate [x, y] at the center of the target button, strictly inside its visible bounds."
-        ),
-        "normalized_center": (
-            "Locate the SAVE button inside the Settings dialog, not the background SAVE button. Return only "
-            "its clickable center as [x, y], using relative coordinates from 0 to 1."
-        ),
-        "action_position": (
-            "Task: click the SAVE button inside the Settings dialog, not the background SAVE button. Return "
-            "only {{'action':'CLICK','value':null,'position':[x,y]}}. Position is the clickable center in relative "
-            "coordinates from 0 to 1."
-        ),
-    }
-    for profile, prompt in profiles.items():
-        for name in ambiguous:
-            width, height = fixtures[name]["image_size"]
-            tests.append(
-                {
-                    "id": f"UITARS-{profile}-{name.rsplit('_', 1)[-1]}",
-                    "model": "uitars",
-                    "fixture": name,
-                    "tokens": 128,
-                    "prompt": prompt.format(width=width, height=height),
-                    "validator": "coordinate",
-                    "profile": profile,
-                }
-            )
     return tests
 
 
@@ -372,27 +343,6 @@ def main() -> int:
 
     qwen_ready = all(item["passed"] for item in results if item["model"] == "qwen")
     showui_ready = all(item["passed"] for item in results if item["model"] == "showui")
-    uitars_results = [item for item in results if item["model"] == "uitars"]
-    profiles = sorted({item["validation"]["profile"] for item in uitars_results})
-    passing_profiles = [
-        profile
-        for profile in profiles
-        if all(
-            item["passed"]
-            for item in uitars_results
-            if item["validation"]["profile"] == profile
-        )
-    ]
-    selected_profile = min(
-        passing_profiles,
-        key=lambda profile: sum(
-            item["validation"]["center_error"] or 1.0
-            for item in uitars_results
-            if item["validation"]["profile"] == profile
-        ),
-        default=None,
-    )
-    uitars_ready = selected_profile is not None
     capabilities = {
         "schema_version": 1,
         "git_commit": args.git_commit,
@@ -401,7 +351,6 @@ def main() -> int:
         "models": {
             "qwen": {"ready": qwen_ready},
             "showui": {"ready": showui_ready},
-            "uitars": {"ready": uitars_ready, "selected_profile": selected_profile},
         },
     }
 
@@ -423,7 +372,7 @@ def main() -> int:
         },
         "tests": results,
         "capabilities": capabilities["models"],
-        "passed": amd_vulkan and qwen_ready and showui_ready and uitars_ready,
+        "passed": amd_vulkan and qwen_ready and showui_ready,
         "notes": [
             "The 30-second field is an SLA observation; cold model loading is included in this first-pass probe.",
             "No mouse or keyboard action is executed by this acceptance tool.",

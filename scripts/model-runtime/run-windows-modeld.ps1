@@ -28,7 +28,10 @@ function Redact-ReportPaths([string]$Directory) {
         $_.Extension -in @(".json", ".log", ".txt")
     } | ForEach-Object {
         $content = Get-Content -LiteralPath $_.FullName -Raw
-        foreach ($value in $replacements) { $content = $content.Replace($value, "<REDACTED>") }
+        foreach ($value in $replacements) {
+            $content = $content.Replace($value, "<REDACTED>")
+            $content = $content.Replace($value.Replace("\", "\\"), "<REDACTED>")
+        }
         Set-Content -LiteralPath $_.FullName -Value $content -Encoding UTF8
     }
 }

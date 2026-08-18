@@ -61,7 +61,7 @@ def unique_target(path: Path) -> dict[str, object]:
     cards = [
         (260, 205, 560, 360, "Qwen2.5-VL-7B", "Planner"),
         (590, 205, 890, 360, "ShowUI-2B", "Grounder"),
-        (920, 205, 1220, 360, "UI-TARS-1.5-7B", "Fallback"),
+        (920, 205, 1220, 360, "llama-server", "Warm runtime"),
     ]
     for left, top, right, bottom, title, role in cards:
         draw.rounded_rectangle((left, top, right, bottom), radius=6, fill="#ffffff", outline="#c5cbd2", width=2)
@@ -82,7 +82,7 @@ def unique_target(path: Path) -> dict[str, object]:
     }
 
 
-def ambiguous_target(path: Path) -> dict[str, object]:
+def same_label_target(path: Path) -> dict[str, object]:
     image, draw = base_window()
     background_save = (980, 570, 1160, 632)
     draw.rounded_rectangle(background_save, radius=6, fill="#69727c")
@@ -98,7 +98,7 @@ def ambiguous_target(path: Path) -> dict[str, object]:
     draw.text((408, 180), "Settings", font=font(28, bold=True), fill="#1f252b")
     draw.text((408, 238), "Runtime backend", font=font(17), fill="#4b5560")
     draw.rounded_rectangle((408, 272, 972, 330), radius=4, fill="#f2f4f6", outline="#bec5cc")
-    draw.text((430, 289), "Vulkan - AMD Radeon Pro WX 9100", font=font(17), fill="#252b31")
+    draw.text((430, 289), "Vulkan - AMD Radeon PRO W6800", font=font(17), fill="#252b31")
     draw.text((408, 370), "Unload idle models after 120 seconds", font=font(17), fill="#252b31")
     draw.rectangle((914, 366, 966, 394), fill="#147d50")
 
@@ -144,22 +144,22 @@ def main() -> None:
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     unique_base_path = args.output_dir / "unique-target-base.png"
-    ambiguous_base_path = args.output_dir / "ambiguous-target-base.png"
+    same_label_base_path = args.output_dir / "same-label-target-base.png"
     unique_base = unique_target(unique_base_path)
-    ambiguous_base = ambiguous_target(ambiguous_base_path)
+    same_label_base = same_label_target(same_label_base_path)
     expected = {"schema_version": 2, "fixtures": {}}
     for label, size in SCALES.items():
         expected["fixtures"][f"unique_{label}"] = scaled_fixture(
             unique_base_path, unique_base, args.output_dir / f"unique-target-{label}.png", size
         )
-        expected["fixtures"][f"ambiguous_{label}"] = scaled_fixture(
-            ambiguous_base_path,
-            ambiguous_base,
-            args.output_dir / f"ambiguous-target-{label}.png",
+        expected["fixtures"][f"same_label_{label}"] = scaled_fixture(
+            same_label_base_path,
+            same_label_base,
+            args.output_dir / f"same-label-target-{label}.png",
             size,
         )
     unique_base_path.unlink()
-    ambiguous_base_path.unlink()
+    same_label_base_path.unlink()
     (args.output_dir / "expected.json").write_text(
         json.dumps(expected, indent=2, sort_keys=True), encoding="utf-8"
     )

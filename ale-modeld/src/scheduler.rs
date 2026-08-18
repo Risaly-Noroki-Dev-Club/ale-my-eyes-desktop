@@ -30,6 +30,7 @@ pub struct ModelScheduler {
 impl ModelScheduler {
     pub fn maintenance(&self) {
         self.sensevoice.unload_if_idle();
+        self.llama.maintenance();
     }
 
     pub async fn handle(&self, request: IpcEnvelope) -> IpcReply {
@@ -73,6 +74,7 @@ impl ModelScheduler {
                         local_vlm_gpu_only: true,
                         gpus: crate::gpu::probe_with_runtime(runtime.as_ref()),
                         available_capabilities,
+                        hot_worker: self.llama.worker_health(),
                     },
                 )
             }
@@ -318,6 +320,7 @@ impl ModelScheduler {
                 )
             }
         };
+        self.llama.reconfigure();
         *self.models.lock().expect("model config lock poisoned") = Some(config);
         ok_json(request.request_id, &serde_json::json!({"configured": true}))
     }

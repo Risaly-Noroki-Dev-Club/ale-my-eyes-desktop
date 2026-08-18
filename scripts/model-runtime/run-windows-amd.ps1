@@ -130,6 +130,8 @@ function Redact-ReportPaths([string]$Directory) {
         $content = Get-Content -LiteralPath $_.FullName -Raw
         foreach ($replacement in $replacements) {
             $content = $content.Replace($replacement.From, $replacement.To)
+            $escaped = $replacement.From.Replace("\", "\\")
+            $content = $content.Replace($escaped, $replacement.To)
         }
         Set-Content -LiteralPath $_.FullName -Value $content -Encoding UTF8
     }
@@ -154,7 +156,7 @@ if ([string]::IsNullOrWhiteSpace($ModelsDir)) {
 } else {
     $ModelsDir = (Resolve-Path $ModelsDir).Path
 }
-$RequiredModels = @("Qwen2.5-VL-7B-Instruct", "ShowUI-2B", "UI-TARS-1.5-7B")
+$RequiredModels = @("Qwen2.5-VL-7B-Instruct", "ShowUI-2B")
 foreach ($model in $RequiredModels) {
     if (-not (Test-Path -LiteralPath (Join-Path $ModelsDir $model) -PathType Container)) {
         throw "Required model directory is missing: $(Join-Path $ModelsDir $model)"
@@ -227,12 +229,18 @@ try {
     $LlamaRoot = Join-Path $ToolsRoot "llama-$LlamaBuild-vulkan"
     $SourceRoot = Join-Path $ToolsRoot "llama-$LlamaBuild-source"
     Expand-PinnedArchive $UvArchive $UvRoot $UvArchiveSha256 "uv.exe"
-    Expand-PinnedArchive $LlamaArchive $LlamaRoot $LlamaArchiveSha256 "llama-cli.exe"
+    Expand-PinnedArchive $LlamaArchive $LlamaRoot $LlamaArchiveSha256 "llama-server.exe"
     Expand-PinnedLlamaSource $SourceArchive $SourceRoot $LlamaSourceSha256 $LlamaBuild
     $Uv = Join-Path $UvRoot "uv.exe"
     $LlamaCli = Join-Path $LlamaRoot "llama-cli.exe"
+    $LlamaServer = Join-Path $LlamaRoot "llama-server.exe"
     $Quantize = Join-Path $LlamaRoot "llama-quantize.exe"
     $LlamaSource = Join-Path $SourceRoot "llama.cpp-$LlamaBuild"
+    foreach ($requiredTool in @($LlamaCli, $LlamaServer, $Quantize)) {
+        if (-not (Test-Path -LiteralPath $requiredTool -PathType Leaf)) {
+            throw "Pinned llama.cpp archive is missing required tool: $requiredTool"
+        }
+    }
 
     $deviceStart = New-Object System.Diagnostics.ProcessStartInfo
     $deviceStart.FileName = $LlamaCli
@@ -276,7 +284,7 @@ try {
     New-Item -ItemType Directory -Force -Path $ReportFixtures | Out-Null
     Copy-Item -Path (Join-Path $FixtureDir "*") -Destination $ReportFixtures -Force
 
-    Write-Stage "5/6 - Converting three pinned models to restart-safe Q4_K_M GGUF"
+    Write-Stage "5/6 - Converting two pinned models to restart-safe Q4_K_M GGUF"
     $ModelManifest = Join-Path $RuntimeRoot "runtime-models.json"
     & $Python (Join-Path $PSScriptRoot "prepare_gguf.py") `
         --models-dir $ModelsDir `

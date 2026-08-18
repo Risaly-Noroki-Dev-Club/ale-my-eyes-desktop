@@ -39,12 +39,6 @@ MODELS = (
         "cabec4fcc48d15ffd3efe0b33ea9bc7d41509d60",
         ("Qwen2VLForConditionalGeneration",),
     ),
-    ModelSpec(
-        "uitars",
-        "UI-TARS-1.5-7B",
-        "683d002dd99d8f95104d31e70391a39348857f4e",
-        ("Qwen2_5_VLForConditionalGeneration",),
-    ),
 )
 
 

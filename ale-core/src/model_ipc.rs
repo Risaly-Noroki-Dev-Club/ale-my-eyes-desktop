@@ -1,7 +1,7 @@
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MODEL_IPC_VERSION: u32 = 1;
+pub const MODEL_IPC_VERSION: u32 = 2;
 pub const MAX_MODEL_IPC_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Message)]

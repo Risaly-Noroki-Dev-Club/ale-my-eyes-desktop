@@ -75,20 +75,6 @@ impl BoundingBox {
             && self.x + self.width <= 1.0
             && self.y + self.height <= 1.0
     }
-
-    pub fn iou(&self, other: &Self) -> f32 {
-        let left = self.x.max(other.x);
-        let top = self.y.max(other.y);
-        let right = (self.x + self.width).min(other.x + other.width);
-        let bottom = (self.y + self.height).min(other.y + other.height);
-        let intersection = (right - left).max(0.0) * (bottom - top).max(0.0);
-        let union = self.width * self.height + other.width * other.height - intersection;
-        if union <= f32::EPSILON {
-            0.0
-        } else {
-            intersection / union
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -243,13 +229,6 @@ pub struct GroundingResult {
     pub candidates: Vec<GroundingCandidate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GroundingModel {
-    ShowUi,
-    UiTars,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalPlanningJob {
     pub question: String,
@@ -271,7 +250,6 @@ pub struct GroundingJob {
     pub image_width: u32,
     pub image_height: u32,
     pub candidate_bounds: Vec<BoundingBox>,
-    pub model: GroundingModel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +391,16 @@ pub struct SchedulerHealth {
     pub local_vlm_gpu_only: bool,
     pub gpus: Vec<GpuDevice>,
     pub available_capabilities: Vec<ModelCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_worker: Option<ModelWorkerHealth>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelWorkerHealth {
+    pub model_id: String,
+    pub process_id: u32,
+    pub active: bool,
+    pub idle_millis: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,7 +435,7 @@ pub struct ModelRuntimeConfig {
     pub sensevoice_model: String,
     pub sensevoice_tokens: String,
     #[serde(default)]
-    pub llama_cli: Option<String>,
+    pub llama_server: Option<String>,
     #[serde(default)]
     pub qwen_model: Option<String>,
     #[serde(default)]
@@ -456,10 +444,6 @@ pub struct ModelRuntimeConfig {
     pub showui_model: Option<String>,
     #[serde(default)]
     pub showui_mmproj: Option<String>,
-    #[serde(default)]
-    pub uitars_model: Option<String>,
-    #[serde(default)]
-    pub uitars_mmproj: Option<String>,
     #[serde(default)]
     pub capability_manifest: Option<String>,
 }
@@ -658,12 +642,6 @@ pub fn route_planning(evidence: &PlanningEvidence) -> RouteDecision {
     }
 }
 
-pub fn grounding_models_agree(first: &GroundingCandidate, second: &GroundingCandidate) -> bool {
-    let dx = first.click_x - second.click_x;
-    let dy = first.click_y - second.click_y;
-    first.bounds.iou(&second.bounds) >= 0.70 && (dx * dx + dy * dy).sqrt() <= 0.02
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,28 +716,6 @@ mod tests {
         }
         .conservative_score();
         assert_eq!(score, 0.72);
-    }
-
-    #[test]
-    fn dual_grounders_require_overlap_and_nearby_points() {
-        let first = GroundingCandidate {
-            bounds: BoundingBox {
-                x: 0.1,
-                y: 0.1,
-                width: 0.2,
-                height: 0.2,
-            },
-            click_x: 0.2,
-            click_y: 0.2,
-            confidence: 0.99,
-            evidence: String::new(),
-        };
-        let mut second = first.clone();
-        second.bounds.x = 0.11;
-        second.click_x = 0.21;
-        assert!(grounding_models_agree(&first, &second));
-        second.click_x = 0.24;
-        assert!(!grounding_models_agree(&first, &second));
     }
 
     #[test]
