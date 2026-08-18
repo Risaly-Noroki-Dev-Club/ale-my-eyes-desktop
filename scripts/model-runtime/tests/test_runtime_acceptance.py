@@ -68,14 +68,24 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             report = root / "report"
             fixtures.mkdir()
             expected = {
-                "image_size": [1280, 720],
-                "unique": {
-                    "file": "unique.png",
-                    "bbox_normalized": [0.68, 0.77, 0.91, 0.89],
-                },
-                "ambiguous": {
-                    "file": "ambiguous.png",
-                    "bbox_normalized": [0.63, 0.72, 0.76, 0.81],
+                "schema_version": 2,
+                "fixtures": {
+                    **{
+                        f"unique_{scale}": {
+                            "file": f"unique-{scale}.png",
+                            "image_size": [1280, 720],
+                            "bbox_normalized": [0.68, 0.77, 0.91, 0.89],
+                        }
+                        for scale in ("100", "150", "200")
+                    },
+                    **{
+                        f"ambiguous_{scale}": {
+                            "file": f"ambiguous-{scale}.png",
+                            "image_size": [1280, 720],
+                            "bbox_normalized": [0.63, 0.72, 0.76, 0.81],
+                        }
+                        for scale in ("100", "150", "200")
+                    },
                 },
             }
             (fixtures / "expected.json").write_text(json.dumps(expected), encoding="utf-8")
@@ -108,15 +118,18 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                     "stderr": stderr,
                 }
 
-            process_results = [
-                result("Vulkan0: AMD Radeon Pro WX 9100", ""),
-                result(
-                    '{"goal":"download","steps":[{"operation":"click","target":"button",'
-                    '"expected_state":"dialog opens"}]}'
-                ),
-                result("[0.80, 0.82]"),
-                result("[0.70, 0.77]"),
-            ]
+            def fake_run(command, _timeout):
+                if "--list-devices" in command:
+                    return result("Vulkan0: AMD Radeon Pro WX 9100", "")
+                prompt = command[command.index("-p") + 1]
+                if "semantic plan" in prompt:
+                    return result(
+                        '{"goal":"download","steps":[{"operation":"click","target":"button",'
+                        '"expected_state":"dialog opens"}]}'
+                    )
+                if "DOWNLOAD MODELS" in prompt:
+                    return result("[0.80, 0.82]")
+                return result("[0.70, 0.77]")
             argv = [
                 "runtime_acceptance.py",
                 "--llama-cli",
@@ -128,13 +141,14 @@ class RuntimeAcceptanceTests(unittest.TestCase):
                 "--report-dir",
                 str(report),
             ]
-            with mock.patch.object(RUNTIME, "run_process", side_effect=process_results), mock.patch.object(
+            with mock.patch.object(RUNTIME, "run_process", side_effect=fake_run), mock.patch.object(
                 sys, "argv", argv
             ):
                 self.assertEqual(RUNTIME.main(), 0)
             summary = json.loads((report / "summary.json").read_text(encoding="utf-8"))
             self.assertTrue(summary["passed"])
             self.assertTrue(all(item["passed"] for item in summary["tests"]))
+            self.assertEqual(summary["capabilities"]["uitars"]["selected_profile"], "absolute_center")
             self.assertNotIn("model_path", summary["models"]["qwen"])
 
 

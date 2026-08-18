@@ -1,4 +1,4 @@
-use ale_core::model_scheduler::{GpuBackend, GpuDevice};
+use ale_core::model_scheduler::{GpuBackend, GpuDevice, ModelRuntimeConfig};
 use std::process::Command;
 
 const MIB: u64 = 1024 * 1024;
@@ -15,6 +15,57 @@ pub fn probe() -> Vec<GpuDevice> {
     {
         devices
     }
+}
+
+pub fn probe_with_runtime(runtime: Option<&ModelRuntimeConfig>) -> Vec<GpuDevice> {
+    let mut devices = probe();
+    if let Some(cli) = runtime.and_then(|runtime| runtime.llama_cli.as_deref()) {
+        let output = Command::new(cli).arg("--list-devices").output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let text = format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                for device in parse_llama_vulkan(&text) {
+                    if !devices.iter().any(|existing| existing.id == device.id) {
+                        devices.push(device);
+                    }
+                }
+            }
+        }
+    }
+    devices
+}
+
+fn parse_llama_vulkan(output: &str) -> Vec<GpuDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (id, details) = line.split_once(':')?;
+            if !id.starts_with("Vulkan") {
+                return None;
+            }
+            let (name, memory) = details.trim().rsplit_once(" (")?;
+            let memory = memory.strip_suffix(')')?;
+            let (total, free) = memory.split_once(',')?;
+            let total_mib = total.trim().strip_suffix(" MiB")?.parse::<u64>().ok()?;
+            let free_mib = free.trim().strip_suffix(" MiB free")?.parse::<u64>().ok()?;
+            let lower = name.to_ascii_lowercase();
+            if !lower.contains("amd") && !lower.contains("radeon") {
+                return None;
+            }
+            Some(GpuDevice {
+                id: format!("amd:{}", id.to_ascii_lowercase()),
+                name: name.to_string(),
+                backend: GpuBackend::Amd,
+                total_vram_bytes: total_mib.saturating_mul(MIB),
+                available_vram_bytes: free_mib.saturating_mul(MIB),
+            })
+        })
+        .collect()
 }
 
 fn probe_nvidia() -> Vec<GpuDevice> {
@@ -105,5 +156,16 @@ mod tests {
         assert_eq!(devices[0].available_vram_bytes, 12_288 * MIB);
         assert!(devices[0].supports_default_models());
         assert!(!devices[0].supports_large_models());
+    }
+
+    #[test]
+    fn parses_amd_vulkan_memory_from_llama_device_probe() {
+        let devices = parse_llama_vulkan(
+            "Available devices:\n  Vulkan0: AMD Radeon PRO W6800 (32752 MiB, 31954 MiB free)\n",
+        );
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, "amd:vulkan0");
+        assert_eq!(devices[0].available_vram_bytes, 31_954 * MIB);
+        assert!(devices[0].supports_large_models());
     }
 }

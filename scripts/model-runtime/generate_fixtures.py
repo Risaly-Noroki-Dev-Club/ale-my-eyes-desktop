@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 1280
 HEIGHT = 720
+SCALES = {"100": (1280, 720), "150": (1600, 900), "200": (1920, 1080)}
 
 
 def font(size: int, bold: bool = False) -> ImageFont.ImageFont:
@@ -121,16 +122,44 @@ def ambiguous_target(path: Path) -> dict[str, object]:
     }
 
 
+def scaled_fixture(
+    source: Path, metadata: dict[str, object], destination: Path, size: tuple[int, int]
+) -> dict[str, object]:
+    width, height = size
+    image = Image.open(source).resize(size, Image.Resampling.LANCZOS)
+    image.save(destination, format="PNG")
+    left, top, right, bottom = metadata["bbox_normalized"]
+    return {
+        "file": destination.name,
+        "target": metadata["target"],
+        "image_size": [width, height],
+        "bbox_pixels": [left * width, top * height, right * width, bottom * height],
+        "bbox_normalized": [left, top, right, bottom],
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    expected = {
-        "image_size": [WIDTH, HEIGHT],
-        "unique": unique_target(args.output_dir / "unique-target.png"),
-        "ambiguous": ambiguous_target(args.output_dir / "ambiguous-target.png"),
-    }
+    unique_base_path = args.output_dir / "unique-target-base.png"
+    ambiguous_base_path = args.output_dir / "ambiguous-target-base.png"
+    unique_base = unique_target(unique_base_path)
+    ambiguous_base = ambiguous_target(ambiguous_base_path)
+    expected = {"schema_version": 2, "fixtures": {}}
+    for label, size in SCALES.items():
+        expected["fixtures"][f"unique_{label}"] = scaled_fixture(
+            unique_base_path, unique_base, args.output_dir / f"unique-target-{label}.png", size
+        )
+        expected["fixtures"][f"ambiguous_{label}"] = scaled_fixture(
+            ambiguous_base_path,
+            ambiguous_base,
+            args.output_dir / f"ambiguous-target-{label}.png",
+            size,
+        )
+    unique_base_path.unlink()
+    ambiguous_base_path.unlink()
     (args.output_dir / "expected.json").write_text(
         json.dumps(expected, indent=2, sort_keys=True), encoding="utf-8"
     )

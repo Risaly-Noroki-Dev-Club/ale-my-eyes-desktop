@@ -272,6 +272,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sherpa-rs",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

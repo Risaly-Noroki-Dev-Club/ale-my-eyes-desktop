@@ -1,4 +1,5 @@
 mod gpu;
+mod llama;
 mod scheduler;
 mod sensevoice;
 

@@ -86,6 +86,7 @@ impl ScreenCoordinateSpace {
         for action in &mut plan.actions {
             let coordinates = match action {
                 Action::Click { x, y, .. }
+                | Action::ControlledTestClick { x, y, .. }
                 | Action::DoubleClick { x, y }
                 | Action::MouseMove { x, y }
                 | Action::Scroll { x, y, .. } => Some((x, y)),
@@ -251,6 +252,14 @@ impl ScreenCapture {
     /// 立即截取一帧
     pub fn capture_now(&self) -> Result<ScreenFrame> {
         capture_primary_monitor(self.config.scale)
+    }
+
+    pub fn capture_now_jpeg(&self) -> Result<CapturedScreen> {
+        let frame = self.capture_now()?;
+        Ok(CapturedScreen {
+            jpeg_data: frame_to_jpeg(&frame, self.config.jpeg_quality)?,
+            coordinate_space: frame.coordinate_space(),
+        })
     }
 }
 

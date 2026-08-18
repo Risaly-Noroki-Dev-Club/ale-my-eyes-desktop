@@ -121,6 +121,17 @@ impl AutomationEngine {
                 self.mouse_move(*x, *y)?;
                 self.mouse_click(*button)?;
             }
+            Action::ControlledTestClick {
+                x,
+                y,
+                window_title,
+                target_name,
+                ..
+            } => {
+                validate_controlled_test_target(*x, *y, window_title, target_name)?;
+                self.mouse_move(*x, *y)?;
+                self.mouse_click(MouseButton::Left)?;
+            }
             Action::DoubleClick { x, y } => {
                 self.mouse_move(*x, *y)?;
                 self.mouse_click(MouseButton::Left)?;
@@ -224,6 +235,66 @@ impl AutomationEngine {
             .button(btn, Direction::Click)
             .map_err(|e| AleError::Other(anyhow::anyhow!("Mouse click failed: {}", e)))
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn validate_controlled_test_target(
+    _x: f64,
+    _y: f64,
+    _window_title: &str,
+    _target_name: &str,
+) -> Result<()> {
+    Err(AleError::ConfigError(
+        "受控测试点击仅支持 Windows".to_string(),
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn validate_controlled_test_target(
+    x: f64,
+    y: f64,
+    window_title: &str,
+    target_name: &str,
+) -> Result<()> {
+    const ALLOWED_WINDOW: &str = "ALE MODEL RUNTIME CONTROLLED TEST";
+    const ALLOWED_TARGET: &str = "SAVE button inside Settings dialog";
+    if std::env::var("ALE_CONTROLLED_TEST_EXECUTION")
+        .ok()
+        .as_deref()
+        != Some("1")
+        || window_title != ALLOWED_WINDOW
+        || target_name != ALLOWED_TARGET
+    {
+        return Err(AleError::ConfigError(
+            "受控测试执行未启用或目标不在允许列表".to_string(),
+        ));
+    }
+    let script = format!(
+        r#"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Add-Type -AssemblyName UIAutomationClient; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class N {{ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }}'; $r=[System.Windows.Automation.AutomationElement]::FromHandle([N]::GetForegroundWindow()); if($null -eq $r -or $r.Current.Name -ne '{ALLOWED_WINDOW}'){{exit 3}}; $c=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'{ALLOWED_TARGET}'); $e=$r.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$c); if($null -eq $e){{exit 4}}; $b=$e.Current.BoundingRectangle; @($b.Left,$b.Top,$b.Right,$b.Bottom)|ConvertTo-Json -Compress"#
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .map_err(|error| AleError::Other(anyhow::anyhow!("UIA 目标复核失败: {error}")))?;
+    if !output.status.success() {
+        return Err(AleError::ConfigError(
+            "执行前活动窗口或 UIA 目标已变化".to_string(),
+        ));
+    }
+    let bounds: [f64; 4] = serde_json::from_slice(&output.stdout)
+        .map_err(|error| AleError::Other(anyhow::anyhow!("UIA 边界无效: {error}")))?;
+    if x < bounds[0] || y < bounds[1] || x > bounds[2] || y > bounds[3] {
+        return Err(AleError::ConfigError(
+            "执行坐标不再位于受控 UIA 目标内".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "windows", test))]

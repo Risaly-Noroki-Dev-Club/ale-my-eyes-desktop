@@ -243,6 +243,51 @@ pub struct GroundingResult {
     pub candidates: Vec<GroundingCandidate>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroundingModel {
+    ShowUi,
+    UiTars,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPlanningJob {
+    pub question: String,
+    pub image_base64: String,
+    pub application_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalPlanningResult {
+    pub plan: SemanticPlan,
+    pub model_id: String,
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundingJob {
+    pub image_base64: String,
+    pub target: TargetRef,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub candidate_bounds: Vec<BoundingBox>,
+    pub model: GroundingModel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateVerificationJob {
+    pub image_base64: String,
+    pub expected_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateVerificationResult {
+    pub observed: bool,
+    pub summary: String,
+    pub model_id: String,
+    pub snapshot_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ConfidenceEvidence {
     pub target_uniqueness: f32,
@@ -401,6 +446,22 @@ pub struct ModelRuntimeConfig {
     pub models_dir: String,
     pub sensevoice_model: String,
     pub sensevoice_tokens: String,
+    #[serde(default)]
+    pub llama_cli: Option<String>,
+    #[serde(default)]
+    pub qwen_model: Option<String>,
+    #[serde(default)]
+    pub qwen_mmproj: Option<String>,
+    #[serde(default)]
+    pub showui_model: Option<String>,
+    #[serde(default)]
+    pub showui_mmproj: Option<String>,
+    #[serde(default)]
+    pub uitars_model: Option<String>,
+    #[serde(default)]
+    pub uitars_mmproj: Option<String>,
+    #[serde(default)]
+    pub capability_manifest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

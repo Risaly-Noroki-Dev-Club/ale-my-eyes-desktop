@@ -3,8 +3,11 @@ use crate::conversation::automation_tools;
 use crate::modeld::SupervisedModeldClient;
 use crate::platform::{self, ExecutionControl, PlatformService};
 use crate::remote_crypto;
-use ale_core::actions::{parse_action_plan_arguments, ActionPlan};
-use ale_core::model_scheduler::{validate_semantic_plan, SemanticPlan};
+use ale_core::actions::{parse_action_plan_arguments, Action, ActionPlan};
+use ale_core::model_scheduler::{
+    validate_semantic_plan, BoundingBox, GroundingJob, GroundingModel, ModelCapability,
+    SemanticPlan, StateVerificationJob, LOCAL_MEDIUM_RISK_THRESHOLD,
+};
 use ale_core::remote::{
     AssistantOutput, AssistantOutputKind, AudioChunk, AudioEnd, AudioFormat, AudioStart,
     CancelRequest, ClientHello, CommandInput, CommandPreview, CommandRequest, ConfirmExecution,
@@ -353,7 +356,10 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
             .map(|health| {
                 health
                     .available_capabilities
-                    .contains(&ale_core::model_scheduler::ModelCapability::LocalPlanning)
+                    .contains(&ModelCapability::LocalPlanning)
+                    && health
+                        .available_capabilities
+                        .contains(&ModelCapability::ElementGrounding)
             })
             .unwrap_or(false)
     } else {
@@ -684,6 +690,31 @@ async fn handle_connection(
                             "桌面模型调度器不可用",
                         )
                         .await?;
+                    } else if local_planning_available && !explicit_cloud_mode {
+                        match start_remote_request(
+                            engine.clone(),
+                            platform.clone(),
+                            modeld.clone(),
+                            request_slots.clone(),
+                            request_id.clone(),
+                            payload,
+                            processing_tx.clone(),
+                            false,
+                            false,
+                            true,
+                        ) {
+                            Ok(request) => processing = Some(request),
+                            Err((code, message)) => {
+                                send_remote_error(
+                                    &mut socket,
+                                    &mut secure,
+                                    Some(request_id),
+                                    code,
+                                    message,
+                                )
+                                .await?;
+                            }
+                        }
                     } else {
                         let (kind, prompt) =
                             initial_model_decision(explicit_cloud_mode, local_planning_available);
@@ -797,6 +828,31 @@ async fn handle_connection(
                                     "桌面模型调度器不可用",
                                 )
                                 .await?;
+                            } else if local_planning_available && !explicit_cloud_mode {
+                                match start_remote_request(
+                                    engine.clone(),
+                                    platform.clone(),
+                                    modeld.clone(),
+                                    request_slots.clone(),
+                                    request_id.clone(),
+                                    payload,
+                                    processing_tx.clone(),
+                                    false,
+                                    false,
+                                    true,
+                                ) {
+                                    Ok(request) => processing = Some(request),
+                                    Err((code, message)) => {
+                                        send_remote_error(
+                                            &mut socket,
+                                            &mut secure,
+                                            Some(request_id),
+                                            code,
+                                            message,
+                                        )
+                                        .await?;
+                                    }
+                                }
                             } else {
                                 let (kind, prompt) = initial_model_decision(
                                     explicit_cloud_mode,
@@ -896,6 +952,7 @@ async fn handle_connection(
                                 request_id,
                                 plan,
                                 platform.clone(),
+                                modeld.clone(),
                                 execution_tx.clone(),
                             ));
                         }
@@ -1119,6 +1176,7 @@ async fn handle_decision_response(
                 results,
                 processing.is_some() || execution_busy,
                 allow_full_screenshot,
+                false,
             ) {
                 Ok(request) => *processing = Some(request),
                 Err((code, message)) => {
@@ -1136,6 +1194,13 @@ enum RequestPayload {
     AudioWav(Vec<u8>),
 }
 
+struct RequestInference<'a> {
+    progress: Option<&'a mpsc::UnboundedSender<ProcessingResult>>,
+    modeld: Option<&'a SupervisedModeldClient>,
+    allow_full_screenshot: bool,
+    local: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_remote_request(
     engine: Arc<Mutex<AleEngine>>,
@@ -1147,6 +1212,7 @@ fn start_remote_request(
     results: mpsc::UnboundedSender<ProcessingResult>,
     connection_busy: bool,
     allow_full_screenshot: bool,
+    local_inference: bool,
 ) -> Result<ProcessingRequest, (&'static str, &'static str)> {
     if connection_busy {
         return Err(("SERVER_BUSY", "当前连接正在处理另一请求"));
@@ -1166,9 +1232,12 @@ fn start_remote_request(
                 platform,
                 &task_request_id,
                 payload,
-                Some(&progress),
-                modeld.as_ref(),
-                allow_full_screenshot,
+                RequestInference {
+                    progress: Some(&progress),
+                    modeld: modeld.as_ref(),
+                    allow_full_screenshot,
+                    local: local_inference,
+                },
             ),
         )
         .await
@@ -1308,7 +1377,19 @@ async fn handle_command(
     let payload = match input {
         CommandInput::Text { text } => RequestPayload::Text(text.clone()),
     };
-    handle_request(engine, platform, request_id, payload, None, None, true).await
+    handle_request(
+        engine,
+        platform,
+        request_id,
+        payload,
+        RequestInference {
+            progress: None,
+            modeld: None,
+            allow_full_screenshot: true,
+            local: false,
+        },
+    )
+    .await
 }
 
 async fn handle_request(
@@ -1316,10 +1397,14 @@ async fn handle_request(
     platform: Arc<dyn PlatformService>,
     request_id: &str,
     input: RequestPayload,
-    progress: Option<&mpsc::UnboundedSender<ProcessingResult>>,
-    modeld: Option<&SupervisedModeldClient>,
-    allow_full_screenshot: bool,
+    inference: RequestInference<'_>,
 ) -> Result<(CommandPreview, Option<ActionPlan>), String> {
+    let RequestInference {
+        progress,
+        modeld,
+        allow_full_screenshot,
+        local: local_inference,
+    } = inference;
     let request_id = request_id.to_string();
     let question = match input {
         RequestPayload::Text(text) => text,
@@ -1348,7 +1433,7 @@ async fn handle_request(
         ProgressStage::CapturingState,
         "正在获取桌面状态",
     );
-    let image = allow_full_screenshot
+    let image = (allow_full_screenshot || local_inference)
         .then(|| platform.capture_image())
         .flatten();
     report_progress(
@@ -1357,6 +1442,146 @@ async fn handle_request(
         ProgressStage::Planning,
         "正在规划操作",
     );
+    if local_inference {
+        let client = modeld.ok_or_else(|| "MODEL_SCHEDULER_UNAVAILABLE".to_string())?;
+        let image = image
+            .as_ref()
+            .ok_or_else(|| "LOCAL_SCREENSHOT_UNAVAILABLE".to_string())?;
+        let snapshot_id = captured_snapshot_id(image);
+        let accessibility = platform.capture_accessibility(&image.coordinate_space);
+        let prepared_question = {
+            let engine = engine.lock().await;
+            engine.prepare_vision_question(&question)
+        };
+        let result = client
+            .local_plan(
+                &request_id,
+                &snapshot_id,
+                prepared_question,
+                &image.jpeg_data,
+                accessibility
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.application_id.clone()),
+            )
+            .await?;
+        if result.snapshot_id != snapshot_id {
+            return Err("SNAPSHOT_MISMATCH".to_string());
+        }
+        let plan = validate_semantic_plan(result.plan).map_err(|error| error.to_string())?;
+        let mut response_text = format!("本地 {} 已生成语义计划。", result.model_id);
+        let mut executable_plan = None;
+        if let Some(target) = plan.steps.first().and_then(|step| step.target.clone()) {
+            let candidate_bounds: Vec<BoundingBox> = accessibility
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .nodes
+                        .iter()
+                        .filter(|node| accessibility_node_matches(node, &target))
+                        .map(|node| node.bounds.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let grounding = GroundingJob {
+                image_base64: base64::engine::general_purpose::STANDARD.encode(&image.jpeg_data),
+                target: target.clone(),
+                image_width: image.coordinate_space.image_width,
+                image_height: image.coordinate_space.image_height,
+                candidate_bounds: candidate_bounds.clone(),
+                model: GroundingModel::ShowUi,
+            };
+            match client.ground(&request_id, &snapshot_id, grounding).await {
+                Ok(grounded)
+                    if grounded.snapshot_id == snapshot_id
+                        && grounded.selected.as_ref().is_some_and(|candidate| {
+                            candidate.confidence >= LOCAL_MEDIUM_RISK_THRESHOLD
+                        }) =>
+                {
+                    if let Some(selected) = grounded.selected {
+                        let controlled = std::env::var("ALE_CONTROLLED_TEST_EXECUTION")
+                            .ok()
+                            .as_deref()
+                            == Some("1")
+                            && accessibility
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.application_id.as_deref())
+                                == Some("ALE MODEL RUNTIME CONTROLLED TEST");
+                        if controlled {
+                            let image_x = selected.click_x as f64
+                                * image.coordinate_space.image_width.saturating_sub(1) as f64;
+                            let image_y = selected.click_y as f64
+                                * image.coordinate_space.image_height.saturating_sub(1) as f64;
+                            let (desktop_x, desktop_y) = image
+                                .coordinate_space
+                                .map_point(image_x, image_y)
+                                .map_err(|error| error.to_string())?;
+                            let mut action_plan =
+                                ActionPlan::new("在专用 AME 测试窗口执行一次受控点击".to_string());
+                            action_plan.add_action(Action::ControlledTestClick {
+                                x: desktop_x,
+                                y: desktop_y,
+                                window_title: "ALE MODEL RUNTIME CONTROLLED TEST".to_string(),
+                                target_name: "SAVE button inside Settings dialog".to_string(),
+                                snapshot_id: snapshot_id.clone(),
+                            });
+                            action_plan.validate().map_err(|error| error.to_string())?;
+                            response_text.push_str(
+                                "定位结果与唯一 UIA 候选一致；确认后只允许点击专用测试窗口。",
+                            );
+                            executable_plan = Some(action_plan);
+                        } else {
+                            response_text.push_str(
+                                "定位结果与唯一 UIA 候选一致；当前为 dry-run，未创建执行动作。",
+                            );
+                        }
+                    } else {
+                        response_text
+                            .push_str("定位模型已运行，但桌面没有唯一 UIA 候选；未创建执行坐标。");
+                    }
+                }
+                primary => {
+                    let fallback = GroundingJob {
+                        image_base64: base64::engine::general_purpose::STANDARD
+                            .encode(&image.jpeg_data),
+                        target,
+                        image_width: image.coordinate_space.image_width,
+                        image_height: image.coordinate_space.image_height,
+                        candidate_bounds,
+                        model: GroundingModel::UiTars,
+                    };
+                    let fallback_result = client
+                        .ground(&format!("{request_id}:uitars"), &snapshot_id, fallback)
+                        .await;
+                    response_text.push_str(match (primary, fallback_result) {
+                        (Ok(_), Ok(_)) => {
+                            "ShowUI 未得到唯一候选，UI-TARS 已复核；模型证据存在冲突，未创建执行坐标。"
+                        }
+                        (Err(_), Ok(_)) => {
+                            "ShowUI 失败，UI-TARS 仅作为复核证据；不使用最后一个模型强制执行。"
+                        }
+                        (_, Err(_)) => {
+                            "ShowUI/UI-TARS 未共同提供可信定位；未创建执行坐标。"
+                        }
+                    });
+                }
+            }
+        }
+        let confirmation_text = executable_plan
+            .as_ref()
+            .map(ActionPlan::speak_text)
+            .unwrap_or_default();
+        return Ok((
+            CommandPreview {
+                request_id,
+                response_text,
+                action_steps: plan.describe_steps(),
+                confirmation_text,
+                requires_confirmation: executable_plan.is_some(),
+                has_plan: executable_plan.is_some(),
+            },
+            executable_plan,
+        ));
+    }
     let mut response = if let Some(client) = modeld {
         let prepared_question = {
             let engine = engine.lock().await;
@@ -1461,6 +1686,50 @@ async fn handle_request(
     ))
 }
 
+fn captured_snapshot_id(image: &crate::platform::CapturedImage) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(&image.jpeg_data);
+    let space = image.coordinate_space;
+    hasher.update(space.image_width.to_le_bytes());
+    hasher.update(space.image_height.to_le_bytes());
+    hasher.update(space.desktop_x.to_le_bytes());
+    hasher.update(space.desktop_y.to_le_bytes());
+    hasher.update(space.desktop_width.to_le_bytes());
+    hasher.update(space.desktop_height.to_le_bytes());
+    format!("snapshot-{:x}", hasher.finalize())
+}
+
+fn accessibility_node_matches(
+    node: &crate::platform::AccessibilityNode,
+    target: &ale_core::model_scheduler::TargetRef,
+) -> bool {
+    if target
+        .node_id
+        .as_deref()
+        .is_some_and(|id| id == node.node_id)
+    {
+        return true;
+    }
+    if let (Some(expected), Some(actual)) = (target.role.as_deref(), node.role.as_deref()) {
+        if !actual
+            .to_ascii_lowercase()
+            .contains(&expected.to_ascii_lowercase())
+        {
+            return false;
+        }
+    }
+    let expected = target
+        .label
+        .as_deref()
+        .or(target.visual_description.as_deref());
+    match (expected, node.label.as_deref()) {
+        (Some(expected), Some(actual)) => actual
+            .to_ascii_lowercase()
+            .contains(&expected.to_ascii_lowercase()),
+        _ => false,
+    }
+}
+
 fn parse_semantic_plan_arguments(arguments: &str) -> Result<SemanticPlan, String> {
     let value: serde_json::Value =
         serde_json::from_str(arguments).map_err(|error| error.to_string())?;
@@ -1544,24 +1813,91 @@ fn start_remote_execution(
     request_id: String,
     plan: ActionPlan,
     platform: Arc<dyn PlatformService>,
+    modeld: Option<SupervisedModeldClient>,
     results: mpsc::UnboundedSender<RemoteExecutionEvent>,
 ) -> RemoteExecution {
     let deadline = Instant::now() + EXECUTION_TIMEOUT;
     let control = ExecutionControl::new(deadline);
     let task_control = control.clone();
     let task_request_id = request_id.clone();
+    let controlled_test = plan
+        .actions
+        .iter()
+        .any(|action| matches!(action, Action::ControlledTestClick { .. }));
+    let expected_snapshot = plan.actions.iter().find_map(|action| match action {
+        Action::ControlledTestClick { snapshot_id, .. } => Some(snapshot_id.clone()),
+        _ => None,
+    });
     let task = tokio::spawn(async move {
         let status_request_id = task_request_id.clone();
+        if let Some(expected_snapshot) = expected_snapshot {
+            let current_snapshot = platform
+                .capture_image_now()
+                .map(|image| captured_snapshot_id(&image));
+            if current_snapshot.as_deref() != Some(expected_snapshot.as_str()) {
+                let _ = results.send(RemoteExecutionEvent {
+                    request_id: status_request_id,
+                    kind: RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(
+                        ExecutionStatus {
+                            request_id: task_request_id,
+                            state: ExecutionState::Failed,
+                            message: "SNAPSHOT_EXPIRED".to_string(),
+                            actions_executed: 0,
+                        },
+                    )),
+                });
+                return;
+            }
+        }
         let blocking_control = task_control.clone();
+        let execution_platform = platform.clone();
         let mut execution = tokio::task::spawn_blocking(move || {
-            execute_confirm(task_request_id, plan, platform, blocking_control)
+            execute_confirm(task_request_id, plan, execution_platform, blocking_control)
         });
         let outcome = match tokio::time::timeout_at(deadline.into(), &mut execution).await {
             Ok(Ok(_)) if task_control.timed_out() => RemoteExecutionOutcome::Error {
                 code: "CONFIRM_TIMEOUT",
                 message: "桌面端执行超时，结果可能不确定".to_string(),
             },
-            Ok(Ok(status)) => RemoteExecutionOutcome::Status(status),
+            Ok(Ok(mut status)) => {
+                if controlled_test && matches!(status.state, ExecutionState::Completed) {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let verification = match (modeld.as_ref(), platform.capture_image_now()) {
+                        (Some(modeld), Some(image)) => {
+                            let snapshot_id = captured_snapshot_id(&image);
+                            modeld
+                                .verify(
+                                    &format!("{}:verify", status_request_id),
+                                    &snapshot_id,
+                                    StateVerificationJob {
+                                        image_base64: String::new(),
+                                        expected_state:
+                                            "The controlled test window visibly shows SAVED"
+                                                .to_string(),
+                                    },
+                                    &image.jpeg_data,
+                                )
+                                .await
+                                .map(|result| result.observed)
+                        }
+                        (None, _) => Err("模型调度器不可用，无法验证执行结果".to_string()),
+                        (_, None) => Err("无法重新截图验证执行结果".to_string()),
+                    };
+                    match verification {
+                        Ok(true) => status.message.push_str("，并已验证 SAVED 后置状态"),
+                        Ok(false) => {
+                            status.state = ExecutionState::Failed;
+                            status.message =
+                                "操作已执行，但模型未观察到 SAVED 后置状态".to_string();
+                        }
+                        Err(error) => {
+                            status.state = ExecutionState::Failed;
+                            status.message = format!("操作已执行，但后置验证失败: {error}");
+                        }
+                    }
+                }
+                RemoteExecutionOutcome::Status(status)
+            }
             Ok(Err(error)) => RemoteExecutionOutcome::Error {
                 code: "INTERNAL_ERROR",
                 message: error.to_string(),
@@ -2293,6 +2629,7 @@ mod tests {
             results,
             false,
             true,
+            false,
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2485,6 +2822,33 @@ mod tests {
         assert!(!output.contains("/Users/alice/private.txt"));
         assert!(output.contains("[敏感信息已隐藏]"));
         assert!(output.contains("[路径已隐藏]"));
+    }
+
+    #[test]
+    fn accessibility_candidate_matching_uses_desktop_evidence() {
+        let node = crate::platform::AccessibilityNode {
+            node_id: "TargetSaveButton".to_string(),
+            role: Some("ControlType.Button".to_string()),
+            label: Some("SAVE button inside Settings dialog".to_string()),
+            bounds: ale_core::model_scheduler::BoundingBox {
+                x: 0.6,
+                y: 0.7,
+                width: 0.1,
+                height: 0.08,
+            },
+        };
+        let target = ale_core::model_scheduler::TargetRef {
+            node_id: None,
+            role: Some("button".to_string()),
+            label: Some("SAVE button".to_string()),
+            visual_description: None,
+        };
+        assert!(accessibility_node_matches(&node, &target));
+        let unrelated = ale_core::model_scheduler::TargetRef {
+            label: Some("CANCEL".to_string()),
+            ..target
+        };
+        assert!(!accessibility_node_matches(&node, &unrelated));
     }
 
     #[test]
@@ -2768,6 +3132,7 @@ mod tests {
             "slow".to_string(),
             plan(),
             Arc::new(ControlledSlowPlatform),
+            None,
             sender,
         );
         let result = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
@@ -2784,6 +3149,41 @@ mod tests {
             finished.kind,
             RemoteExecutionEventKind::FinishedAfterTimeout
         ));
+        drop(request);
+    }
+
+    #[tokio::test]
+    async fn controlled_execution_rejects_a_stale_snapshot_before_input() {
+        let platform = Arc::new(MockPlatform {
+            executed: AtomicUsize::new(0),
+            capture_enabled: true,
+        });
+        let mut controlled = ActionPlan::new("controlled".to_string());
+        controlled.add_action(Action::ControlledTestClick {
+            x: 50.0,
+            y: 50.0,
+            window_title: "ALE MODEL RUNTIME CONTROLLED TEST".to_string(),
+            target_name: "SAVE button inside Settings dialog".to_string(),
+            snapshot_id: "stale-snapshot".to_string(),
+        });
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let request = start_remote_execution(
+            "stale".to_string(),
+            controlled,
+            platform.clone(),
+            None,
+            sender,
+        );
+        let result = receiver.recv().await.unwrap();
+        let RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(status)) =
+            result.kind
+        else {
+            panic!("expected stale snapshot status");
+        };
+        assert_eq!(status.state, ExecutionState::Failed);
+        assert_eq!(status.message, "SNAPSHOT_EXPIRED");
+        assert_eq!(status.actions_executed, 0);
+        assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
         drop(request);
     }
 }

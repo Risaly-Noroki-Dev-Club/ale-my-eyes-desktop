@@ -4,9 +4,10 @@ use ale_core::model_ipc::{
     MODEL_IPC_VERSION,
 };
 use ale_core::model_scheduler::{
-    CancelModelJob, JobPrivacy, ModelCapability, ModelJob, ModelRuntimeConfig,
-    RemoteEndpointConfig, RemotePlanningJob, RemotePlanningResult, RemoteProviderSet,
-    SchedulerHealth, SchedulerPriority, SpeechRecognitionJob, SpeechRecognitionResult,
+    CancelModelJob, GroundingJob, GroundingResult, JobPrivacy, LocalPlanningJob,
+    LocalPlanningResult, ModelCapability, ModelJob, ModelRuntimeConfig, RemoteEndpointConfig,
+    RemotePlanningJob, RemotePlanningResult, RemoteProviderSet, SchedulerHealth, SchedulerPriority,
+    SpeechRecognitionJob, SpeechRecognitionResult, StateVerificationJob, StateVerificationResult,
 };
 use base64::Engine;
 use rand::RngCore;
@@ -180,6 +181,79 @@ impl ModeldClient {
             .await
     }
 
+    pub async fn local_plan(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        question: String,
+        image: &[u8],
+        application_id: Option<String>,
+    ) -> Result<LocalPlanningResult, String> {
+        let payload = LocalPlanningJob {
+            question,
+            image_base64: base64::engine::general_purpose::STANDARD.encode(image),
+            application_id,
+        };
+        let job = ModelJob {
+            request_id: request_id.to_string(),
+            capability: ModelCapability::LocalPlanning,
+            priority: SchedulerPriority::InteractiveRequest,
+            deadline_unix_ms: unix_millis() + 90_000,
+            risk_ceiling: ale_core::actions::RiskLevel::Medium,
+            snapshot_id: Some(snapshot_id.to_string()),
+            privacy: JobPrivacy::default(),
+            payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
+        };
+        self.call_json_with_id(request_id, IpcRequestKind::Schedule, &job)
+            .await
+    }
+
+    pub async fn ground(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        grounding: GroundingJob,
+    ) -> Result<GroundingResult, String> {
+        let job = ModelJob {
+            request_id: request_id.to_string(),
+            capability: ModelCapability::ElementGrounding,
+            priority: SchedulerPriority::InteractiveRequest,
+            deadline_unix_ms: unix_millis() + 30_000,
+            risk_ceiling: ale_core::actions::RiskLevel::Medium,
+            snapshot_id: Some(snapshot_id.to_string()),
+            privacy: JobPrivacy::default(),
+            payload: serde_json::to_value(grounding).map_err(|error| error.to_string())?,
+        };
+        self.call_json_with_id(request_id, IpcRequestKind::Schedule, &job)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn verify(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        verification: StateVerificationJob,
+        image: &[u8],
+    ) -> Result<StateVerificationResult, String> {
+        let verification = StateVerificationJob {
+            image_base64: base64::engine::general_purpose::STANDARD.encode(image),
+            ..verification
+        };
+        let job = ModelJob {
+            request_id: request_id.to_string(),
+            capability: ModelCapability::StateVerification,
+            priority: SchedulerPriority::StateVerification,
+            deadline_unix_ms: unix_millis() + 30_000,
+            risk_ceiling: ale_core::actions::RiskLevel::Low,
+            snapshot_id: Some(snapshot_id.to_string()),
+            privacy: JobPrivacy::default(),
+            payload: serde_json::to_value(verification).map_err(|error| error.to_string())?,
+        };
+        self.call_json_with_id(request_id, IpcRequestKind::Schedule, &job)
+            .await
+    }
+
     pub async fn transcribe_wav(
         &self,
         request_id: &str,
@@ -237,6 +311,21 @@ impl ModeldClient {
 
     async fn configure_models(&self, config: &AppConfig) -> Result<(), String> {
         let models_dir = PathBuf::from(&config.models.models_dir);
+        let runtime_dir = models_dir.join(".runtime");
+        let gguf_dir = runtime_dir.join("gguf");
+        let qwen_dir = {
+            let large = gguf_dir.join(&config.model_scheduler.qwen_large_model);
+            if large.is_dir() {
+                large
+            } else {
+                gguf_dir.join(&config.model_scheduler.qwen_model)
+            }
+        };
+        let llama_name = if cfg!(windows) {
+            "llama-cli.exe"
+        } else {
+            "llama-cli"
+        };
         let runtime = ModelRuntimeConfig {
             models_dir: models_dir.to_string_lossy().into_owned(),
             sensevoice_model: models_dir
@@ -249,6 +338,60 @@ impl ModeldClient {
                 .join("tokens.txt")
                 .to_string_lossy()
                 .into_owned(),
+            llama_cli: Some(
+                runtime_dir
+                    .join("tools")
+                    .join("llama-b10472-vulkan")
+                    .join(llama_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            qwen_model: Some(
+                qwen_dir
+                    .join("model-q4_k_m.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            qwen_mmproj: Some(
+                qwen_dir
+                    .join("mmproj-model-f16.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            showui_model: Some(
+                gguf_dir
+                    .join(&config.model_scheduler.grounding_model)
+                    .join("model-q4_k_m.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            showui_mmproj: Some(
+                gguf_dir
+                    .join(&config.model_scheduler.grounding_model)
+                    .join("mmproj-model-f16.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            uitars_model: Some(
+                gguf_dir
+                    .join(&config.model_scheduler.grounding_fallback_model)
+                    .join("model-q4_k_m.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            uitars_mmproj: Some(
+                gguf_dir
+                    .join(&config.model_scheduler.grounding_fallback_model)
+                    .join("mmproj-model-f16.gguf")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            capability_manifest: Some(
+                runtime_dir
+                    .join("runtime-capabilities.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         };
         let _: serde_json::Value = self
             .call_json(IpcRequestKind::ConfigureModels, &runtime)
@@ -375,6 +518,50 @@ impl SupervisedModeldClient {
         result
     }
 
+    pub async fn local_plan(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        question: String,
+        image: &[u8],
+        application_id: Option<String>,
+    ) -> Result<LocalPlanningResult, String> {
+        let client = self.connection().await?;
+        let result = client
+            .local_plan(request_id, snapshot_id, question, image, application_id)
+            .await;
+        self.record_result(&client, result.is_ok()).await;
+        result
+    }
+
+    pub async fn ground(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        grounding: GroundingJob,
+    ) -> Result<GroundingResult, String> {
+        let client = self.connection().await?;
+        let result = client.ground(request_id, snapshot_id, grounding).await;
+        self.record_result(&client, result.is_ok()).await;
+        result
+    }
+
+    #[allow(dead_code)]
+    pub async fn verify(
+        &self,
+        request_id: &str,
+        snapshot_id: &str,
+        verification: StateVerificationJob,
+        image: &[u8],
+    ) -> Result<StateVerificationResult, String> {
+        let client = self.connection().await?;
+        let result = client
+            .verify(request_id, snapshot_id, verification, image)
+            .await;
+        self.record_result(&client, result.is_ok()).await;
+        result
+    }
+
     pub async fn transcribe_wav(
         &self,
         request_id: &str,
@@ -402,6 +589,24 @@ impl SupervisedModeldClient {
             state.restart_blocked = false;
             state.last_error = None;
         }
+    }
+
+    async fn terminate_current_process_for_acceptance(&self) -> Result<(), String> {
+        let client = self
+            .state
+            .lock()
+            .await
+            .client
+            .clone()
+            .ok_or_else(|| "模型调度器尚未启动".to_string())?;
+        let result = client
+            ._process
+            .child
+            .lock()
+            .map_err(|_| "模型调度器进程锁失败".to_string())?
+            .start_kill()
+            .map_err(|error| format!("无法终止模型调度器验收进程: {error}"));
+        result
     }
 
     async fn connection(&self) -> Result<ModeldClient, String> {
@@ -455,6 +660,82 @@ impl SupervisedModeldClient {
             record_process_failure(&mut state, "模型调度器连接已关闭".to_string());
         }
     }
+}
+
+pub async fn run_supervisor_acceptance(
+    models_dir: PathBuf,
+    report_path: PathBuf,
+) -> Result<(), String> {
+    let mut config = AppConfig::default();
+    config.models.models_dir = models_dir.to_string_lossy().into_owned();
+    let supervisor = SupervisedModeldClient::start(&config).await;
+    let initial_error = supervisor.initial_error().await;
+    let initial_health = supervisor.health().await;
+    let initial_ok = initial_health.as_ref().is_ok_and(|health| {
+        health
+            .available_capabilities
+            .contains(&ModelCapability::LocalPlanning)
+            && health
+                .available_capabilities
+                .contains(&ModelCapability::ElementGrounding)
+    });
+
+    let kill_error = if initial_ok {
+        supervisor
+            .terminate_current_process_for_acceptance()
+            .await
+            .err()
+    } else {
+        Some("initial modeld health check failed".to_string())
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut restart_errors = Vec::new();
+    let restarted_health = loop {
+        match supervisor.health().await {
+            Ok(health) => break Some(health),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                restart_errors.push(error);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => {
+                restart_errors.push(error);
+                break None;
+            }
+        }
+    };
+    let restarted_ok = restarted_health.as_ref().is_some_and(|health| {
+        health
+            .available_capabilities
+            .contains(&ModelCapability::LocalPlanning)
+            && health
+                .available_capabilities
+                .contains(&ModelCapability::ElementGrounding)
+    });
+    let passed = initial_ok && kill_error.is_none() && restarted_ok;
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "passed": passed,
+        "no_input_executed": true,
+        "desktop_binary_remained_alive": true,
+        "initial_error": initial_error,
+        "initial_health": initial_health.ok(),
+        "kill_error": kill_error,
+        "restart_errors": restart_errors,
+        "restarted_health": restarted_health,
+    });
+    if let Some(parent) = report_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    passed
+        .then_some(())
+        .ok_or_else(|| "桌面 modeld 监督器验收失败".to_string())
 }
 
 fn record_process_failure(state: &mut SupervisorState, error: String) {

@@ -23,6 +23,14 @@ pub enum RiskLevel {
 pub enum Action {
     /// 鼠标点击
     Click { x: f64, y: f64, button: MouseButton },
+    /// 仅用于显式启用的 Windows 受控测试窗口。
+    ControlledTestClick {
+        x: f64,
+        y: f64,
+        window_title: String,
+        target_name: String,
+        snapshot_id: String,
+    },
     /// 鼠标双击
     DoubleClick { x: f64, y: f64 },
     /// 鼠标移动
@@ -95,6 +103,7 @@ impl Action {
                 RiskLevel::Low
             }
             Action::Click { .. }
+            | Action::ControlledTestClick { .. }
             | Action::DoubleClick { .. }
             | Action::Type { .. }
             | Action::Key { .. }
@@ -110,6 +119,11 @@ impl Action {
             Action::Click { x, y, button } => {
                 format!("在坐标 ({}, {}) 处{:?}键点击", x, y, button)
             }
+            Action::ControlledTestClick {
+                window_title,
+                target_name,
+                ..
+            } => format!("在受控测试窗口 {window_title} 点击 {target_name}"),
             Action::DoubleClick { x, y } => {
                 format!("在坐标 ({}, {}) 处双击", x, y)
             }
@@ -206,6 +220,7 @@ impl ActionPlan {
         for action in &self.actions {
             match action {
                 Action::Click { x, y, .. }
+                | Action::ControlledTestClick { x, y, .. }
                 | Action::DoubleClick { x, y }
                 | Action::MouseMove { x, y }
                 | Action::Scroll { x, y, .. }
@@ -227,6 +242,13 @@ impl ActionPlan {
                     return Err(AleError::ConfigError(format!(
                         "单次等待最多允许 {MAX_WAIT_MS} 毫秒"
                     )));
+                }
+                Action::ControlledTestClick { snapshot_id, .. }
+                    if snapshot_id.is_empty() || snapshot_id.len() > 128 =>
+                {
+                    return Err(AleError::ConfigError(
+                        "受控测试动作必须绑定有效快照".to_string(),
+                    ));
                 }
                 _ => {}
             }

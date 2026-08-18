@@ -210,9 +210,9 @@ try {
         powershell = $PSVersionTable.PSVersion.ToString()
     }
     $inventory | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $ReportDir "system.json") -Encoding UTF8
-    $wx9100 = @($gpus | Where-Object { $_.name -match "WX\s*9100" })
-    if ($wx9100.Count -eq 0) {
-        Write-Warning "Win32_VideoController did not report a Radeon Pro WX 9100; Vulkan probing will decide the test."
+    $w6800 = @($gpus | Where-Object { $_.name -match "W\s*6800" })
+    if ($w6800.Count -eq 0) {
+        Write-Warning "Win32_VideoController did not report a Radeon PRO W6800; Vulkan probing will decide the test."
     }
 
     Write-Stage "2/6 - Downloading and verifying pinned test tools"
@@ -287,11 +287,15 @@ try {
         --manifest $ModelManifest
     if ($LASTEXITCODE -ne 0) { throw "GGUF conversion failed" }
     Write-Stage "6/6 - Running real Vulkan multimodal inference"
+    $GitCommit = (& git.exe -C $RepoRoot rev-parse HEAD 2>$null)
+    if ([string]::IsNullOrWhiteSpace($GitCommit)) { $GitCommit = "unknown" }
     & $Python (Join-Path $PSScriptRoot "runtime_acceptance.py") `
         --llama-cli $LlamaCli `
         --models-manifest $ModelManifest `
         --fixtures-dir $FixtureDir `
         --report-dir $ReportDir `
+        --capabilities-out (Join-Path $RuntimeRoot "runtime-capabilities.json") `
+        --git-commit $GitCommit `
         --timeout-seconds ($InferenceTimeoutMinutes * 60)
     $ExitCode = $LASTEXITCODE
 } catch {

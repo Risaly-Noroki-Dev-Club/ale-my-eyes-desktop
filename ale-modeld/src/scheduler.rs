@@ -1,12 +1,12 @@
 use ale_core::model_ipc::{
     IpcEnvelope, IpcReply, IpcReplyStatus, IpcRequestKind, MODEL_IPC_VERSION,
 };
-use ale_core::model_scheduler::{ModelCapability, RouteDecision, RouteTarget};
 use ale_core::model_scheduler::{
-    ModelJob, ModelRuntimeConfig, RemoteEndpointConfig, RemoteEndpointRole, RemotePlanningJob,
-    RemotePlanningResult, RemoteProviderSet, SchedulerHealth, SpeechRecognitionJob,
-    SpeechRecognitionResult,
+    GroundingJob, LocalPlanningJob, ModelJob, ModelRuntimeConfig, RemoteEndpointConfig,
+    RemoteEndpointRole, RemotePlanningJob, RemotePlanningResult, RemoteProviderSet,
+    SchedulerHealth, SpeechRecognitionJob, SpeechRecognitionResult, StateVerificationJob,
 };
+use ale_core::model_scheduler::{ModelCapability, RouteDecision, RouteTarget};
 use base64::Engine;
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,7 @@ pub struct ModelScheduler {
     models: Mutex<Option<ModelRuntimeConfig>>,
     primary_circuit: Mutex<CircuitState>,
     sensevoice: Arc<crate::sensevoice::SenseVoiceAdapter>,
+    llama: Arc<crate::llama::LlamaAdapter>,
 }
 
 impl ModelScheduler {
@@ -51,14 +52,18 @@ impl ModelScheduler {
                 {
                     available_capabilities.push(ModelCapability::RemotePlanning);
                 }
-                if self
+                let runtime = self
                     .models
                     .lock()
                     .expect("model config lock poisoned")
-                    .as_ref()
-                    .is_some_and(crate::sensevoice::SenseVoiceAdapter::available)
-                {
-                    available_capabilities.push(ModelCapability::SpeechRecognition);
+                    .clone();
+                if let Some(runtime) = runtime.as_ref() {
+                    if crate::sensevoice::SenseVoiceAdapter::available(runtime) {
+                        available_capabilities.push(ModelCapability::SpeechRecognition);
+                    }
+                    available_capabilities.extend(self.llama.capabilities(runtime));
+                    available_capabilities.sort_by_key(|capability| *capability as u8);
+                    available_capabilities.dedup();
                 }
                 ok_json(
                     request.request_id,
@@ -66,7 +71,7 @@ impl ModelScheduler {
                         service: "ale-modeld".to_string(),
                         protocol_version: MODEL_IPC_VERSION,
                         local_vlm_gpu_only: true,
-                        gpus: crate::gpu::probe(),
+                        gpus: crate::gpu::probe_with_runtime(runtime.as_ref()),
                         available_capabilities,
                     },
                 )
@@ -135,16 +140,140 @@ impl ModelScheduler {
         if job.capability == ModelCapability::SpeechRecognition {
             return self.speech_recognition(request_id, job).await;
         }
-        let decision = RouteDecision {
-            target: RouteTarget::UserDecisionRequired,
-            reasons: vec![ale_core::model_scheduler::EscalationReason::LocalModelUnavailable],
-            requires_confirmation: true,
-        };
-        let mut reply = ok_json(request_id, &decision);
-        if decision.target == RouteTarget::UserDecisionRequired {
-            reply.status = IpcReplyStatus::DecisionRequired as i32;
+        if matches!(
+            job.capability,
+            ModelCapability::StateSummary
+                | ModelCapability::LocalPlanning
+                | ModelCapability::ElementGrounding
+                | ModelCapability::StateVerification
+        ) && !self.local_capability_available(job.capability)
+        {
+            return decision_required(request_id);
         }
-        reply
+        if matches!(
+            job.capability,
+            ModelCapability::StateSummary | ModelCapability::LocalPlanning
+        ) {
+            return self.local_plan(request_id, job).await;
+        }
+        if job.capability == ModelCapability::ElementGrounding {
+            return self.ground(request_id, job).await;
+        }
+        if job.capability == ModelCapability::StateVerification {
+            return self.verify(request_id, job).await;
+        }
+        decision_required(request_id)
+    }
+
+    fn local_capability_available(&self, capability: ModelCapability) -> bool {
+        self.models
+            .lock()
+            .expect("model config lock poisoned")
+            .as_ref()
+            .is_some_and(|runtime| self.llama.capabilities(runtime).contains(&capability))
+    }
+
+    fn runtime(&self) -> Result<ModelRuntimeConfig, &'static str> {
+        self.models
+            .lock()
+            .expect("model config lock poisoned")
+            .clone()
+            .ok_or("local model runtime is not configured")
+    }
+
+    async fn local_plan(&self, request_id: String, job: ModelJob) -> IpcReply {
+        let snapshot_id = match job.snapshot_id.as_deref() {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => {
+                return error_reply(
+                    request_id,
+                    "SNAPSHOT_REQUIRED",
+                    "local planning requires a snapshot ID",
+                )
+            }
+        };
+        let risk_ceiling = job.risk_ceiling;
+        let planning: LocalPlanningJob = match serde_json::from_value(job.payload) {
+            Ok(value) => value,
+            Err(error) => return error_reply(request_id, "INVALID_LOCAL_JOB", &error.to_string()),
+        };
+        let runtime = match self.runtime() {
+            Ok(value) => value,
+            Err(error) => return error_reply(request_id, "LOCAL_MODEL_UNAVAILABLE", error),
+        };
+        match self
+            .llama
+            .local_plan(&runtime, &snapshot_id, planning)
+            .await
+        {
+            Ok(result) if result.plan.maximum_risk() <= risk_ceiling => {
+                ok_json(request_id, &result)
+            }
+            Ok(_) => error_reply(
+                request_id,
+                "RISK_CEILING_EXCEEDED",
+                "desktop risk recomputation exceeded the model job ceiling",
+            ),
+            Err(error) => error_reply(request_id, "LOCAL_PLANNING_FAILED", &error),
+        }
+    }
+
+    async fn ground(&self, request_id: String, job: ModelJob) -> IpcReply {
+        let snapshot_id = match job.snapshot_id.as_deref() {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => {
+                return error_reply(
+                    request_id,
+                    "SNAPSHOT_REQUIRED",
+                    "grounding requires a snapshot ID",
+                )
+            }
+        };
+        let grounding: GroundingJob = match serde_json::from_value(job.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return error_reply(request_id, "INVALID_GROUNDING_JOB", &error.to_string())
+            }
+        };
+        let runtime = match self.runtime() {
+            Ok(value) => value,
+            Err(error) => return error_reply(request_id, "LOCAL_MODEL_UNAVAILABLE", error),
+        };
+        match self.llama.ground(&runtime, &snapshot_id, grounding).await {
+            Ok(result) => ok_json(request_id, &result),
+            Err(error) => error_reply(request_id, "GROUNDING_FAILED", &error),
+        }
+    }
+
+    async fn verify(&self, request_id: String, job: ModelJob) -> IpcReply {
+        let snapshot_id = match job.snapshot_id.as_deref() {
+            Some(value) if !value.trim().is_empty() => value.to_string(),
+            _ => {
+                return error_reply(
+                    request_id,
+                    "SNAPSHOT_REQUIRED",
+                    "verification requires a snapshot ID",
+                )
+            }
+        };
+        let verification: StateVerificationJob = match serde_json::from_value(job.payload) {
+            Ok(value) => value,
+            Err(error) => {
+                return error_reply(request_id, "INVALID_VERIFICATION_JOB", &error.to_string())
+            }
+        };
+        let runtime = match self.runtime() {
+            Ok(value) => value,
+            Err(error) => return error_reply(request_id, "LOCAL_MODEL_UNAVAILABLE", error),
+        };
+        match self
+            .llama
+            .verify(&runtime, &snapshot_id, verification)
+            .await
+        {
+            Ok(result) => ok_json(request_id, &result),
+            Err(error) => error_reply(request_id, "VERIFICATION_FAILED", &error),
+        }
     }
 
     fn configure_remote(&self, request: IpcEnvelope) -> IpcReply {
@@ -499,6 +628,17 @@ pub(crate) fn error_reply(request_id: String, code: &str, message: &str) -> IpcR
         error_code: code.to_string(),
         error_message: message.to_string(),
     }
+}
+
+fn decision_required(request_id: String) -> IpcReply {
+    let decision = RouteDecision {
+        target: RouteTarget::UserDecisionRequired,
+        reasons: vec![ale_core::model_scheduler::EscalationReason::LocalModelUnavailable],
+        requires_confirmation: true,
+    };
+    let mut reply = ok_json(request_id, &decision);
+    reply.status = IpcReplyStatus::DecisionRequired as i32;
+    reply
 }
 
 #[cfg(test)]

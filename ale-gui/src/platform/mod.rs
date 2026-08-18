@@ -1,5 +1,6 @@
 use crate::screen_capture::ScreenCoordinateSpace;
 use ale_core::actions::ActionPlan;
+use ale_core::model_scheduler::BoundingBox;
 use ale_core::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,6 +10,20 @@ use std::time::Instant;
 pub struct CapturedImage {
     pub jpeg_data: Vec<u8>,
     pub coordinate_space: ScreenCoordinateSpace,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccessibilityNode {
+    pub node_id: String,
+    pub role: Option<String>,
+    pub label: Option<String>,
+    pub bounds: BoundingBox,
+}
+
+#[derive(Clone, Debug)]
+pub struct AccessibilitySnapshot {
+    pub application_id: Option<String>,
+    pub nodes: Vec<AccessibilityNode>,
 }
 
 /// 统一的自动化执行结果
@@ -62,6 +77,17 @@ pub struct PlatformCapabilities {
 pub trait PlatformService: Send + Sync {
     /// 捕获当前屏幕画面及其桌面坐标空间。
     fn capture_image(&self) -> Option<CapturedImage>;
+
+    fn capture_image_now(&self) -> Option<CapturedImage> {
+        self.capture_image()
+    }
+
+    fn capture_accessibility(
+        &self,
+        _coordinate_space: &ScreenCoordinateSpace,
+    ) -> Option<AccessibilitySnapshot> {
+        None
+    }
 
     /// 执行自动化操作计划
     fn execute_plan(&self, plan: &ActionPlan, approved: bool) -> Result<ExecutionResult>;

@@ -48,6 +48,14 @@ def point_in_bbox(point: tuple[float, float] | None, bbox: list[float]) -> bool:
     return bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
 
 
+def center_error(point: tuple[float, float] | None, bbox: list[float]) -> float | None:
+    if point is None:
+        return None
+    center_x = (bbox[0] + bbox[2]) / 2
+    center_y = (bbox[1] + bbox[3]) / 2
+    return round(((point[0] - center_x) ** 2 + (point[1] - center_y) ** 2) ** 0.5, 6)
+
+
 def normalize_coordinate(
     point: tuple[float, float] | None, image_size: list[int]
 ) -> tuple[float, float] | None:
@@ -147,7 +155,7 @@ def offload_evidence(result: dict[str, Any]) -> dict[str, Any]:
         return {"detected": int(offloaded) > 0, "offloaded_layers": int(offloaded), "total_layers": int(total)}
     lower = text.lower()
     return {
-        "detected": "vulkan" in lower and any(token in lower for token in ("amd", "radeon", "wx 9100")),
+        "detected": "vulkan" in lower and any(token in lower for token in ("amd", "radeon", "w6800")),
         "offloaded_layers": None,
         "total_layers": None,
     }
@@ -190,17 +198,99 @@ def model_command(
     ]
 
 
+def fixture_map(expected: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if "fixtures" in expected:
+        return expected["fixtures"]
+    image_size = expected["image_size"]
+    return {
+        name: {**value, "image_size": image_size}
+        for name, value in expected.items()
+        if name != "image_size"
+    }
+
+
+def acceptance_tests(fixtures: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    unique = sorted(name for name in fixtures if name.startswith("unique"))
+    ambiguous = sorted(name for name in fixtures if name.startswith("ambiguous"))
+    tests: list[dict[str, Any]] = [
+        {
+            "id": "QWEN-01",
+            "model": "qwen",
+            "fixture": unique[0],
+            "tokens": 320,
+            "prompt": (
+                "Analyze this deterministic desktop screenshot. Return only one JSON object with keys "
+                "goal, application_id, summary, and steps. steps must be an array with one object containing "
+                "operation, target, and expected_state. Plan how to activate the DOWNLOAD MODELS button. "
+                "This is a semantic plan: do not include coordinates, x, y, bounding boxes, or position."
+            ),
+            "validator": "semantic_plan",
+        }
+    ]
+    for name in unique:
+        tests.append(
+            {
+                "id": f"SHOWUI-{name.rsplit('_', 1)[-1]}",
+                "model": "showui",
+                "fixture": name,
+                "tokens": 48,
+                "prompt": (
+                    "Based on the screenshot of the page, I give a text description and you give its "
+                    "corresponding location. The coordinate represents a clickable location [x, y] for an "
+                    "element, which is a relative coordinate on the screenshot, scaled from 0 to 1. "
+                    "DOWNLOAD MODELS button"
+                ),
+                "validator": "coordinate",
+                "profile": "official_normalized",
+            }
+        )
+    profiles = {
+        "absolute_center": (
+            "You are a GUI grounding model. Locate the SAVE button inside the Settings dialog, not the "
+            "background SAVE button. The screenshot is exactly {width} by {height} pixels. Return only the "
+            "absolute pixel coordinate [x, y] at the center of the target button, strictly inside its visible bounds."
+        ),
+        "normalized_center": (
+            "Locate the SAVE button inside the Settings dialog, not the background SAVE button. Return only "
+            "its clickable center as [x, y], using relative coordinates from 0 to 1."
+        ),
+        "action_position": (
+            "Task: click the SAVE button inside the Settings dialog, not the background SAVE button. Return "
+            "only {{'action':'CLICK','value':null,'position':[x,y]}}. Position is the clickable center in relative "
+            "coordinates from 0 to 1."
+        ),
+    }
+    for profile, prompt in profiles.items():
+        for name in ambiguous:
+            width, height = fixtures[name]["image_size"]
+            tests.append(
+                {
+                    "id": f"UITARS-{profile}-{name.rsplit('_', 1)[-1]}",
+                    "model": "uitars",
+                    "fixture": name,
+                    "tokens": 128,
+                    "prompt": prompt.format(width=width, height=height),
+                    "validator": "coordinate",
+                    "profile": profile,
+                }
+            )
+    return tests
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--llama-cli", type=Path, required=True)
     parser.add_argument("--models-manifest", type=Path, required=True)
     parser.add_argument("--fixtures-dir", type=Path, required=True)
     parser.add_argument("--report-dir", type=Path, required=True)
+    parser.add_argument("--capabilities-out", type=Path)
+    parser.add_argument("--git-commit", default="unknown")
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     args = parser.parse_args()
     args.report_dir.mkdir(parents=True, exist_ok=True)
     manifest = json.loads(args.models_manifest.read_text(encoding="utf-8"))
     expected = json.loads((args.fixtures_dir / "expected.json").read_text(encoding="utf-8"))
+    fixtures = fixture_map(expected)
 
     device = run_process([str(args.llama_cli), "--list-devices"], 60)
     write_process_log(args.report_dir, "00-devices", device)
@@ -211,49 +301,11 @@ def main() -> int:
         and any(token in device_text for token in ("amd", "radeon", "wx 9100"))
     )
 
-    tests = [
-        {
-            "id": "QWEN-01",
-            "model": "qwen",
-            "fixture": "unique",
-            "tokens": 320,
-            "prompt": (
-                "Analyze this deterministic desktop screenshot. Return only one JSON object with keys "
-                "goal, application_id, summary, and steps. steps must be an array with one object containing "
-                "operation, target, and expected_state. Plan how to activate the DOWNLOAD MODELS button. "
-                "This is a semantic plan: do not include coordinates, x, y, bounding boxes, or position."
-            ),
-            "validator": "semantic_plan",
-        },
-        {
-            "id": "SHOWUI-01",
-            "model": "showui",
-            "fixture": "unique",
-            "tokens": 48,
-            "prompt": (
-                "Based on the screenshot of the page, I give a text description and you give its corresponding "
-                "location. The coordinate represents a clickable location [x, y] for an element, which is a "
-                "relative coordinate on the screenshot, scaled from 0 to 1. DOWNLOAD MODELS button"
-            ),
-            "validator": "coordinate",
-        },
-        {
-            "id": "UITARS-01",
-            "model": "uitars",
-            "fixture": "ambiguous",
-            "tokens": 96,
-            "prompt": (
-                "You are a GUI grounding model. Locate the SAVE button inside the Settings dialog, not the "
-                "background SAVE button. The screenshot is exactly 1280 by 720 pixels. Return only the absolute "
-                "pixel coordinate [x, y] at the center of the target button, strictly inside its visible bounds."
-            ),
-            "validator": "coordinate",
-        },
-    ]
+    tests = acceptance_tests(fixtures)
 
     results: list[dict[str, Any]] = []
     for test in tests:
-        fixture = expected[test["fixture"]]
+        fixture = fixtures[test["fixture"]]
         command = model_command(
             args.llama_cli,
             manifest["models"][test["model"]],
@@ -274,13 +326,16 @@ def main() -> int:
             raw_point = extract_coordinate(generated)
             if raw_point is None:
                 raw_point = extract_coordinate(combined)
-            point = normalize_coordinate(raw_point, expected["image_size"])
+            point = normalize_coordinate(raw_point, fixture["image_size"])
+            valid = point_in_bbox(point, fixture["bbox_normalized"])
             validation = {
                 "type": "coordinate",
-                "valid": point_in_bbox(point, fixture["bbox_normalized"]),
+                "valid": valid,
                 "point": list(point) if point else None,
                 "raw_point": list(raw_point) if raw_point else None,
                 "expected_bbox": fixture["bbox_normalized"],
+                "center_error": center_error(point, fixture["bbox_normalized"]),
+                "profile": test.get("profile"),
             }
         offload = offload_evidence(process)
         passed = (
@@ -289,6 +344,15 @@ def main() -> int:
             and validation["valid"]
             and offload["detected"]
         )
+        failure_reason = None
+        if process["timed_out"]:
+            failure_reason = "inference timed out"
+        elif process["exit_code"] != 0:
+            failure_reason = f"llama.cpp exited with {process['exit_code']}"
+        elif not offload["detected"]:
+            failure_reason = "GPU offload was not detected"
+        elif not validation["valid"]:
+            failure_reason = "model output did not satisfy the strict validator"
         results.append(
             {
                 "id": test["id"],
@@ -300,14 +364,52 @@ def main() -> int:
                 "timed_out": process["timed_out"],
                 "gpu_offload": offload,
                 "validation": validation,
+                "model_output": generated,
+                "failure_reason": failure_reason,
                 "log": f"{test['id'].lower()}.log",
             }
         )
+
+    qwen_ready = all(item["passed"] for item in results if item["model"] == "qwen")
+    showui_ready = all(item["passed"] for item in results if item["model"] == "showui")
+    uitars_results = [item for item in results if item["model"] == "uitars"]
+    profiles = sorted({item["validation"]["profile"] for item in uitars_results})
+    passing_profiles = [
+        profile
+        for profile in profiles
+        if all(
+            item["passed"]
+            for item in uitars_results
+            if item["validation"]["profile"] == profile
+        )
+    ]
+    selected_profile = min(
+        passing_profiles,
+        key=lambda profile: sum(
+            item["validation"]["center_error"] or 1.0
+            for item in uitars_results
+            if item["validation"]["profile"] == profile
+        ),
+        default=None,
+    )
+    uitars_ready = selected_profile is not None
+    capabilities = {
+        "schema_version": 1,
+        "git_commit": args.git_commit,
+        "llama_build": manifest["llama_build"],
+        "amd_vulkan_device_detected": amd_vulkan,
+        "models": {
+            "qwen": {"ready": qwen_ready},
+            "showui": {"ready": showui_ready},
+            "uitars": {"ready": uitars_ready, "selected_profile": selected_profile},
+        },
+    }
 
     report = {
         "schema_version": 1,
         "backend": "llama.cpp-vulkan",
         "llama_build": manifest["llama_build"],
+        "git_commit": args.git_commit,
         "amd_vulkan_device_detected": amd_vulkan,
         "device_probe_exit_code": device["exit_code"],
         "models": {
@@ -320,13 +422,17 @@ def main() -> int:
             for key, value in manifest["models"].items()
         },
         "tests": results,
-        "passed": amd_vulkan and all(result["passed"] for result in results),
+        "capabilities": capabilities["models"],
+        "passed": amd_vulkan and qwen_ready and showui_ready and uitars_ready,
         "notes": [
             "The 30-second field is an SLA observation; cold model loading is included in this first-pass probe.",
             "No mouse or keyboard action is executed by this acceptance tool.",
         ],
     }
     (args.report_dir / "summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if args.capabilities_out:
+        args.capabilities_out.parent.mkdir(parents=True, exist_ok=True)
+        args.capabilities_out.write_text(json.dumps(capabilities, indent=2), encoding="utf-8")
     lines = [
         "Ale, My Eyes! Windows AMD model runtime acceptance",
         f"Overall: {'PASS' if report['passed'] else 'FAIL'}",

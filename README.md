@@ -16,9 +16,18 @@ On Windows, start the pinned high-memory model downloader with:
 scripts\download-models.bat
 ```
 
-Running without arguments, including by double-clicking the script, asks only whether to use unattended mode. It otherwise downloads all pinned models to the repository `models` directory with 8 concurrent Hugging Face workers. Use `sensevoice`, `qwen`, `showui`, or `uitars` instead of `all` for scripted single-model downloads. `--models-dir D:\AleModels` selects another drive and `--workers 16` changes the concurrent Hugging Face file count. The normal mode retries every minute for up to 24 hours; `--retry-hours 48` changes that window. Unattended mode accepts the displayed licenses, issues no further prompts, and retries indefinitely until every model completes or the process is manually stopped. Interrupted SenseVoice archives and Hugging Face shards resume from their partial data, and a model is marked complete only after the pinned snapshot finishes. The complete set requires about 63 GB of downloads and at least 70 GB of free space. Qwen, ShowUI, and UI-TARS remain inactive until their GPU runtimes are integrated; downloading them does not bypass that capability gate.
+Running without arguments, including by double-clicking the script, asks only whether to use unattended mode. It otherwise downloads all pinned models to the repository `models` directory with 8 concurrent Hugging Face workers. Use `sensevoice`, `qwen`, `showui`, or `uitars` instead of `all` for scripted single-model downloads. `--models-dir D:\AleModels` selects another drive and `--workers 16` changes the concurrent Hugging Face file count. The normal mode retries every minute for up to 24 hours; `--retry-hours 48` changes that window. Unattended mode accepts the displayed licenses, issues no further prompts, and retries indefinitely until every model completes or the process is manually stopped. Interrupted SenseVoice archives and Hugging Face shards resume from their partial data, and a model is marked complete only after the pinned snapshot finishes. The complete set requires about 63 GB of downloads and at least 70 GB of free space. Downloaded VLM files remain inactive until the pinned Vulkan calibration publishes passing capability evidence; file presence alone never bypasses that gate.
 
-For the Radeon Pro WX 9100 real-model bring-up, use `scripts\model-runtime\run-windows-amd.bat` after the three VLM snapshots finish downloading. The pinned Vulkan test converts them to Q4_K_M locally, checks GPU offload and golden coordinate boxes, and creates a redacted portable acceptance report under `target\model-runtime-reports` without performing mouse or keyboard actions.
+For the Radeon PRO W6800 real-machine bring-up, run the stages below in order. The pinned Vulkan test converts the existing snapshots to Q4_K_M locally, checks strict coordinate boxes, and creates redacted reports under `target\model-runtime-reports`. The modeld stage uses native MSVC binaries and performs no mouse or keyboard input.
+
+```bat
+scripts\model-runtime\setup-windows-test.bat
+scripts\model-runtime\run-windows-amd.bat
+scripts\model-runtime\run-windows-modeld.bat
+scripts\model-runtime\run-controlled-window-test.bat
+```
+
+The controlled-window command is dry-run by default. Only after its report passes may a tester run `powershell -ExecutionPolicy Bypass -File scripts\model-runtime\run-controlled-window-test.ps1 -Execute`; that mode requires typing `YES` and can click only the dedicated WinForms fixture. This does not replace the desktop product-chain test through Android protocol v3.
 
 ## Development
 

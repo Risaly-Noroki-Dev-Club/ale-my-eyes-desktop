@@ -29,6 +29,9 @@ sherpa-rs = { version = "0.6.8", default-features = false, features = ["download
 default = ["sensevoice"]
 sensevoice = ["dep:sherpa-rs"]
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "ale-modeld"
 path = "src/main.rs"

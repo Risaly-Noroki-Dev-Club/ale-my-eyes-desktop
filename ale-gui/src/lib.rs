@@ -9,6 +9,14 @@ pub mod screen_capture;
 pub mod automation;
 
 mod modeld;
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub async fn run_modeld_supervisor_acceptance(
+    models_dir: std::path::PathBuf,
+    report_path: std::path::PathBuf,
+) -> Result<(), String> {
+    modeld::run_supervisor_acceptance(models_dir, report_path).await
+}
 mod platform;
 mod remote_crypto;
 
