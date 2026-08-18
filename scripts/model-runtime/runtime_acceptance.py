@@ -48,6 +48,20 @@ def point_in_bbox(point: tuple[float, float] | None, bbox: list[float]) -> bool:
     return bbox[0] <= x <= bbox[2] and bbox[1] <= y <= bbox[3]
 
 
+def normalize_coordinate(
+    point: tuple[float, float] | None, image_size: list[int]
+) -> tuple[float, float] | None:
+    if point is None:
+        return None
+    x, y = point
+    if 0 <= x <= 1 and 0 <= y <= 1:
+        return point
+    width, height = image_size
+    if width <= 0 or height <= 0 or not (0 <= x < width and 0 <= y < height):
+        return None
+    return x / width, y / height
+
+
 def contains_coordinate_fields(value: Any) -> bool:
     if isinstance(value, dict):
         forbidden = {"x", "y", "position", "bbox", "bounds", "click_x", "click_y"}
@@ -170,6 +184,7 @@ def model_command(
         "42",
         "--image-max-tokens",
         "1024",
+        "--verbose",
         "--no-display-prompt",
         "--single-turn",
     ]
@@ -229,8 +244,8 @@ def main() -> int:
             "tokens": 96,
             "prompt": (
                 "You are a GUI grounding model. Locate the SAVE button inside the Settings dialog, not the "
-                "background SAVE button. Return only its normalized clickable point as [x, y], with both values "
-                "between 0 and 1."
+                "background SAVE button. The screenshot is exactly 1280 by 720 pixels. Return only the absolute "
+                "pixel coordinate [x, y] at the center of the target button, strictly inside its visible bounds."
             ),
             "validator": "coordinate",
         },
@@ -256,13 +271,15 @@ def main() -> int:
             plan = semantic_plan(generated) or semantic_plan(combined)
             validation = {"type": "semantic_plan", "valid": plan is not None, "parsed": plan}
         else:
-            point = extract_coordinate(generated)
-            if point is None:
-                point = extract_coordinate(combined)
+            raw_point = extract_coordinate(generated)
+            if raw_point is None:
+                raw_point = extract_coordinate(combined)
+            point = normalize_coordinate(raw_point, expected["image_size"])
             validation = {
                 "type": "coordinate",
                 "valid": point_in_bbox(point, fixture["bbox_normalized"]),
                 "point": list(point) if point else None,
+                "raw_point": list(raw_point) if raw_point else None,
                 "expected_bbox": fixture["bbox_normalized"],
             }
         offload = offload_evidence(process)

@@ -22,6 +22,23 @@ class RuntimeAcceptanceTests(unittest.TestCase):
         self.assertTrue(RUNTIME.point_in_bbox((0.8, 0.7), [0.7, 0.6, 0.9, 0.8]))
         self.assertFalse(RUNTIME.point_in_bbox((0.2, 0.7), [0.7, 0.6, 0.9, 0.8]))
 
+    def test_pixel_coordinate_is_normalized_against_fixture_size(self):
+        self.assertEqual(
+            RUNTIME.normalize_coordinate((893, 549), [1280, 720]),
+            (893 / 1280, 549 / 720),
+        )
+        self.assertIsNone(RUNTIME.normalize_coordinate((1280, 549), [1280, 720]))
+
+    def test_model_command_enables_verbose_gpu_logs(self):
+        command = RUNTIME.model_command(
+            Path("llama-cli"),
+            {"model_path": "model.gguf", "mmproj_path": "mmproj.gguf"},
+            Path("fixture.png"),
+            "prompt",
+            1,
+        )
+        self.assertIn("--verbose", command)
+
     def test_semantic_plan_rejects_coordinates(self):
         valid = '{"goal":"download","steps":[{"operation":"click","target":"button","expected_state":"dialog"}]}'
         invalid = '{"goal":"download","steps":[{"operation":"click","target":{"bbox":[0.7,0.6,0.9,0.8]},"expected_state":"dialog"}]}'
@@ -42,6 +59,7 @@ class RuntimeAcceptanceTests(unittest.TestCase):
             report = root / "report"
             fixtures.mkdir()
             expected = {
+                "image_size": [1280, 720],
                 "unique": {
                     "file": "unique.png",
                     "bbox_normalized": [0.68, 0.77, 0.91, 0.89],
