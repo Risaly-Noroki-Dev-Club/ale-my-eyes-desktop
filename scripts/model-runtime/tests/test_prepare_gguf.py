@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).parents[1] / "prepare_gguf.py"
@@ -68,6 +69,39 @@ class PrepareGgufTests(unittest.TestCase):
             self.assertIsNotNone(PREPARE.completed_artifact(output, spec))
             model.write_bytes(b"other")
             self.assertIsNone(PREPARE.completed_artifact(output, spec))
+
+    def test_mmproj_conversion_uses_a_distinct_output_path(self):
+        spec = PREPARE.MODELS[0]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            output = root / "output"
+            commands: list[list[str]] = []
+
+            def fake_run(command, _log_path, _env):
+                commands.append(command)
+                if command[-1] == "Q4_K_M":
+                    Path(command[2]).write_bytes(b"quantized")
+                    return
+                destination = Path(command[command.index("--outfile") + 1])
+                destination.write_bytes(b"projector" if "--mmproj" in command else b"model")
+
+            with patch.object(PREPARE, "run_logged", side_effect=fake_run):
+                PREPARE.convert_model(
+                    Path("python"),
+                    Path("converter.py"),
+                    Path("quantize"),
+                    source,
+                    output,
+                    spec,
+                    "test-build",
+                )
+
+            language_output = Path(commands[0][commands[0].index("--outfile") + 1])
+            projector_output = Path(commands[1][commands[1].index("--outfile") + 1])
+            self.assertNotEqual(language_output, projector_output)
+            self.assertEqual(projector_output.name, "mmproj-model-f16.gguf")
 
 
 if __name__ == "__main__":

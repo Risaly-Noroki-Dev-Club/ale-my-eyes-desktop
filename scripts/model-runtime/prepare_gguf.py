@@ -86,6 +86,8 @@ def run_logged(command: list[str], log_path: Path, env: dict[str, str]) -> None:
         log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] COMMAND: {json.dumps(command)}\n")
         log.flush()
         completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, env=env, check=False)
+        log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] EXIT: {completed.returncode}\n")
+        log.flush()
     if completed.returncode != 0:
         raise RuntimeError(f"command failed with exit code {completed.returncode}; see {log_path}")
 
@@ -154,7 +156,7 @@ def convert_model(
             str(converter),
             str(source),
             "--outfile",
-            str(f16),
+            str(mmproj),
             "--outtype",
             "f16",
             "--mmproj",
