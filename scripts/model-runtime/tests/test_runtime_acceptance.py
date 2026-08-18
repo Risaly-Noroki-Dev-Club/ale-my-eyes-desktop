@@ -18,6 +18,15 @@ class RuntimeAcceptanceTests(unittest.TestCase):
     def test_coordinate_uses_last_normalized_pair(self):
         self.assertEqual(RUNTIME.extract_coordinate("noise [12, 9] answer [0.8, 0.7]"), (0.8, 0.7))
 
+    def test_coordinate_accepts_parentheses_from_uitars_stdout(self):
+        stdout = "(820,515)\n"
+        verbose_stderr = "llama_context: preserved_tokens = [151657,151658]"
+        self.assertEqual(RUNTIME.extract_coordinate(stdout), (820.0, 515.0))
+        self.assertEqual(
+            RUNTIME.extract_coordinate(stdout) or RUNTIME.extract_coordinate(verbose_stderr),
+            (820.0, 515.0),
+        )
+
     def test_point_must_be_inside_bbox(self):
         self.assertTrue(RUNTIME.point_in_bbox((0.8, 0.7), [0.7, 0.6, 0.9, 0.8]))
         self.assertFalse(RUNTIME.point_in_bbox((0.2, 0.7), [0.7, 0.6, 0.9, 0.8]))
