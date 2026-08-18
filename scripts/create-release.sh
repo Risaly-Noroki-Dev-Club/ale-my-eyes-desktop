@@ -12,7 +12,7 @@ rm -rf "$release_dir"
 mkdir -p "$source_dir"
 
 cp Cargo.toml Cargo.lock flake.nix flake.lock README.md LICENSE AGENTS.md "$source_dir/"
-cp -R ale-core ale-cli ale-gui ale-modeld scripts vendor assets docs "$source_dir/"
+cp -R ale-core ale-cli ale-gui ale-modeld scripts vendor assets "$source_dir/"
 
 cat > "$source_dir/BUILD.md" <<'EOF'
 # Build
@@ -45,10 +45,5 @@ cat > "$release_dir/ale-my-eyes-quickstart/QUICKSTART.md" <<'EOF'
 The application creates its configuration in the current user's standard configuration directory. Do not create or edit a `config/config.json` beside the executable.
 EOF
 tar -C "$release_dir" -czf "$release_dir/ale-my-eyes-quickstart.tar.gz" ale-my-eyes-quickstart
-
-mkdir -p "$release_dir/ale-my-eyes-docs"
-cp README.md LICENSE "$release_dir/ale-my-eyes-docs/"
-cp -R docs "$release_dir/ale-my-eyes-docs/"
-tar -C "$release_dir" -czf "$release_dir/ale-my-eyes-docs.tar.gz" ale-my-eyes-docs
 
 printf 'Release archives created in %s\n' "$release_dir"

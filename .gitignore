@@ -31,10 +31,14 @@ Thumbs.db
 ale-gui/android/build/
 
 # Models
+/models/
 models/downloaded/
 *.bin
 *.onnx
 *.gguf
+
+# Local documentation
+/docs/
 
 # Config
 config/config.json
