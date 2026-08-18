@@ -30,6 +30,19 @@ class PrepareGgufTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 PREPARE.validate_source(Path(directory), spec)
 
+    def test_source_accepts_pytorch_bin_weights(self):
+        spec = PREPARE.MODELS[1]
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / spec.directory
+            model.mkdir()
+            (model / "config.json").write_text(
+                json.dumps({"architectures": [spec.architectures[0]]}), encoding="utf-8"
+            )
+            (model / ".ale-revision").write_text(spec.revision, encoding="ascii")
+            (model / "pytorch_model.bin").write_bytes(b"weights")
+            self.assertEqual(PREPARE.validate_source(Path(directory), spec), model)
+            self.assertEqual(PREPARE.source_size(model), len(b"weights"))
+
     def test_completed_artifact_rejects_hash_mismatch(self):
         spec = PREPARE.MODELS[1]
         with tempfile.TemporaryDirectory() as directory:

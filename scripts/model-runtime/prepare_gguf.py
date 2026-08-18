@@ -56,8 +56,12 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def weight_files(path: Path) -> tuple[Path, ...]:
+    return tuple(path.glob("*.safetensors")) + tuple(path.glob("pytorch_model*.bin"))
+
+
 def source_size(path: Path) -> int:
-    return sum(item.stat().st_size for item in path.glob("*.safetensors"))
+    return sum(item.stat().st_size for item in weight_files(path))
 
 
 def validate_source(root: Path, spec: ModelSpec) -> Path:
@@ -73,7 +77,7 @@ def validate_source(root: Path, spec: ModelSpec) -> Path:
     if not marker.is_file() or marker.read_text(encoding="ascii").strip() != spec.revision:
         raise RuntimeError(f"pinned revision marker missing or incorrect for {spec.directory}")
     if source_size(model) == 0:
-        raise RuntimeError(f"no safetensors weights found in {model}")
+        raise RuntimeError(f"no supported Hugging Face weights found in {model}")
     return model
 
 
