@@ -4,6 +4,14 @@ param([string]$ModelsDir)
 $ErrorActionPreference = "Stop"
 if ($env:OS -ne "Windows_NT") { throw "This acceptance tool requires Windows." }
 
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+if ((Test-Path -LiteralPath $cargoBin) -and $null -eq (Get-Command rustc.exe -ErrorAction SilentlyContinue)) {
+    $env:Path = "$cargoBin;$env:Path"
+}
+if ($null -eq (Get-Command rustc.exe -ErrorAction SilentlyContinue)) {
+    throw "Rust is unavailable. Run scripts\model-runtime\setup-windows-test.bat first."
+}
+
 function Import-VsEnvironment {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe is missing. Run setup-windows-test.bat first." }

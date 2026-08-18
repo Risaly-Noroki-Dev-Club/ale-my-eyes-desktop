@@ -39,6 +39,11 @@ if ($env:OS -ne "Windows_NT") {
     throw "This setup tool must run on Windows."
 }
 
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+if ((Test-Path -LiteralPath $cargoBin) -and -not (Test-Command "rustup.exe")) {
+    $env:Path = "$cargoBin;$env:Path"
+}
+
 $missing = New-Object System.Collections.Generic.List[string]
 if (-not (Test-Command "rustup.exe")) { $missing.Add("Rust stable MSVC") }
 if (-not (Test-Command "cargo.exe")) { $missing.Add("Cargo") }
@@ -71,9 +76,14 @@ if ($missing.Count -gt 0) {
     }
     if (-not (Test-Command "rustup.exe")) {
         & winget.exe install --id Rustlang.Rustup --exact --accept-package-agreements --accept-source-agreements --silent
-        if ($LASTEXITCODE -ne 0) { throw "rustup installation failed: $LASTEXITCODE" }
-        $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+        $wingetExitCode = $LASTEXITCODE
         if (Test-Path -LiteralPath $cargoBin) { $env:Path = "$cargoBin;$env:Path" }
+        if (-not (Test-Command "rustup.exe")) {
+            throw "rustup installation failed: $wingetExitCode"
+        }
+        if ($wingetExitCode -ne 0) {
+            Write-Host "winget reported no Rustup upgrade; using the existing installation." -ForegroundColor DarkGray
+        }
     }
 }
 
