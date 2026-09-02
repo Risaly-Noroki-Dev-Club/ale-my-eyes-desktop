@@ -12,6 +12,30 @@ if ($null -eq (Get-Command rustc.exe -ErrorAction SilentlyContinue)) {
     throw "Rust is unavailable. Run scripts\model-runtime\setup-windows-test.bat first."
 }
 
+function Find-LibclangDirectory {
+    $candidates = @(
+        $env:LIBCLANG_PATH,
+        (Join-Path ${env:ProgramFiles} "LLVM\bin"),
+        (Join-Path ${env:ProgramFiles(x86)} "LLVM\bin")
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $candidate = Split-Path -Parent $candidate
+        }
+        if ((Test-Path -LiteralPath (Join-Path $candidate "libclang.dll")) -or
+            (Test-Path -LiteralPath (Join-Path $candidate "clang.dll"))) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+$libclangPath = Find-LibclangDirectory
+if ([string]::IsNullOrWhiteSpace($libclangPath)) {
+    throw "LLVM libclang is unavailable. Run scripts\model-runtime\setup-windows-test.bat first."
+}
+$env:LIBCLANG_PATH = $libclangPath
+
 function Import-VsEnvironment {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
     if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe is missing. Run setup-windows-test.bat first." }

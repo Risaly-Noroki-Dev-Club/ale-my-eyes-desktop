@@ -25,6 +25,24 @@ function Test-WindowsSdk {
         Select-Object -First 1)
 }
 
+function Find-LibclangDirectory {
+    $candidates = @(
+        $env:LIBCLANG_PATH,
+        (Join-Path ${env:ProgramFiles} "LLVM\bin"),
+        (Join-Path ${env:ProgramFiles(x86)} "LLVM\bin")
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $candidate = Split-Path -Parent $candidate
+        }
+        if ((Test-Path -LiteralPath (Join-Path $candidate "libclang.dll")) -or
+            (Test-Path -LiteralPath (Join-Path $candidate "clang.dll"))) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
 function Import-VsEnvironment([string]$Installation) {
     $vsDevCmd = Join-Path $Installation "Common7\Tools\VsDevCmd.bat"
     if (-not (Test-Path -LiteralPath $vsDevCmd)) { throw "VsDevCmd.bat is missing: $vsDevCmd" }
@@ -52,8 +70,10 @@ $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer
 $installation = Get-VsInstallation $vswhere
 $hasCpp = -not [string]::IsNullOrWhiteSpace($installation)
 $hasSdk = Test-WindowsSdk
+$libclangPath = Find-LibclangDirectory
 if (-not $hasCpp) { $missing.Add("Visual Studio 2022 C++ Build Tools") }
 if (-not $hasSdk) { $missing.Add("Windows 10/11 SDK") }
+if ([string]::IsNullOrWhiteSpace($libclangPath)) { $missing.Add("LLVM libclang") }
 
 if ($missing.Count -gt 0 -and -not $Install) {
     Write-Host "Missing Windows build prerequisites:" -ForegroundColor Yellow
@@ -85,6 +105,17 @@ if ($missing.Count -gt 0) {
             Write-Host "winget reported no Rustup upgrade; using the existing installation." -ForegroundColor DarkGray
         }
     }
+    if ([string]::IsNullOrWhiteSpace($libclangPath)) {
+        & winget.exe install --id LLVM.LLVM --exact --accept-package-agreements --accept-source-agreements --silent
+        $wingetExitCode = $LASTEXITCODE
+        $libclangPath = Find-LibclangDirectory
+        if ([string]::IsNullOrWhiteSpace($libclangPath)) {
+            throw "LLVM libclang installation failed: $wingetExitCode"
+        }
+        if ($wingetExitCode -ne 0) {
+            Write-Host "winget reported no LLVM upgrade; using the existing libclang installation." -ForegroundColor DarkGray
+        }
+    }
 }
 
 $installation = Get-VsInstallation $vswhere
@@ -100,10 +131,17 @@ if ($LASTEXITCODE -ne 0) { throw "Rust MSVC toolchain installation failed: $LAST
 & rustup.exe default stable-x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { throw "Rust MSVC toolchain selection failed: $LASTEXITCODE" }
 
+$libclangPath = Find-LibclangDirectory
+if ([string]::IsNullOrWhiteSpace($libclangPath)) {
+    throw "LLVM libclang is unavailable. Install LLVM.LLVM and retry."
+}
+$env:LIBCLANG_PATH = $libclangPath
+
 $hostLine = (& rustc.exe -vV | Select-String '^host:').Line
 if ($hostLine -ne "host: x86_64-pc-windows-msvc") {
     throw "Unexpected Rust host after setup: $hostLine"
 }
 
 Write-Host "Windows MSVC test environment is ready." -ForegroundColor Green
+Write-Host "libclang: $env:LIBCLANG_PATH"
 Write-Host "Build command: cargo build --release --locked -p ale-cli -p ale-gui -p ale-modeld"

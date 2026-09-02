@@ -31,6 +31,8 @@ scripts\model-runtime\run-controlled-window-test.bat
 
 The controlled-window command is dry-run by default. Only after its report passes may a tester run `powershell -ExecutionPolicy Bypass -File scripts\model-runtime\run-controlled-window-test.ps1 -Execute`; that mode requires typing `YES` and can click only the dedicated WinForms fixture. This does not replace the desktop product-chain test through Android protocol v3.
 
+The Windows build setup also requires LLVM's `libclang.dll` because the SenseVoice sherpa binding uses bindgen. `setup-windows-test.bat` detects or installs the pinned build prerequisites, including LLVM, and exports `LIBCLANG_PATH` for the native build.
+
 ## Development
 
 ```bash
