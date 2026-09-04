@@ -1,0 +1,274 @@
+import { LineEdit, Button, CheckBox, ScrollView, Palette } from "std-widgets.slint";
+import { AppTheme, ActionButton, IconButton } from "widgets.slint";
+
+// 辅助组件（必须在被使用前定义）
+component SettingsGroup inherits Rectangle {
+    in property <string> title;
+    height: 24px;
+
+    Text {
+        text: root.title;
+        font-size: 15px;
+        font-weight: 700;
+        color: Palette.foreground;
+        y: 4px;
+    }
+}
+
+component SettingsField inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+
+    Text {
+        text: root.label;
+        font-size: 12px;
+        color: Palette.foreground.transparentize(0.45);
+    }
+
+    @children
+}
+
+export component SettingsPage inherits Rectangle {
+    in property <string> provider: "";
+    in property <string> api-key: "";
+    in property <string> api-url: "";
+    in property <string> model: "";
+    in property <string> max-tokens-str: "4000";
+    in property <bool> auto-speak: true;
+    in property <bool> show-api-key: false;
+    in property <bool> is-busy: false;
+    in property <string> config-path: "";
+    in property <string> remote-address: "";
+    in property <string> remote-code: "";
+    in property <string> remote-status: "";
+    in property <bool> remote-connected: false;
+    in property <string> remote-pairing-info: "";
+
+    callback provider-changed(string);
+    callback api-key-changed(string);
+    callback api-url-changed(string);
+    callback model-changed(string);
+    callback max-tokens-changed(string);
+    callback auto-speak-changed(bool);
+    callback toggle-api-key-visible();
+    callback save-settings();
+    callback test-connection();
+    callback remote-address-changed(string);
+    callback remote-code-changed(string);
+    callback connect-remote();
+    callback disconnect-remote();
+    callback close-settings();
+
+    background: Palette.background;
+
+    VerticalLayout {
+        padding: 0;
+        spacing: 0;
+
+        // 顶部导航栏
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+            spacing: 8px;
+            height: 48px;
+            alignment: center;
+
+            IconButton {
+                icon: "←";
+                tooltip: "返回";
+                clicked => { root.close-settings(); }
+            }
+
+            Text {
+                text: "设置";
+                font-size: 18px;
+                font-weight: 700;
+                color: Palette.foreground;
+                horizontal-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            // 占位保持居中
+            Rectangle { width: 28px; height: 28px; }
+        }
+
+        // 内容区
+        ScrollView {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 20px;
+
+                // ===== API 配置 =====
+                SettingsGroup { title: "API 配置"; }
+
+                SettingsField {
+                    label: "Provider";
+                    editor := LineEdit {
+                        text: root.provider;
+                        placeholder-text: "openai";
+                        edited(text) => { root.provider-changed(text); }
+                    }
+                }
+
+                SettingsField {
+                    label: "API Key";
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            text: root.api-key;
+                            placeholder-text: "sk-...";
+                            input-type: root.show-api-key ? InputType.text : InputType.password;
+                            edited(text) => { root.api-key-changed(text); }
+                            horizontal-stretch: 1;
+                        }
+                        ActionButton {
+                            text: root.show-api-key ? "隐藏" : "显示";
+                            compact: true;
+                            clicked => { root.toggle-api-key-visible(); }
+                        }
+                    }
+                }
+
+                SettingsField {
+                    label: "Base URL";
+                    LineEdit {
+                        text: root.api-url;
+                        placeholder-text: "https://api.openai.com/v1";
+                        edited(text) => { root.api-url-changed(text); }
+                    }
+                }
+
+                SettingsField {
+                    label: "Model";
+                    LineEdit {
+                        text: root.model;
+                        placeholder-text: "gpt-4o";
+                        edited(text) => { root.model-changed(text); }
+                    }
+                }
+
+                SettingsField {
+                    label: "Max Tokens";
+                    LineEdit {
+                        text: root.max-tokens-str;
+                        placeholder-text: "4000";
+                        edited(text) => { root.max-tokens-changed(text); }
+                    }
+                }
+
+                // ===== 界面设置 =====
+                SettingsGroup { title: "界面"; }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    CheckBox {
+                        checked: root.auto-speak;
+                        text: "自动语音播报";
+                        toggled => { root.auto-speak-changed(self.checked); }
+                    }
+                }
+
+                // ===== 局域网桌面端 =====
+                SettingsGroup { title: "局域网桌面端"; }
+
+                Text {
+                    text: root.remote-status;
+                    font-size: 13px;
+                    color: root.remote-connected ? #6b4c9a : Palette.foreground.transparentize(0.45);
+                    wrap: word-wrap;
+                }
+
+                if root.remote-pairing-info != "" : Text {
+                    text: root.remote-pairing-info;
+                    font-size: 11px;
+                    color: Palette.foreground.transparentize(0.5);
+                    wrap: word-wrap;
+                }
+
+                SettingsField {
+                    label: "桌面地址";
+                    LineEdit {
+                        text: root.remote-address;
+                        placeholder-text: "ws://192.168.1.10:37654";
+                        edited(text) => { root.remote-address-changed(text); }
+                    }
+                }
+
+                SettingsField {
+                    label: "配对码";
+                    LineEdit {
+                        text: root.remote-code;
+                        placeholder-text: "123456";
+                        edited(text) => { root.remote-code-changed(text); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    ActionButton {
+                        text: "连接桌面";
+                        enabled: !root.is-busy;
+                        clicked => { root.connect-remote(); }
+                    }
+                    ActionButton {
+                        text: "断开";
+                        enabled: root.remote-connected;
+                        clicked => { root.disconnect-remote(); }
+                    }
+                }
+
+                // ===== 关于 =====
+                SettingsGroup { title: "关于"; }
+
+                if root.config-path != "" : Text {
+                    text: root.config-path;
+                    font-size: 11px;
+                    color: Palette.foreground.transparentize(0.45);
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "Ale, My Eyes! v0.1.0";
+                    font-size: 12px;
+                    color: Palette.foreground.transparentize(0.4);
+                }
+            }
+        }
+
+        // 分隔线
+        Rectangle {
+            height: 1px;
+            background: Palette.border;
+        }
+
+        // 底部操作栏
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+            spacing: 8px;
+            height: 56px;
+
+            ActionButton {
+                text: "测试连接";
+                enabled: !root.is-busy;
+                clicked => { root.test-connection(); }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            ActionButton {
+                text: "保存";
+                primary: true;
+                enabled: !root.is-busy;
+                clicked => { root.save-settings(); }
+            }
+        }
+    }
+}

@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ale, My Eyes! — UI 设计参考</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1a1a1a;
+    --control-bg: #f5f5f5;
+    --alt-bg: #eeeeee;
+    --border: #d0d0d0;
+    --accent: #6b4c9a;
+    --accent-light: rgba(107, 76, 154, 0.08);
+    --danger: #dc3545;
+    --warning: #ffc107;
+    --success: #28a745;
+    --info: #17a2b8;
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --font-base: 14px;
+    --font-sm: 12px;
+    --font-xs: 10px;
+    --touch-min: 28px;
+    --pad: 8px;
+    --gap: 4px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    width: 100%; height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: var(--font-base);
+    background: #e5e5e5;
+    display: flex; align-items: center; justify-content: center;
+  }
+
+  /* 模拟桌面窗口 */
+  .window-frame {
+    width: 360px;
+    height: 280px;
+    background: var(--bg);
+    border-radius: var(--radius-md);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* 顶部标题栏（Slint Window 默认自带，但代码里没显式写，这里为了真实感加上） */
+  .title-bar {
+    height: 28px;
+    background: linear-gradient(to bottom, #f8f8f8, #ececec);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-size: var(--font-sm);
+    color: #444;
+    font-weight: 600;
+    user-select: none;
+  }
+
+  /* 主内容 */
+  .compact-screen {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: var(--pad);
+    gap: var(--gap);
+    overflow: hidden;
+  }
+
+  /* 状态行 */
+  .status-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: var(--gap);
+  }
+  .status-left {
+    display: flex; align-items: center; gap: 4px;
+  }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--border);
+    transition: background 0.2s;
+  }
+  .status-dot.speaking { background: var(--success); width: 12px; height: 12px; }
+  .status-dot.processing { background: var(--warning); }
+  .status-dot.error { background: var(--danger); }
+  .status-dot.ready { background: var(--success); }
+  .status-text {
+    font-size: var(--font-sm);
+    color: rgba(26,26,26,0.5);
+    line-height: var(--touch-min);
+  }
+  .icon-btn {
+    width: var(--touch-min); height: var(--touch-min);
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: var(--font-sm);
+    color: rgba(26,26,26,0.5);
+    transition: background 0.15s;
+    user-select: none;
+  }
+  .icon-btn:hover { background: var(--control-bg); }
+  .icon-btn.active { color: var(--accent); }
+
+  /* 转写区 */
+  .transcription {
+    height: 22px;
+    background: var(--alt-bg);
+    border-radius: var(--radius-sm);
+    display: flex; align-items: center;
+    padding: 0 12px;
+    font-size: var(--font-sm);
+    color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .transcription:empty { display: none; }
+
+  /* AI 回答区 */
+  .response-card {
+    flex: 1;
+    background: var(--control-bg);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .response-placeholder {
+    font-size: var(--font-sm);
+    color: rgba(26,26,26,0.45);
+    text-align: center;
+    margin: auto;
+  }
+  .response-content {
+    font-size: var(--font-sm);
+    color: var(--fg);
+    line-height: 1.5;
+    overflow-y: auto;
+    word-break: break-word;
+  }
+  .action-steps {
+    margin-top: 6px;
+    font-size: var(--font-xs);
+    color: var(--accent);
+    line-height: 1.4;
+  }
+
+  /* 确认对话框 */
+  .confirmation-bar {
+    display: flex; align-items: center; gap: 8px;
+    height: var(--touch-min);
+  }
+  .confirmation-bar:empty { display: none; }
+  .confirm-box {
+    flex: 1;
+    height: 100%;
+    background: var(--accent-light);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--accent);
+    display: flex; align-items: center;
+    padding: 0 12px;
+    font-size: var(--font-sm);
+    color: var(--fg);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .btn {
+    height: var(--touch-min);
+    padding: 0 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    font-size: var(--font-sm);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s;
+    color: var(--fg);
+  }
+  .btn:hover { background: var(--control-bg); }
+  .btn.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn.primary:hover { opacity: 0.9; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* 底部栏 */
+  .bottom-bar {
+    display: flex; align-items: center; gap: 8px;
+    height: var(--touch-min);
+  }
+  .capability-label {
+    font-size: var(--font-xs);
+    color: rgba(26,26,26,0.45);
+    white-space: nowrap;
+    user-select: none;
+  }
+  .input-wrap {
+    flex: 1;
+    height: 100%;
+    background: var(--control-bg);
+    border-radius: var(--radius-md);
+    border: 1px solid var(--border);
+    display: flex; align-items: center;
+    padding: 0 10px;
+  }
+  .input-wrap input {
+    flex: 1;
+    border: none; background: transparent;
+    font-size: var(--font-sm);
+    color: var(--fg);
+    outline: none;
+  }
+  .send-btn {
+    width: var(--touch-min); height: var(--touch-min);
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    font-size: var(--font-sm);
+    color: #fff;
+    user-select: none;
+    transition: opacity 0.15s;
+  }
+  .send-btn:hover { opacity: 0.9; }
+  .send-btn.disabled { background: var(--border); cursor: not-allowed; }
+
+  /* 设置弹窗 */
+  .modal-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal-overlay.open { display: flex; }
+  .settings-popup {
+    width: 340px;
+    height: 440px;
+    background: var(--bg);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .settings-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-title {
+    font-size: calc(var(--font-base) + 2px);
+    font-weight: 700;
+    color: var(--fg);
+  }
+  .settings-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .settings-group-title {
+    font-size: var(--font-base);
+    font-weight: 600;
+    color: var(--fg);
+    margin-top: 4px;
+  }
+  .settings-label {
+    font-size: var(--font-sm);
+    color: rgba(26,26,26,0.55);
+    margin-bottom: 2px;
+  }
+  .settings-input {
+    width: 100%;
+    height: 32px;
+    padding: 0 8px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg);
+    font-size: var(--font-sm);
+    color: var(--fg);
+    outline: none;
+  }
+  .settings-input:focus { border-color: var(--accent); }
+  .settings-row {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .settings-row .settings-input { flex: 1; }
+
+  .toggle-switch {
+    position: relative;
+    width: 40px; height: 22px;
+    background: var(--border);
+    border-radius: 11px;
+    cursor: pointer;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .toggle-switch::after {
+    content: "";
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 18px; height: 18px;
+    background: #fff;
+    border-radius: 50%;
+    transition: left 0.2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+  }
+  .toggle-switch.on { background: var(--accent); }
+  .toggle-switch.on::after { left: 20px; }
+
+  .settings-footer {
+    display: flex; gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+  .settings-footer .btn { flex: 1; }
+
+  .remote-status {
+    font-size: var(--font-sm);
+    color: rgba(26,26,26,0.55);
+    word-break: break-word;
+  }
+  .remote-status.connected { color: var(--accent); }
+  .remote-pairing-info {
+    font-size: var(--font-xs);
+    color: rgba(26,26,26,0.45);
+    word-break: break-word;
+  }
+  .config-path {
+    font-size: var(--font-xs);
+    color: rgba(26,26,26,0.45);
+    word-break: break-word;
+  }
+
+  /* 辅助 */
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="window-frame" id="appWindow">
+  <div class="title-bar">Ale, My Eyes!</div>
+
+  <div class="compact-screen">
+    <!-- 状态行 -->
+    <div class="status-row">
+      <div class="status-left">
+        <div class="status-dot" id="statusDot"></div>
+        <div class="status-text" id="statusText">初始化中...</div>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <div class="icon-btn" id="toggleListen" title="切换监听">||</div>
+        <div class="icon-btn" id="openSettings" title="设置">⚙</div>
+      </div>
+    </div>
+
+    <!-- 转写区 -->
+    <div class="transcription" id="transcription"></div>
+
+    <!-- AI 回答区 -->
+    <div class="response-card">
+      <div class="response-placeholder" id="responsePlaceholder">等待语音指令...</div>
+      <div class="response-content hidden" id="responseContent"></div>
+      <div class="action-steps hidden" id="actionSteps"></div>
+    </div>
+
+    <!-- 确认对话框 -->
+    <div class="confirmation-bar hidden" id="confirmationBar">
+      <div class="confirm-box" id="confirmText"></div>
+      <button class="btn primary" id="btnConfirm">确认</button>
+      <button class="btn" id="btnCancel">取消</button>
+    </div>
+
+    <!-- 底部栏 -->
+    <div class="bottom-bar">
+      <div class="capability-label" id="capabilityLabel">LLM Token: 0</div>
+      <div class="input-wrap">
+        <input type="text" id="textInput" placeholder="打字提问..." autocomplete="off">
+      </div>
+      <div class="send-btn disabled" id="sendBtn">📤</div>
+    </div>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div class="modal-overlay" id="settingsOverlay">
+    <div class="settings-popup">
+      <div class="settings-header">
+        <div class="settings-title">⚙ 设置</div>
+        <button class="btn" id="closeSettings" style="width:28px;height:28px;padding:0;">✕</button>
+      </div>
+      <div class="settings-body">
+        <div class="settings-group-title">云端 API</div>
+        <div class="settings-label">OpenAI-compatible Provider</div>
+        <input class="settings-input" id="provider" placeholder="openai">
+
+        <div class="settings-label">API Key</div>
+        <div class="settings-row">
+          <input class="settings-input" id="apiKey" placeholder="sk-..." type="password" style="flex:1;">
+          <button class="btn" id="toggleApiKey">显示</button>
+        </div>
+
+        <div class="settings-label">API URL</div>
+        <input class="settings-input" id="apiUrl" placeholder="https://api.openai.com/v1">
+
+        <div class="settings-label">Model</div>
+        <input class="settings-input" id="model" placeholder="gpt-4o">
+
+        <div class="settings-group-title">Token 预算</div>
+        <div class="settings-label">上下文对话最大 token 数</div>
+        <input class="settings-input" id="maxTokens" placeholder="4000" value="4000">
+
+        <div class="settings-group-title">界面</div>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <div class="toggle-switch on" id="autoSpeakSwitch"></div>
+          <span style="font-size:var(--font-sm);color:var(--fg);">自动语音播报</span>
+        </div>
+
+        <div class="settings-group-title">局域网桌面端</div>
+        <div class="remote-status" id="remoteStatus">未连接桌面端</div>
+        <div class="remote-pairing-info hidden" id="remotePairingInfo"></div>
+
+        <div class="settings-label">桌面地址</div>
+        <input class="settings-input" id="remoteAddress" placeholder="ws://192.168.1.10:37654 或 ale-my-eyes://pair?...">
+
+        <div class="settings-label">配对码</div>
+        <input class="settings-input" id="remoteCode" placeholder="123456">
+
+        <div class="settings-row">
+          <button class="btn primary" id="btnConnectRemote">连接桌面</button>
+          <button class="btn" id="btnDisconnectRemote" disabled>断开</button>
+        </div>
+
+        <div class="settings-group-title">配置文件</div>
+        <div class="config-path" id="configPath">~/.config/ale-my-eyes/config.json</div>
+      </div>
+      <div class="settings-footer">
+        <button class="btn primary" id="btnSave">保存</button>
+        <button class="btn" id="btnTest">测试连接</button>
+        <button class="btn" id="btnCancelSettings">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const state = {
+    engineReady: false,
+    isBusy: false,
+    listeningEnabled: true,
+    vadState: 'silent',
+    statusText: '初始化中...',
+    statusType: 'info',
+    transcription: '',
+    aiResponse: '',
+    actionSteps: '',
+    showConfirmation: false,
+    confirmationText: '',
+    sessionTokens: 0,
+    capabilityText: '',
+    showSettings: false,
+    showApiKey: false,
+    autoSpeak: true,
+    remoteConnected: false,
+    remoteStatus: '未连接桌面端',
+    remotePairingInfo: '',
+    configPath: '~/.config/ale-my-eyes/config.json',
+  };
+
+  const els = {
+    statusDot: document.getElementById('statusDot'),
+    statusText: document.getElementById('statusText'),
+    transcription: document.getElementById('transcription'),
+    responsePlaceholder: document.getElementById('responsePlaceholder'),
+    responseContent: document.getElementById('responseContent'),
+    actionSteps: document.getElementById('actionSteps'),
+    confirmationBar: document.getElementById('confirmationBar'),
+    confirmText: document.getElementById('confirmText'),
+    capabilityLabel: document.getElementById('capabilityLabel'),
+    textInput: document.getElementById('textInput'),
+    sendBtn: document.getElementById('sendBtn'),
+    toggleListen: document.getElementById('toggleListen'),
+    openSettings: document.getElementById('openSettings'),
+    settingsOverlay: document.getElementById('settingsOverlay'),
+    closeSettings: document.getElementById('closeSettings'),
+    btnConfirm: document.getElementById('btnConfirm'),
+    btnCancel: document.getElementById('btnCancel'),
+    btnSave: document.getElementById('btnSave'),
+    btnTest: document.getElementById('btnTest'),
+    btnCancelSettings: document.getElementById('btnCancelSettings'),
+    toggleApiKey: document.getElementById('toggleApiKey'),
+    apiKey: document.getElementById('apiKey'),
+    autoSpeakSwitch: document.getElementById('autoSpeakSwitch'),
+    remoteStatus: document.getElementById('remoteStatus'),
+    remotePairingInfo: document.getElementById('remotePairingInfo'),
+    btnConnectRemote: document.getElementById('btnConnectRemote'),
+    btnDisconnectRemote: document.getElementById('btnDisconnectRemote'),
+    configPath: document.getElementById('configPath'),
+  };
+
+  function updateUI() {
+    // Status dot
+    let dotCls = 'status-dot';
+    if (state.vadState === 'speaking') dotCls += ' speaking';
+    else if (state.isBusy) dotCls += ' processing';
+    else if (!state.engineReady) dotCls += ' error';
+    else dotCls += ' ready';
+    els.statusDot.className = dotCls;
+
+    // Status text
+    let st = state.statusText;
+    if (state.vadState === 'speaking') st = '说话中';
+    else if (state.vadState === 'speech_ended') st = '处理中';
+    else if (state.isBusy) st = state.statusText;
+    els.statusText.textContent = st;
+
+    // Transcription
+    els.transcription.textContent = state.transcription ? '🎙 ' + state.transcription : '';
+    els.transcription.style.display = state.transcription ? 'flex' : 'none';
+
+    // Response area
+    const hasContent = state.aiResponse || state.actionSteps;
+    els.responsePlaceholder.classList.toggle('hidden', hasContent);
+    els.responseContent.classList.toggle('hidden', !state.aiResponse);
+    els.actionSteps.classList.toggle('hidden', !state.actionSteps);
+    els.responseContent.textContent = state.aiResponse;
+    els.actionSteps.textContent = state.actionSteps;
+
+    // Confirmation
+    els.confirmationBar.classList.toggle('hidden', !state.showConfirmation);
+    els.confirmText.textContent = state.showConfirmation ? '⚠ ' + state.confirmationText : '';
+
+    // Bottom bar
+    const cap = state.capabilityText ? state.capabilityText + '  ' : '';
+    els.capabilityLabel.textContent = cap + 'LLM Token: ' + state.sessionTokens;
+
+    // Send button
+    els.sendBtn.classList.toggle('disabled', !state.engineReady || state.isBusy);
+
+    // Listen toggle
+    els.toggleListen.textContent = state.listeningEnabled ? '||' : '▶';
+
+    // Settings overlay
+    els.settingsOverlay.classList.toggle('open', state.showSettings);
+
+    // Settings fields
+    els.remoteStatus.textContent = state.remoteStatus;
+    els.remoteStatus.classList.toggle('connected', state.remoteConnected);
+    els.remotePairingInfo.classList.toggle('hidden', !state.remotePairingInfo);
+    els.remotePairingInfo.textContent = state.remotePairingInfo;
+    els.btnConnectRemote.disabled = state.isBusy;
+    els.btnDisconnectRemote.disabled = !state.remoteConnected;
+    els.configPath.textContent = state.configPath;
+  }
+
+  // Events
+  els.toggleListen.addEventListener('click', () => {
+    state.listeningEnabled = !state.listeningEnabled;
+    if (!state.listeningEnabled) {
+      state.statusText = '监听已暂停';
+      state.statusType = 'paused';
+    } else {
+      state.statusText = '监听中';
+      state.statusType = 'listening';
+      state.vadState = 'silent';
+    }
+    updateUI();
+  });
+
+  els.openSettings.addEventListener('click', () => {
+    state.showSettings = true;
+    updateUI();
+  });
+
+  function closeSettings() {
+    state.showSettings = false;
+    updateUI();
+  }
+  els.closeSettings.addEventListener('click', closeSettings);
+  els.btnCancelSettings.addEventListener('click', closeSettings);
+
+  els.btnSave.addEventListener('click', () => {
+    state.showSettings = false;
+    state.statusText = '就绪';
+    state.statusType = 'ready';
+    if (!state.engineReady) state.engineReady = true;
+    updateUI();
+  });
+
+  els.btnTest.addEventListener('click', () => {
+    const key = els.apiKey.value.trim();
+    if (!key) {
+      state.statusText = 'API key 未配置';
+      state.statusType = 'error';
+    } else {
+      state.statusText = '连接成功';
+      state.statusType = 'ready';
+      state.engineReady = true;
+    }
+    updateUI();
+  });
+
+  els.toggleApiKey.addEventListener('click', () => {
+    state.showApiKey = !state.showApiKey;
+    els.apiKey.type = state.showApiKey ? 'text' : 'password';
+    els.toggleApiKey.textContent = state.showApiKey ? '隐藏' : '显示';
+  });
+
+  els.autoSpeakSwitch.addEventListener('click', () => {
+    state.autoSpeak = !state.autoSpeak;
+    els.autoSpeakSwitch.classList.toggle('on', state.autoSpeak);
+  });
+
+  els.btnConnectRemote.addEventListener('click', () => {
+    state.isBusy = true;
+    setTimeout(() => {
+      state.isBusy = false;
+      state.remoteConnected = true;
+      state.remoteStatus = '已加密连接: Ale-Desktop-Mac';
+      state.remotePairingInfo = '配对链接: ws://192.168.1.10:37654\n\nws://192.168.1.10:37654?code=JVVDPV';
+      updateUI();
+    }, 600);
+    updateUI();
+  });
+
+  els.btnDisconnectRemote.addEventListener('click', () => {
+    state.remoteConnected = false;
+    state.remoteStatus = '未连接桌面端';
+    state.remotePairingInfo = '';
+    updateUI();
+  });
+
+  els.btnConfirm.addEventListener('click', () => {
+    state.showConfirmation = false;
+    state.statusText = '执行完成: 3 步';
+    state.statusType = 'ready';
+    updateUI();
+  });
+
+  els.btnCancel.addEventListener('click', () => {
+    state.showConfirmation = false;
+    state.confirmationText = '';
+    updateUI();
+  });
+
+  function submitText() {
+    const text = els.textInput.value.trim();
+    if (!text || text.length > 2000) return;
+    if (!state.engineReady || state.isBusy) return;
+
+    state.transcription = text;
+    state.isBusy = true;
+    state.statusText = '分析中...';
+    state.statusType = 'processing';
+    state.aiResponse = '';
+    state.actionSteps = '';
+    els.textInput.value = '';
+    updateUI();
+
+    setTimeout(() => {
+      state.isBusy = false;
+      state.statusText = '就绪';
+      state.statusType = 'ready';
+      state.aiResponse = '这是一个模拟的 AI 回复。在实际应用中，这里会显示云端大模型的回答内容。';
+      state.actionSteps = '';
+      state.sessionTokens += 245;
+      updateUI();
+    }, 1200);
+  }
+
+  els.sendBtn.addEventListener('click', submitText);
+  els.textInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submitText();
+  });
+
+  // Simulate engine ready after 1s
+  setTimeout(() => {
+    state.engineReady = true;
+    state.statusText = '就绪';
+    state.statusType = 'ready';
+    state.capabilityText = '麦克风 + 视觉 + 自动化';
+    updateUI();
+  }, 800);
+
+  updateUI();
+})();
+</script>
+</body>
+</html>

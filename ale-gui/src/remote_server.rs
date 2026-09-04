@@ -2302,6 +2302,47 @@ fn render_qr(uri: &str) -> Result<String, String> {
     Ok(code.render::<unicode::Dense1x2>().build())
 }
 
+/// Render a QR code as an RGBA image suitable for Slint.
+/// `dark_mode`: true for white modules on black background, false for black on white.
+pub fn render_qr_image(uri: &str, dark_mode: bool) -> Result<image::RgbaImage, String> {
+    use qrcode::Color;
+
+    let code = QrCode::new(uri.as_bytes()).map_err(|error| error.to_string())?;
+    let module_size = 6;
+    let quiet_zone = 4;
+    let modules = code.width() as u32;
+    let size = (modules + quiet_zone * 2) * module_size;
+
+    let module_rgba = if dark_mode {
+        image::Rgba([255u8, 255u8, 255u8, 255u8])
+    } else {
+        image::Rgba([0u8, 0u8, 0u8, 255u8])
+    };
+    let bg_rgba = if dark_mode {
+        image::Rgba([0u8, 0u8, 0u8, 255u8])
+    } else {
+        image::Rgba([255u8, 255u8, 255u8, 255u8])
+    };
+
+    let mut img = image::RgbaImage::from_pixel(size, size, bg_rgba);
+
+    for y in 0..modules {
+        for x in 0..modules {
+            if code[(x as usize, y as usize)] == Color::Dark {
+                let px = (x + quiet_zone) * module_size;
+                let py = (y + quiet_zone) * module_size;
+                for dy in 0..module_size {
+                    for dx in 0..module_size {
+                        img.put_pixel(px + dx, py + dy, module_rgba);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(img)
+}
+
 struct MdnsRegistration {
     daemon: mdns_sd::ServiceDaemon,
     fullname: String,

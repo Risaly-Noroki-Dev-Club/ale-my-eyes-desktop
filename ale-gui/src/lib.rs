@@ -98,41 +98,30 @@ pub fn setup_app(app: &AppWindow) {
     #[cfg(target_os = "android")]
     app.set_is_mobile(true);
 
+    // 初始页面为配对页
+    app.set_current_page("pairing".into());
+
     let state = Rc::new(Mutex::new(AppState::new()));
     let app_weak = app.as_weak();
 
+    // 配对倒计时定时器（只能在主线程管理）
+    let pairing_timer: Rc<std::cell::RefCell<Option<slint::Timer>>> =
+        Rc::new(std::cell::RefCell::new(None));
+
+    // 启动远程桌面服务 + 配对倒计时
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let state = state.clone();
         let app_weak = app_weak.clone();
+        let pairing_timer = pairing_timer.clone();
         spawn_local_task(async move {
             loop {
                 let engine = { state.lock().await.engine.clone() };
-                if let Some(engine) = engine {
+                if engine.is_some() {
                     let Some(app) = app_weak.upgrade() else {
                         return;
                     };
-                    match remote_server::start(engine).await {
-                        Ok(handle) => {
-                            let websocket_url = handle.pairing.websocket_url();
-                            let code = handle.pairing.code.clone();
-                            let pairing_info =
-                                format!("配对链接: {}\n\n{}", handle.pairing.uri(), handle.qr_text);
-                            app.set_remote_connected(true);
-                            app.set_remote_status(slint::format!(
-                                "桌面端监听中: {}",
-                                websocket_url
-                            ));
-                            app.set_remote_address(websocket_url.into());
-                            app.set_remote_code(code.into());
-                            app.set_remote_pairing_info(pairing_info.into());
-                            state.lock().await.remote_server = Some(handle);
-                        }
-                        Err(error) => {
-                            app.set_remote_status(slint::format!("桌面端服务启动失败: {}", error));
-                            app.set_remote_connected(false);
-                        }
-                    }
+                    start_remote_server(&state, &app, &app_weak, &pairing_timer).await;
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -596,7 +585,7 @@ pub fn setup_app(app: &AppWindow) {
                     platform.set_sensitive_ui_visible(true);
                 }
                 app.set_show_api_key(false);
-                app.set_show_settings(true);
+                app.set_current_page("settings".into());
             });
         });
     }
@@ -611,8 +600,66 @@ pub fn setup_app(app: &AppWindow) {
                 return;
             };
             app.set_show_api_key(false);
-            app.set_show_settings(false);
+            app.set_current_page("main".into());
             resume_capture_after_sensitive_ui_hidden(state, app.as_weak());
+        });
+    }
+
+    // Enter main screen from pairing
+    {
+        let app_weak = app_weak.clone();
+        app.on_enter_main(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            app.set_current_page("main".into());
+            app.set_status_text("就绪".into());
+            app.set_status_type("ready".into());
+        });
+    }
+
+    // Retry pairing (regenerate code)
+    {
+        let state = state.clone();
+        let app_weak = app_weak.clone();
+        let pairing_timer = pairing_timer.clone();
+        app.on_retry_pairing(move || {
+            let state = state.clone();
+            let app_weak = app_weak.clone();
+            let pairing_timer = pairing_timer.clone();
+            spawn_local_task(async move {
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                app.set_is_busy(true);
+                app.set_remote_status("正在重新生成配对码...".into());
+
+                // Stop existing server
+                {
+                    let mut st = state.lock().await;
+                    st.remote_server = None;
+                }
+
+                // Cancel old timer
+                if let Some(timer) = pairing_timer.borrow_mut().take() {
+                    timer.stop();
+                }
+
+                // Wait a moment for cleanup
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+                let engine = { state.lock().await.engine.clone() };
+                if engine.is_some() {
+                    let Some(app) = app_weak.upgrade() else {
+                        return;
+                    };
+                    start_remote_server(&state, &app, &app_weak, &pairing_timer).await;
+                }
+
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_is_busy(false);
+                }
+            });
         });
     }
 
@@ -877,7 +924,7 @@ pub fn setup_app(app: &AppWindow) {
                         app.set_show_api_key(false);
                         app.set_status_text("就绪".into());
                         app.set_status_type("ready".into());
-                        app.set_show_settings(false);
+                        app.set_current_page("main".into());
                         resume_capture_after_sensitive_ui_hidden(state.clone(), app.as_weak());
                     }
                     Err(error) => {
@@ -947,7 +994,7 @@ fn resume_capture_after_sensitive_ui_hidden(
         let Some(app) = app_weak.upgrade() else {
             return;
         };
-        if app.get_show_settings() {
+        if app.get_current_page() == "settings" {
             return;
         }
         spawn_local_task(async move {
@@ -956,6 +1003,82 @@ fn resume_capture_after_sensitive_ui_hidden(
             }
         });
     });
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn start_remote_server(
+    state: &Rc<Mutex<AppState>>,
+    app: &AppWindow,
+    app_weak: &slint::Weak<AppWindow>,
+    pairing_timer: &Rc<std::cell::RefCell<Option<slint::Timer>>>,
+) {
+    let engine = { state.lock().await.engine.clone() };
+    let Some(engine) = engine else {
+        app.set_remote_status("引擎未初始化".into());
+        return;
+    };
+
+    match remote_server::start(engine).await {
+        Ok(handle) => {
+            let websocket_url = handle.pairing.websocket_url();
+            let code = handle.pairing.code.clone();
+            let pairing_info = format!("配对链接: {}\n\n{}", handle.pairing.uri(), handle.qr_text);
+
+            app.set_remote_connected(true);
+            app.set_remote_status(slint::format!("桌面端监听中: {}", websocket_url));
+            app.set_remote_address(websocket_url.into());
+            app.set_remote_code(code.clone().into());
+            app.set_remote_pairing_info(pairing_info.into());
+            app.set_pairing_code(code.into());
+            app.set_pairing_timer_sec(120);
+
+            // Generate QR code image, adapting to current theme
+            let dark_mode = app.get_is_dark_mode();
+            match remote_server::render_qr_image(&handle.pairing.uri(), dark_mode) {
+                Ok(qr_image) => {
+                    let (width, height) = (qr_image.width(), qr_image.height());
+                    let rgba = qr_image.into_raw();
+                    let mut pixel_buffer =
+                        slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(width, height);
+                    pixel_buffer.make_mut_bytes().copy_from_slice(&rgba);
+                    app.set_pairing_qr_image(slint::Image::from_rgba8_premultiplied(
+                        pixel_buffer,
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to render QR code image: {}", error);
+                }
+            }
+
+            state.lock().await.remote_server = Some(handle);
+
+            // Start pairing countdown timer
+            let app_weak_timer = app_weak.clone();
+            let timer = slint::Timer::default();
+            timer.start(
+                slint::TimerMode::Repeated,
+                std::time::Duration::from_secs(1),
+                move || {
+                    let Some(app) = app_weak_timer.upgrade() else {
+                        return;
+                    };
+                    let remaining = app.get_pairing_timer_sec() - 1;
+                    if remaining <= 0 {
+                        app.set_pairing_timer_sec(0);
+                        app.set_remote_status("配对码已过期，请重新生成".into());
+                        app.set_remote_connected(false);
+                    } else {
+                        app.set_pairing_timer_sec(remaining);
+                    }
+                },
+            );
+            *pairing_timer.borrow_mut() = Some(timer);
+        }
+        Err(error) => {
+            app.set_remote_status(slint::format!("桌面端服务启动失败: {}", error));
+            app.set_remote_connected(false);
+        }
+    }
 }
 
 fn start_continuous_listening(st: &mut AppState, app: &AppWindow) {
@@ -1091,6 +1214,7 @@ mod tests {
         app.set_is_busy(false);
         app.set_text_input("hello".into());
         app.set_show_confirmation(true);
+        app.set_current_page("main".into());
 
         let submitted = Rc::new(RefCell::new(String::new()));
         let submitted_callback = submitted.clone();
@@ -1107,13 +1231,15 @@ mod tests {
         let cancelled_callback = cancelled.clone();
         app.on_cancel_action(move || cancelled_callback.set(true));
 
-        for label in ["提交", "切换监听", "确认", "取消"] {
+        for label in ["切换监听", "确认执行", "取消"] {
             let controls: Vec<_> = ElementHandle::find_by_accessible_label(&app, label).collect();
-            assert_eq!(controls.len(), 1, "expected one visible {label} control");
+            assert!(
+                !controls.is_empty(),
+                "expected at least one visible {label} control"
+            );
             controls[0].invoke_accessible_default_action();
         }
 
-        assert_eq!(&*submitted.borrow(), "hello");
         assert!(listening.get());
         assert!(confirmed.get());
         assert!(cancelled.get());

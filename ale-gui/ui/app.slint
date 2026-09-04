@@ -1,17 +1,27 @@
-import { CompactScreen } from "compact.slint";
-import { SettingsPopup } from "settings-popup.slint";
+import { PairingScreen } from "pairing.slint";
+import { MainScreen } from "main-screen.slint";
+import { SettingsPage } from "settings-page.slint";
 import { AppTheme } from "widgets.slint";
-import { Palette } from "std-widgets.slint";
+import { Palette, StyleMetrics } from "std-widgets.slint";
 
 export { AppTheme }
 
 export component AppWindow inherits Window {
     title: "Ale, My Eyes!";
-    preferred-width: 360px;
-    // 移动端需要更多垂直空间（触控友好布局）
-    preferred-height: 280px;
+    preferred-width: 420px;
+    preferred-height: 540px;
     background: Palette.background;
 
+    // 页面路由: "pairing" | "main" | "settings"
+    in-out property <string> current-page: "pairing";
+    out property <bool> is-dark-mode: StyleMetrics.dark-color-scheme;
+    in-out property <image> pairing-qr-image;
+
+    // ===== 配对页属性 =====
+    in-out property <string> pairing-code: "";
+    in-out property <int> pairing-timer-sec: 120;
+
+    // ===== 主界面 + 通用属性 =====
     in-out property <string> status-text: "初始化中...";
     in-out property <string> status-type: "info";
     in-out property <string> vad-state: "silent";
@@ -25,10 +35,9 @@ export component AppWindow inherits Window {
     in-out property <bool> listening-enabled: true;
     in-out property <string> capability-text: "";
     in-out property <int> session-tokens: 0;
-    in-out property <int> max-tokens-budget: 4000;
     in-out property <string> text-input: "";
 
-    in-out property <bool> show-settings: false;
+    // ===== 设置页属性 =====
     in-out property <string> provider: "";
     in-out property <string> api-key: "";
     in-out property <string> api-url: "";
@@ -42,14 +51,20 @@ export component AppWindow inherits Window {
     in-out property <string> remote-status: "未连接桌面端";
     in-out property <bool> remote-connected: false;
     in-out property <string> remote-pairing-info: "";
-    // 由 Rust 侧根据 target_os 设置
     in-out property <bool> is-mobile: false;
 
+    // ===== 配对页回调 =====
+    callback enter-main();
+    callback retry-pairing();
+
+    // ===== 主界面回调 =====
     callback text-submitted(string);
     callback toggle-listening();
     callback confirm-action();
     callback cancel-action();
     callback open-settings();
+
+    // ===== 设置页回调 =====
     callback close-settings();
     callback provider-changed(string);
     callback api-key-changed(string);
@@ -65,17 +80,29 @@ export component AppWindow inherits Window {
     callback connect-remote();
     callback disconnect-remote();
 
-    // 将 is-mobile 传递给 AppTheme 全局单例
     init => {
         AppTheme.is-mobile = root.is-mobile;
     }
 
-    // 监听 is-mobile 变化同步到 AppTheme
     changed is-mobile => {
         AppTheme.is-mobile = root.is-mobile;
     }
 
-    compact := CompactScreen {
+    // 配对页
+    if root.current-page == "pairing": PairingScreen {
+        pairing-code: root.pairing-code;
+        pairing-timer-sec: root.pairing-timer-sec;
+        remote-connected: root.remote-connected;
+        remote-status: root.remote-status;
+        is-busy: root.is-busy;
+        pairing-qr-image: root.pairing-qr-image;
+
+        enter-main => { root.enter-main(); }
+        retry-pairing => { root.retry-pairing(); }
+    }
+
+    // 主界面
+    if root.current-page == "main": MainScreen {
         status-text: root.status-text;
         status-type: root.status-type;
         vad-state: root.vad-state;
@@ -89,17 +116,17 @@ export component AppWindow inherits Window {
         listening-enabled: root.listening-enabled;
         capability-text: root.capability-text;
         session-tokens: root.session-tokens;
-        max-tokens-budget: root.max-tokens-budget;
-        text-input: root.text-input;
+        remote-status: root.remote-status;
+        remote-connected: root.remote-connected;
 
-        text-submitted(text) => { root.text-submitted(text); }
         toggle-listening => { root.toggle-listening(); }
         confirm-action => { root.confirm-action(); }
         cancel-action => { root.cancel-action(); }
         open-settings => { root.open-settings(); }
     }
 
-    if root.show-settings: SettingsPopup {
+    // 设置页（全屏覆盖）
+    if root.current-page == "settings": SettingsPage {
         provider: root.provider;
         api-key: root.api-key;
         api-url: root.api-url;

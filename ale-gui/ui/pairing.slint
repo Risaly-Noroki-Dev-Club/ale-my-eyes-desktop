@@ -1,0 +1,111 @@
+import { AppTheme, ActionButton, StatusBadge } from "widgets.slint";
+import { Palette } from "std-widgets.slint";
+
+export component PairingScreen inherits Rectangle {
+    in property <string> pairing-code: "";
+    in property <int> pairing-timer-sec: 120;
+    in property <bool> remote-connected: false;
+    in property <string> remote-status: "等待连接...";
+    in property <bool> is-busy: false;
+    in property <image> pairing-qr-image;
+
+    callback enter-main();
+    callback retry-pairing();
+
+    background: Palette.background;
+
+    VerticalLayout {
+        alignment: center;
+        padding: 24px;
+        spacing: 20px;
+
+        // 标题
+        Text {
+            text: "连接助手设备";
+            font-size: 22px;
+            font-weight: 700;
+            color: Palette.foreground;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "使用手机扫描二维码，或输入以下配对码";
+            font-size: 13px;
+            color: Palette.foreground.transparentize(0.45);
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        // 配对卡片
+        Rectangle {
+            height: 320px;
+            background: Palette.control-background;
+            border-radius: 16px;
+            border-width: 1px;
+            border-color: Palette.border;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 16px;
+                alignment: center;
+
+                // QR 码（由 Rust 生成并传入）
+                Rectangle {
+                    height: 160px;
+                    width: 160px;
+                    background: Palette.background;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Palette.border;
+                    clip: true;
+
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.pairing-qr-image;
+                        image-fit: contain;
+                    }
+                }
+
+                // 配对码
+                Text {
+                    text: root.pairing-code;
+                    font-size: 32px;
+                    font-weight: 800;
+                    letter-spacing: 6px;
+                    color: #6b4c9a;
+                    horizontal-alignment: center;
+                }
+
+                // 倒计时
+                Text {
+                    text: "有效期 " + floor(root.pairing-timer-sec / 60) + ":" + mod(root.pairing-timer-sec, 60);
+                    font-size: 13px;
+                    color: Palette.foreground.transparentize(0.4);
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // 状态
+        StatusBadge {
+            text: root.remote-status;
+            connected: root.remote-connected;
+        }
+
+        // 进入主界面按钮（连接成功后显示）
+        if root.remote-connected : ActionButton {
+            text: "进入主界面";
+            primary: true;
+            enabled: !root.is-busy;
+            clicked => { root.enter-main(); }
+        }
+
+        // 重新生成按钮
+        if !root.remote-connected : ActionButton {
+            text: "重新生成配对码";
+            enabled: !root.is-busy;
+            clicked => { root.retry-pairing(); }
+        }
+    }
+}
