@@ -160,12 +160,6 @@ Linux 开发需要安装系统依赖：
 sudo apt-get install -y libclang-dev libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev netcat-openbsd xvfb
 ```
 
-### 验证状态
-
-2026-09-09 的本地 macOS 验证结果：**173 项测试通过，1 项真实屏幕捕获测试按需跳过**；工作区格式检查、编译检查、Clippy 和桌面端/调度器构建通过。界面已检查桌面、紧凑窗口、中英文与高对比度布局。
-
-自动化测试使用本地 HTTP/IPC 模拟端点，没有调用真实付费模型。真实端点可通过设置页的能力测试检查；Windows/Linux 原生运行和屏幕阅读器体验需要在对应环境验证。
-
 ## Nix / NixOS
 
 ```bash
