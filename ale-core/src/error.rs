@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AleError {
+    #[error(transparent)]
+    ModelCall(#[from] crate::model_api::ModelCallError),
     #[error("ASR error: {0}")]
     AsrError(String),
 

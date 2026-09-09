@@ -484,6 +484,7 @@ fn model_job(
     deadline_unix_ms: i64,
 ) -> ModelJob {
     ModelJob {
+        remote_snapshot: None,
         request_id: request_id.to_string(),
         capability,
         priority: SchedulerPriority::InteractiveRequest,

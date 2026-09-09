@@ -321,6 +321,8 @@ pub struct RouteDecision {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelJob {
+    #[serde(default)]
+    pub remote_snapshot: Option<RemoteProviderSet>,
     pub request_id: String,
     pub capability: ModelCapability,
     pub priority: SchedulerPriority,
@@ -345,6 +347,8 @@ pub struct CancelModelJob {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteEndpointConfig {
+    #[serde(default)]
+    pub wire_api: crate::model_api::WireApi,
     pub provider: String,
     pub api_key: String,
     pub api_url: String,
@@ -355,6 +359,10 @@ pub struct RemoteEndpointConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteProviderSet {
+    #[serde(default)]
+    pub transcription: Option<RemoteEndpointConfig>,
+    #[serde(default)]
+    pub revision: u64,
     pub primary: RemoteEndpointConfig,
     pub backup: Option<RemoteEndpointConfig>,
     pub backup_enabled: bool,
@@ -393,6 +401,8 @@ pub struct SchedulerHealth {
     pub available_capabilities: Vec<ModelCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hot_worker: Option<ModelWorkerHealth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensevoice_state: Option<LocalModelState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

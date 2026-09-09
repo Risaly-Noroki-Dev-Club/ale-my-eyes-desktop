@@ -3,6 +3,7 @@ use crate::conversation::automation_tools;
 use crate::modeld::SupervisedModeldClient;
 use crate::platform::{self, ExecutionControl, PlatformService};
 use crate::remote_crypto;
+use crate::ui_state::{Control, Session, SessionGuard, UiHub, OBSERVER};
 use ale_core::actions::{parse_action_plan_arguments, Action, ActionPlan};
 use ale_core::model_scheduler::{
     validate_semantic_plan, BoundingBox, GroundingJob, ModelCapability, SemanticPlan,
@@ -20,7 +21,6 @@ use ale_core::AleEngine;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::list_afinet_netifas;
-use qrcode::render::unicode;
 use qrcode::QrCode;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -48,7 +48,7 @@ const MAX_TRACKED_PAIRING_CLIENTS: usize = 256;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(85);
 #[cfg(not(test))]
 const EXECUTION_TIMEOUT: Duration = Duration::from_secs(28);
 #[cfg(test)]
@@ -209,10 +209,25 @@ impl AudioAssembler {
 }
 
 pub struct RemoteServerHandle {
-    pub pairing: PairingInfo,
-    pub qr_text: String,
+    pub hub: UiHub,
+    pub credentials: Arc<std::sync::Mutex<PairingCredentials>>,
+    pub modeld: Option<SupervisedModeldClient>,
+    pub platform: Arc<dyn PlatformService>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
+}
+
+pub struct PairingCredentials {
+    pub info: PairingInfo,
+    pub expires: Instant,
+}
+
+impl RemoteServerHandle {
+    pub fn refresh_pairing(&self) {
+        let mut credentials = self.credentials.lock().unwrap();
+        credentials.info.code = remote_crypto::pairing_code();
+        credentials.expires = Instant::now() + Duration::from_secs(120);
+    }
 }
 
 #[derive(Clone)]
@@ -227,6 +242,8 @@ struct ConnectionContext {
     scheduler_enabled: bool,
     explicit_cloud_mode: bool,
     local_planning_available: bool,
+    credentials: Arc<std::sync::Mutex<PairingCredentials>>,
+    hub: UiHub,
 }
 
 struct DeferredRequest {
@@ -240,20 +257,11 @@ struct DeferredRequest {
 struct ProcessingRequest {
     request_id: String,
     task: JoinHandle<()>,
-    modeld: Option<SupervisedModeldClient>,
 }
 
 impl Drop for ProcessingRequest {
     fn drop(&mut self) {
         self.task.abort();
-        if let Some(modeld) = self.modeld.clone() {
-            let request_id = self.request_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = modeld.cancel(&request_id).await {
-                    tracing::debug!(%request_id, %error, "modeld cancellation was not acknowledged");
-                }
-            });
-        }
     }
 }
 
@@ -307,6 +315,9 @@ enum ProcessingOutcome {
 
 impl Drop for RemoteServerHandle {
     fn drop(&mut self) {
+        for session in self.hub.0.lock().unwrap().sessions.values() {
+            let _ = session.controls.try_send(Control::Disconnect);
+        }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -331,12 +342,20 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         code,
         name,
     };
-    let qr_text = render_qr(&pairing.uri()).unwrap_or_else(|_| pairing.uri());
 
     let listener = TcpListener::bind(("0.0.0.0", DEFAULT_REMOTE_PORT))
         .await
         .map_err(|error| error.to_string())?;
     let platform: Arc<dyn PlatformService> = Arc::from(platform::create_platform());
+    platform.set_sensitive_ui_visible(true);
+    let capabilities = platform.capabilities();
+    tracing::debug!(
+        capture = capabilities.image_capture,
+        automation = capabilities.automation,
+        microphone = capabilities.local_microphone,
+        automation_ready = platform.is_automation_ready(),
+        "Desktop capabilities"
+    );
     let app_config = engine.lock().await.config().clone();
     let scheduler_enabled = app_config.model_scheduler.enabled;
     let explicit_cloud_mode = app_config.inference.mode == "cloud";
@@ -366,6 +385,15 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         false
     };
     let server_pairing = pairing.clone();
+    let credentials = Arc::new(std::sync::Mutex::new(PairingCredentials {
+        info: pairing.clone(),
+        expires: Instant::now() + Duration::from_secs(120),
+    }));
+    let hub = UiHub::default();
+    let handle_modeld = modeld.clone();
+    let handle_platform = platform.clone();
+    let task_credentials = credentials.clone();
+    let task_hub = hub.clone();
     let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let request_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let request_limiter = Arc::new(std::sync::Mutex::new(ClientRequestLimiter::new(
@@ -408,10 +436,21 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
                         scheduler_enabled,
                         explicit_cloud_mode,
                         local_planning_available,
+                        credentials: task_credentials.clone(),
+                        hub: task_hub.clone(),
                     };
+                    let connection_id = uuid::Uuid::new_v4().to_string();
+                    let observer_hub = task_hub.clone();
                     tokio::spawn(async move {
                         let _connection_permit = connection_permit;
-                        if let Err(error) = handle_connection(stream, addr, context).await {
+                        let _guard = SessionGuard(observer_hub.clone(), connection_id.clone());
+                        if let Err(error) = OBSERVER
+                            .scope(
+                                (observer_hub, connection_id),
+                                handle_connection(stream, addr, context),
+                            )
+                            .await
+                        {
                             tracing::warn!("Remote client disconnected: {}", error);
                         }
                     });
@@ -425,8 +464,10 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     });
 
     Ok(RemoteServerHandle {
-        pairing,
-        qr_text,
+        hub,
+        credentials,
+        modeld: handle_modeld,
+        platform: handle_platform,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
@@ -448,6 +489,8 @@ async fn handle_connection(
         scheduler_enabled,
         explicit_cloud_mode,
         local_planning_available,
+        credentials,
+        hub,
     } = context;
     let websocket_config = WebSocketConfig {
         max_message_size: Some(remote_crypto::MAX_ENCRYPTED_FRAME_BYTES),
@@ -490,14 +533,23 @@ async fn handle_connection(
         record_pairing_failure(&pairing_limiter, addr.ip());
         return Err("INVALID_HANDSHAKE".to_string());
     }
-    let (mut secure, server_handshake) =
-        match remote_crypto::server_handshake_reply(&pairing.code, &client_handshake.into_data()) {
-            Ok(handshake) => handshake,
-            Err(error) => {
-                record_pairing_failure(&pairing_limiter, addr.ip());
-                return Err(format!("PAIRING_FAILED: {error}"));
-            }
-        };
+    let credential_code = {
+        let credentials = credentials.lock().unwrap();
+        if credentials.expires <= Instant::now() {
+            return Err("PAIRING_EXPIRED".into());
+        }
+        credentials.info.code.clone()
+    };
+    let (mut secure, server_handshake) = match remote_crypto::server_handshake_reply(
+        &credential_code,
+        &client_handshake.into_data(),
+    ) {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            record_pairing_failure(&pairing_limiter, addr.ip());
+            return Err(format!("PAIRING_FAILED: {error}"));
+        }
+    };
     if let Ok(mut limiter) = pairing_limiter.lock() {
         limiter.record_success(addr.ip());
     }
@@ -527,8 +579,36 @@ async fn handle_connection(
     let mut decision_maintenance = tokio::time::interval(Duration::from_millis(250));
     decision_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut unexpected_messages = 0_u8;
+    let connection_id = OBSERVER
+        .try_with(|(_, id)| id.clone())
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    let (controls_tx, mut controls_rx) = mpsc::channel(16);
+    let mut authenticated = false;
+    let mut paused = false;
+    let mut ping_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    let mut ping: Option<(Vec<u8>, Instant)> = None;
+    let mut last_received = Instant::now();
+    enum Input {
+        Wire(Message),
+        Control(Control),
+    }
     loop {
         let frame = tokio::select! {
+            command = controls_rx.recv() => {
+                let Some(command) = command else { break };
+                Input::Control(command)
+            }
+            _ = ping_timer.tick() => {
+                if last_received.elapsed() > CONNECTION_IDLE_TIMEOUT { return Err("CONNECTION_IDLE_TIMEOUT".into()); }
+                let nonce = rand::random::<u64>().to_be_bytes().to_vec();
+                tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Ping(nonce.clone()))).await
+                    .map_err(|_| "SEND_TIMEOUT")?.map_err(|e| e.to_string())?;
+                ping = Some((nonce, Instant::now()));
+                continue;
+            }
             _ = decision_maintenance.tick(), if deferred.is_some() => {
                 if deferred
                     .as_ref()
@@ -610,24 +690,123 @@ async fn handle_connection(
             }
             frame = tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, socket.next()) => {
                 match frame {
-                    Ok(Some(Ok(frame))) => frame,
+                    Ok(Some(Ok(frame))) => Input::Wire(frame),
                     Ok(Some(Err(error))) => return Err(error.to_string()),
                     Ok(None) => break,
                     Err(_) => return Err("CONNECTION_IDLE_TIMEOUT".to_string()),
                 }
             }
         };
-        if !frame.is_binary() {
+        let message = match frame {
+            Input::Control(Control::Disconnect) => {
+                break;
+            }
+            Input::Control(Control::Pause(value)) => {
+                paused = value;
+                let mut cancelled = pending.plans.keys().cloned().collect::<Vec<_>>();
+                if let Some(request) = &processing {
+                    cancelled.push(request.request_id.clone());
+                }
+                if let Some(request) = &execution {
+                    cancelled.push(request.request_id.clone());
+                }
+                if let Some(request) = &deferred {
+                    cancelled.push(request.request_id.clone());
+                }
+                if let Some(request) = &active_audio {
+                    cancelled.push(request.request_id.clone());
+                }
+                cancelled.sort();
+                cancelled.dedup();
+                active_audio = None;
+                processing.take();
+                execution.take();
+                deferred.take();
+                pending = PendingPlans::new(MAX_PENDING_PLANS, PENDING_PLAN_TTL);
+                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                    session.paused = value;
+                    session.task = if value { "Paused" } else { "Ready" }.into();
+                    session.decision = None;
+                }
+                hub.log(&connection_id, if value { "Paused" } else { "Ready" });
+                for request_id in cancelled {
+                    send_remote_error(
+                        &mut socket,
+                        &mut secure,
+                        Some(request_id),
+                        "CANCELLED",
+                        "桌面已暂停，当前请求已取消",
+                    )
+                    .await?;
+                }
+                continue;
+            }
+            Input::Control(Control::Reply(reply)) => reply,
+            Input::Wire(frame) => {
+                last_received = Instant::now();
+                if let Message::Pong(payload) = &frame {
+                    if let Some((nonce, sent)) = &ping {
+                        if payload == nonce {
+                            if let Some(session) =
+                                hub.0.lock().unwrap().sessions.get_mut(&connection_id)
+                            {
+                                session.latency =
+                                    Some((sent.elapsed().as_millis() as u64, Instant::now()));
+                            }
+                        }
+                    }
+                }
+                if frame.is_close() {
+                    break;
+                }
+                if !frame.is_binary() {
+                    continue;
+                }
+                let Some(message) = secure
+                    .decrypt_frame(&frame.into_data(), remote_crypto::MAX_SECURE_MESSAGE_BYTES)?
+                else {
+                    continue;
+                };
+                message
+            }
+        };
+        if !authenticated && !matches!(&message, RemoteMessage::ClientHello(_)) {
+            return Err("CLIENT_HELLO_REQUIRED".into());
+        }
+        if paused
+            && matches!(
+                &message,
+                RemoteMessage::CommandRequest(_)
+                    | RemoteMessage::AudioStart(_)
+                    | RemoteMessage::AudioChunk(_)
+                    | RemoteMessage::AudioEnd(_)
+                    | RemoteMessage::ConfirmExecution(_)
+                    | RemoteMessage::DecisionResponse(_)
+            )
+        {
+            let request_id = match &message {
+                RemoteMessage::CommandRequest(request) => &request.request_id,
+                RemoteMessage::AudioStart(request) => &request.request_id,
+                RemoteMessage::AudioChunk(request) => &request.request_id,
+                RemoteMessage::AudioEnd(request) => &request.request_id,
+                RemoteMessage::ConfirmExecution(request) => &request.request_id,
+                RemoteMessage::DecisionResponse(request) => &request.request_id,
+                _ => unreachable!("paused message filter"),
+            };
+            send_remote_error(
+                &mut socket,
+                &mut secure,
+                Some(request_id.clone()),
+                "CANCELLED",
+                "桌面已暂停",
+            )
+            .await?;
             continue;
         }
-        let Some(message) =
-            secure.decrypt_frame(&frame.into_data(), remote_crypto::MAX_SECURE_MESSAGE_BYTES)?
-        else {
-            continue;
-        };
         let handled = match message {
             RemoteMessage::ClientHello(ClientHello {
-                protocol_version, ..
+                protocol_version,
+                device_name,
             }) => {
                 if protocol_version != REMOTE_PROTOCOL_VERSION {
                     send_remote_error(
@@ -639,6 +818,30 @@ async fn handle_connection(
                     )
                     .await?;
                     return Err("PROTOCOL_INCOMPATIBLE".to_string());
+                }
+                if !authenticated {
+                    {
+                        let current = credentials.lock().unwrap();
+                        if current.expires <= Instant::now() || current.info.code != credential_code
+                        {
+                            return Err("PAIRING_EXPIRED".into());
+                        }
+                    }
+                    authenticated = true;
+                    hub.0.lock().unwrap().sessions.insert(
+                        connection_id.clone(),
+                        Session {
+                            name: device_name.chars().take(100).collect(),
+                            address: addr.ip().to_string(),
+                            paused: false,
+                            task: "Ready".into(),
+                            output: String::new(),
+                            latency: None,
+                            decision: None,
+                            controls: controls_tx.clone(),
+                        },
+                    );
+                    hub.log(&connection_id, "Connected");
                 }
                 true
             }
@@ -913,9 +1116,29 @@ async fn handle_connection(
                 if let Some(plan) = pending.take(&request_id, Instant::now()) {
                     audit::record("cancelled", "remote", &plan, None);
                 }
+                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                    if session
+                        .decision
+                        .as_ref()
+                        .is_some_and(|decision| decision.request == request_id)
+                    {
+                        session.decision = None;
+                        session.task = "Cancelled".into();
+                    }
+                }
+                hub.log(&connection_id, "Cancelled");
                 true
             }
             RemoteMessage::ConfirmExecution(confirm) => {
+                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                    if session
+                        .decision
+                        .as_ref()
+                        .is_some_and(|d| d.id.is_none() && d.request == confirm.request_id)
+                    {
+                        session.decision = None;
+                    }
+                }
                 if execution.is_some() {
                     send_remote_error(
                         &mut socket,
@@ -961,6 +1184,14 @@ async fn handle_connection(
                 true
             }
             RemoteMessage::DecisionResponse(response) => {
+                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                    if session.decision.as_ref().is_some_and(|d| {
+                        d.id.as_deref() == Some(response.decision_id.as_str())
+                            && d.request == response.request_id
+                    }) {
+                        session.decision = None;
+                    }
+                }
                 handle_decision_response(
                     response,
                     &mut deferred,
@@ -1221,13 +1452,12 @@ fn start_remote_request(
         return Err(("SERVER_BUSY", "服务器正忙"));
     };
     let task_request_id = request_id.clone();
-    let cancel_modeld = modeld.clone();
     let task = tokio::spawn(async move {
         let _request_permit = request_permit;
         let progress = results.clone();
-        let outcome = match tokio::time::timeout(
-            REQUEST_TIMEOUT,
-            handle_request(
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let process = async {
+            let request = handle_request(
                 engine,
                 platform,
                 &task_request_id,
@@ -1238,7 +1468,16 @@ fn start_remote_request(
                     allow_full_screenshot,
                     local: local_inference,
                 },
-            ),
+            );
+            if let Some(modeld) = &modeld {
+                modeld.with_request(request).await
+            } else {
+                request.await
+            }
+        };
+        let outcome = match tokio::time::timeout_at(
+            deadline,
+            ale_core::model_api::DEADLINE.scope(deadline, process),
         )
         .await
         {
@@ -1257,11 +1496,7 @@ fn start_remote_request(
             outcome,
         });
     });
-    Ok(ProcessingRequest {
-        request_id,
-        task,
-        modeld: cancel_modeld,
-    })
+    Ok(ProcessingRequest { request_id, task })
 }
 
 async fn publish_processing_result(
@@ -1284,6 +1519,11 @@ async fn publish_processing_result(
             .await
         }
         ProcessingOutcome::Complete(mut preview, plan) => {
+            let risk = plan.as_ref().map(|plan| match plan.risk_level {
+                ale_core::actions::RiskLevel::Low => "LowRiskPlan",
+                ale_core::actions::RiskLevel::Medium => "MediumRiskPlan",
+                ale_core::actions::RiskLevel::High => "HighRiskPlan",
+            });
             if let Some(plan) = plan {
                 audit::record("created", "remote", &plan, None);
                 if pending
@@ -1328,6 +1568,21 @@ async fn publish_processing_result(
                 &RemoteMessage::CommandPreview(preview.clone()),
             )
             .await?;
+            if let Some(risk) = risk {
+                let _ = OBSERVER.try_with(|(hub, id)| {
+                    if let Some(decision) = hub
+                        .0
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .get_mut(id)
+                        .and_then(|session| session.decision.as_mut())
+                        .filter(|decision| decision.request == result.request_id)
+                    {
+                        decision.kind = risk.into();
+                    }
+                });
+            }
             send_secure(
                 socket,
                 secure,
@@ -2056,7 +2311,17 @@ async fn send_secure(
     secure: &mut remote_crypto::SecureChannel,
     message: &RemoteMessage,
 ) -> Result<(), String> {
-    for frame in secure.encrypt_message(message)? {
+    let _ = OBSERVER.try_with(|(hub, id)| hub.observe(id, message));
+    let mut outgoing = message.clone();
+    if OBSERVER
+        .try_with(|(hub, _)| hub.0.lock().unwrap().mute_speech)
+        .unwrap_or(false)
+    {
+        if let RemoteMessage::AssistantOutput(output) = &mut outgoing {
+            output.speech_text.clear();
+        }
+    }
+    for frame in secure.encrypt_message(&outgoing)? {
         tokio::time::timeout(SEND_TIMEOUT, socket.send(Message::Binary(frame)))
             .await
             .map_err(|_| "SEND_TIMEOUT".to_string())?
@@ -2297,11 +2562,6 @@ fn local_addresses() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn render_qr(uri: &str) -> Result<String, String> {
-    let code = QrCode::new(uri.as_bytes()).map_err(|error| error.to_string())?;
-    Ok(code.render::<unicode::Dense1x2>().build())
-}
-
 /// Render a QR code as an RGBA image suitable for Slint.
 /// `dark_mode`: true for white modules on black background, false for black on white.
 pub fn render_qr_image(uri: &str, dark_mode: bool) -> Result<image::RgbaImage, String> {
@@ -2524,7 +2784,7 @@ mod tests {
         response_text: &'static str,
     ) -> (String, tokio::task::JoinHandle<String>) {
         mock_json_endpoint(format!(
-            r#"{{"choices":[{{"message":{{"content":"{response_text}"}}}}],"usage":{{"total_tokens":1}}}}"#
+            r#"{{"choices":[{{"finish_reason":"stop","message":{{"content":"{response_text}"}}}}],"usage":{{"total_tokens":1}}}}"#
         ))
         .await
     }
@@ -2592,8 +2852,10 @@ mod tests {
         new_config.cloud_api.api_url = new_url;
         new_config.cloud_api.model = "new-model".to_string();
         new_config.cloud_api.api_key = "new-key".to_string();
-        crate::save_settings(shared_engine.clone(), new_config)
+        shared_engine
+            .lock()
             .await
+            .update_config(new_config)
             .unwrap();
 
         assert!(Arc::ptr_eq(&shared_engine, &remote_engine));
@@ -2709,6 +2971,11 @@ mod tests {
         };
         let context = ConnectionContext {
             engine,
+            credentials: Arc::new(std::sync::Mutex::new(PairingCredentials {
+                info: pairing.clone(),
+                expires: Instant::now() + Duration::from_secs(120),
+            })),
+            hub: UiHub::default(),
             pairing,
             platform: platform.clone(),
             request_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
@@ -2725,9 +2992,19 @@ mod tests {
         };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let hub = context.hub.clone();
+        let credentials = context.credentials.clone();
+        let server_hub = hub.clone();
+        let reconnect_context = context.clone();
         let server = tokio::spawn(async move {
             let (stream, peer) = listener.accept().await.unwrap();
-            handle_connection(stream, peer, context).await
+            let _guard = SessionGuard(server_hub.clone(), "test-session".into());
+            OBSERVER
+                .scope(
+                    (server_hub, "test-session".into()),
+                    handle_connection(stream, peer, context),
+                )
+                .await
         });
 
         let (handshake, first) = remote_crypto::test_client_handshake_start(code).unwrap();
@@ -2748,6 +3025,10 @@ mod tests {
             }
         };
         assert!(matches!(hello, RemoteMessage::ServerHello(_)));
+        assert!(
+            hub.0.lock().unwrap().sessions.is_empty(),
+            "listening and Noise reply alone are not an authenticated device"
+        );
         for frame in secure
             .encrypt_message(&RemoteMessage::ClientHello(ClientHello {
                 protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -2810,9 +3091,108 @@ mod tests {
         assert_eq!(rejection.request_id.as_deref(), Some("loopback-request"));
         assert_eq!(rejection.code, "MODEL_SCHEDULER_DISABLED");
         assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
-
-        socket.close(None).await.unwrap();
+        let controls = hub.0.lock().unwrap().sessions["test-session"]
+            .controls
+            .clone();
+        credentials.lock().unwrap().expires = Instant::now();
+        controls.send(Control::Pause(true)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if hub.0.lock().unwrap().sessions["test-session"].paused {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for frame in secure
+            .encrypt_message(&RemoteMessage::CommandRequest(CommandRequest {
+                request_id: "paused-request".into(),
+                input: CommandInput::Text {
+                    text: "do not execute".into(),
+                },
+            }))
+            .unwrap()
+        {
+            socket.send(Message::Binary(frame)).await.unwrap();
+        }
+        loop {
+            let frame = socket.next().await.unwrap().unwrap();
+            if !frame.is_binary() {
+                continue;
+            }
+            if let Some(message) = secure
+                .decrypt_frame(&frame.into_data(), remote_crypto::MAX_SECURE_MESSAGE_BYTES)
+                .unwrap()
+            {
+                assert!(
+                    matches!(message, RemoteMessage::Error(RemoteError { code, .. }) if code == "CANCELLED")
+                );
+                break;
+            }
+        }
+        controls.send(Control::Pause(false)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !hub.0.lock().unwrap().sessions["test-session"].paused {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
+        controls.send(Control::Disconnect).await.unwrap();
         assert!(server.await.unwrap().is_ok());
+        assert!(hub.0.lock().unwrap().sessions.is_empty());
+        for rotate_after_noise in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let context = reconnect_context.clone();
+            if rotate_after_noise {
+                credentials.lock().unwrap().expires = Instant::now() + Duration::from_secs(120);
+            }
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                handle_connection(stream, peer, context).await
+            });
+            let (handshake, first) = remote_crypto::test_client_handshake_start(code).unwrap();
+            let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+                .await
+                .unwrap();
+            socket.send(Message::Binary(first)).await.unwrap();
+            if rotate_after_noise {
+                let reply = socket.next().await.unwrap().unwrap().into_data();
+                let mut secure = handshake.finish(&reply).unwrap();
+                let handle = RemoteServerHandle {
+                    hub: hub.clone(),
+                    credentials: credentials.clone(),
+                    modeld: None,
+                    platform: platform.clone(),
+                    shutdown: None,
+                    task: None,
+                };
+                handle.refresh_pairing();
+                assert_ne!(credentials.lock().unwrap().info.code, code);
+                for frame in secure
+                    .encrypt_message(&RemoteMessage::ClientHello(ClientHello {
+                        protocol_version: REMOTE_PROTOCOL_VERSION,
+                        device_name: "stale-pairing".into(),
+                    }))
+                    .unwrap()
+                {
+                    socket.send(Message::Binary(frame)).await.unwrap();
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.unwrap_err().contains("PAIRING_EXPIRED"));
+            assert!(hub.0.lock().unwrap().sessions.is_empty());
+        }
         api_request.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3159,15 +3539,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(result.request_id, "slow");
-        assert!(matches!(result.kind, RemoteExecutionEventKind::TimedOut));
-        let finished = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            finished.kind,
-            RemoteExecutionEventKind::FinishedAfterTimeout
-        ));
+        // The cooperative worker can observe the deadline before Tokio's timeout fires.
+        match result.kind {
+            RemoteExecutionEventKind::TimedOut => {
+                let finished = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    finished.kind,
+                    RemoteExecutionEventKind::FinishedAfterTimeout
+                ));
+            }
+            RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Error { code, .. }) => {
+                assert_eq!(code, "CONFIRM_TIMEOUT")
+            }
+            _ => panic!("timed-out execution must never report success"),
+        }
         drop(request);
     }
 

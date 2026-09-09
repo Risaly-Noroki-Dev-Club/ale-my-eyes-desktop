@@ -259,7 +259,10 @@ mod tests {
         let _: IpcReply = read_message(&mut client).await.unwrap();
 
         let providers = RemoteProviderSet {
+            transcription: None,
+            revision: 0,
             primary: RemoteEndpointConfig {
+                wire_api: Default::default(),
                 provider: "openai".to_string(),
                 api_key: "test".to_string(),
                 api_url: format!("http://{address}"),
@@ -288,6 +291,7 @@ mod tests {
         assert_eq!(configured.status, IpcReplyStatus::Ok as i32);
 
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: "slow-job".to_string(),
             capability: ModelCapability::RemotePlanning,
             priority: SchedulerPriority::InteractiveRequest,

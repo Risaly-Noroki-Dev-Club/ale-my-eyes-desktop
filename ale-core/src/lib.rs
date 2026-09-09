@@ -93,6 +93,7 @@ impl AleEngine {
 
         let mut inference_engine = inference::AdaptiveInference::new(inference_config);
         let mut cloud_ready = false;
+        inference_engine.configure_transcription(&config_manager.config().transcription);
 
         if !config_manager.config().cloud_api.api_key.trim().is_empty() {
             let cloud_config = Self::cloud_config_from_app(&config_manager.config().cloud_api);
@@ -175,7 +176,7 @@ impl AleEngine {
         })
     }
 
-    fn cloud_config_from_app(config: &config::CloudApiConfig) -> cloud::CloudConfig {
+    pub fn cloud_config_from_app(config: &config::CloudApiConfig) -> cloud::CloudConfig {
         let provider = match config.provider.to_lowercase().as_str() {
             "anthropic" => cloud::CloudProvider::Anthropic,
             "google" => cloud::CloudProvider::Google,
@@ -185,6 +186,7 @@ impl AleEngine {
         };
 
         cloud::CloudConfig {
+            wire_api: config.wire_api,
             provider,
             api_key: config.api_key.clone(),
             api_url: config.api_url.clone(),
@@ -507,6 +509,8 @@ impl AleEngine {
     /// 更新配置
     pub fn update_config(&mut self, config: config::AppConfig) -> Result<()> {
         self.config_manager.update_config(config)?;
+        self.inference_engine
+            .configure_transcription(&self.config_manager.config().transcription);
         let cloud = &self.config_manager.config().cloud_api;
         if cloud.api_key.trim().is_empty() {
             self.inference_engine.clear_cloud_api();
@@ -660,6 +664,7 @@ mod tests {
     #[test]
     fn test_cloud_config_from_app_openai() {
         let app_config = config::CloudApiConfig {
+            wire_api: model_api::WireApi::OpenaiChatCompletions,
             provider: "openai".to_string(),
             api_key: "sk-test".to_string(),
             api_url: "https://api.openai.com/v1".to_string(),
@@ -714,3 +719,5 @@ mod tests {
         assert!(!status.tts_ready);
     }
 }
+pub mod model_api;
+pub mod model_probe;

@@ -3,9 +3,21 @@ use crate::{AleError, Result};
 const SERVICE: &str = "com.alemyeyes.cloud-api";
 const ACCOUNT: &str = "default";
 const BACKUP_ACCOUNT: &str = "backup";
+const TRANSCRIPTION_ACCOUNT: &str = "transcription";
 
 /// Stores credentials outside the application configuration file.
 pub trait SecretStore: Send + Sync {
+    fn get_transcription_api_key(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn set_transcription_api_key(&self, _key: &str) -> Result<()> {
+        Err(AleError::ConfigError(
+            "Credential store does not support independent transcription keys".into(),
+        ))
+    }
+    fn delete_transcription_api_key(&self) -> Result<()> {
+        Ok(())
+    }
     fn get_api_key(&self) -> Result<Option<String>>;
     fn set_api_key(&self, api_key: &str) -> Result<()>;
     fn delete_api_key(&self) -> Result<()>;
@@ -33,6 +45,28 @@ impl SystemSecretStore {
 }
 
 impl SecretStore for SystemSecretStore {
+    fn get_transcription_api_key(&self) -> Result<Option<String>> {
+        match Self::entry(TRANSCRIPTION_ACCOUNT)?.get_password() {
+            Ok(key) => Ok(Some(key)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err(AleError::ConfigError(
+                "Cannot read transcription credential".into(),
+            )),
+        }
+    }
+    fn set_transcription_api_key(&self, key: &str) -> Result<()> {
+        Self::entry(TRANSCRIPTION_ACCOUNT)?
+            .set_password(key)
+            .map_err(|_| AleError::ConfigError("Cannot save transcription credential".into()))
+    }
+    fn delete_transcription_api_key(&self) -> Result<()> {
+        match Self::entry(TRANSCRIPTION_ACCOUNT)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err(AleError::ConfigError(
+                "Cannot delete transcription credential".into(),
+            )),
+        }
+    }
     fn get_api_key(&self) -> Result<Option<String>> {
         match Self::entry(ACCOUNT)?.get_password() {
             Ok(value) => Ok(Some(value)),

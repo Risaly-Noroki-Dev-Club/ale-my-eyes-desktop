@@ -91,6 +91,7 @@ pub struct InferenceResult<T> {
 pub struct AdaptiveInference {
     config: InferenceConfig,
     cloud_api: Option<Box<dyn crate::cloud::CloudApi>>,
+    transcription_api: Option<Box<dyn crate::cloud::CloudApi>>,
     #[cfg(feature = "local-inference")]
     local_asr: Option<crate::asr::WhisperRecognizer>,
     #[cfg(feature = "local-inference")]
@@ -102,6 +103,7 @@ impl AdaptiveInference {
         Self {
             config,
             cloud_api: None,
+            transcription_api: None,
             #[cfg(feature = "local-inference")]
             local_asr: None,
             #[cfg(feature = "local-inference")]
@@ -117,6 +119,14 @@ impl AdaptiveInference {
     /// Remove the configured cloud provider when credentials are cleared.
     pub fn clear_cloud_api(&mut self) {
         self.cloud_api = None;
+    }
+
+    pub fn configure_transcription(&mut self, config: &crate::config::TranscriptionConfig) {
+        self.transcription_api = config.enabled.then(|| {
+            crate::cloud::CloudApiFactory::create(crate::AleEngine::cloud_config_from_app(
+                &config.endpoint,
+            ))
+        });
     }
 
     /// 设置本地 ASR 模型
@@ -272,13 +282,14 @@ impl AdaptiveInference {
                 }
             }
             InferenceMode::CloudOnly | InferenceMode::Adaptive => {
-                // 云端推理
                 let cloud_api = self
-                    .cloud_api
+                    .transcription_api
                     .as_ref()
-                    .ok_or(AleError::NotInitialized("Cloud API"))?;
-
-                let response = cloud_api.transcribe(audio_data).await?;
+                    .ok_or(AleError::NotInitialized("Independent transcription API"))?;
+                let response = crate::model_api::retry(crate::model_api::deadline(), 1, || {
+                    cloud_api.transcribe(audio_data)
+                })
+                .await?;
                 response.content
             }
         };

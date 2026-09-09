@@ -37,6 +37,40 @@ pub struct ModeldClient {
     _process: Arc<ModeldProcess>,
 }
 
+tokio::task_local! { static REQUEST_CONTEXT: (ModeldClient, RemoteProviderSet); }
+
+struct PendingCall {
+    client: ModeldClient,
+    id: String,
+    cancel: bool,
+    complete: bool,
+    write_started: bool,
+    sent: bool,
+}
+impl Drop for PendingCall {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let client = self.client.clone();
+        let id = self.id.clone();
+        let cancel = self.cancel;
+        if self.write_started && !self.sent {
+            // A partially written frame cannot be followed by another IPC frame.
+            client.alive.store(false, Ordering::Release);
+            if let Ok(mut child) = client._process.child.lock() {
+                let _ = child.start_kill();
+            }
+        }
+        tokio::spawn(async move {
+            client.pending.lock().await.remove(&id);
+            if cancel && client.is_alive() {
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.cancel(&id)).await;
+            }
+        });
+    }
+}
+
 const MAX_CONSECUTIVE_PROCESS_FAILURES: u8 = 3;
 
 #[derive(Clone)]
@@ -45,6 +79,7 @@ pub struct SupervisedModeldClient {
 }
 
 struct SupervisorState {
+    revision: u64,
     config: AppConfig,
     client: Option<ModeldClient>,
     consecutive_failures: u8,
@@ -69,7 +104,7 @@ impl Drop for ModeldProcess {
 }
 
 impl ModeldClient {
-    pub async fn start(config: &AppConfig) -> Result<Self, String> {
+    pub async fn start(config: &AppConfig, revision: u64) -> Result<Self, String> {
         let executable = modeld_executable()?;
         let endpoint = modeld_endpoint();
         let mut token = vec![0_u8; 32];
@@ -138,9 +173,7 @@ impl ModeldClient {
             _process: process,
         };
         client.call_raw(IpcRequestKind::Authenticate, token).await?;
-        if !config.cloud_api.api_key.trim().is_empty() {
-            client.configure_remote(config).await?;
-        }
+        client.configure_remote(config, revision).await?;
         client.configure_models(config).await?;
         Ok(client)
     }
@@ -164,6 +197,7 @@ impl ModeldClient {
             tools,
         };
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: request_id.to_string(),
             capability: ModelCapability::RemotePlanning,
             priority: SchedulerPriority::InteractiveRequest,
@@ -195,6 +229,7 @@ impl ModeldClient {
             application_id,
         };
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: request_id.to_string(),
             capability: ModelCapability::LocalPlanning,
             priority: SchedulerPriority::InteractiveRequest,
@@ -215,6 +250,7 @@ impl ModeldClient {
         grounding: GroundingJob,
     ) -> Result<GroundingResult, String> {
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: request_id.to_string(),
             capability: ModelCapability::ElementGrounding,
             priority: SchedulerPriority::InteractiveRequest,
@@ -241,6 +277,7 @@ impl ModeldClient {
             ..verification
         };
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: request_id.to_string(),
             capability: ModelCapability::StateVerification,
             priority: SchedulerPriority::StateVerification,
@@ -265,10 +302,11 @@ impl ModeldClient {
             allow_remote,
         };
         let job = ModelJob {
+            remote_snapshot: None,
             request_id: request_id.to_string(),
             capability: ModelCapability::SpeechRecognition,
             priority: SchedulerPriority::InteractiveRequest,
-            deadline_unix_ms: unix_millis() + 30_000,
+            deadline_unix_ms: unix_millis() + 85_000,
             risk_ceiling: ale_core::actions::RiskLevel::Low,
             snapshot_id: None,
             privacy: JobPrivacy {
@@ -294,15 +332,8 @@ impl ModeldClient {
         Ok(())
     }
 
-    async fn configure_remote(&self, config: &AppConfig) -> Result<(), String> {
-        let providers = RemoteProviderSet {
-            primary: endpoint(&config.cloud_api),
-            backup: config.remote_routing.backup.as_ref().map(endpoint),
-            backup_enabled: config.remote_routing.backup_enabled,
-            backup_pre_authorized: config.remote_routing.backup_pre_authorized,
-            circuit_failure_threshold: config.remote_routing.circuit_failure_threshold,
-            circuit_open_seconds: config.remote_routing.circuit_open_seconds,
-        };
+    async fn configure_remote(&self, config: &AppConfig, revision: u64) -> Result<(), String> {
+        let providers = provider_set(config, revision);
         let _: serde_json::Value = self
             .call_json(IpcRequestKind::ConfigureRemote, &providers)
             .await?;
@@ -414,34 +445,73 @@ impl ModeldClient {
         &self,
         request_id: &str,
         kind: IpcRequestKind,
-        payload: Vec<u8>,
+        mut payload: Vec<u8>,
     ) -> Result<IpcReply, String> {
-        let (sender, receiver) = oneshot::channel();
-        if self
-            .pending
-            .lock()
-            .await
-            .insert(request_id.to_string(), sender)
-            .is_some()
-        {
-            return Err("模型调度器请求 ID 重复".to_string());
+        let deadline = ale_core::model_api::deadline();
+        if tokio::time::Instant::now() >= deadline {
+            return Err("DEADLINE_EXCEEDED".into());
         }
-        let write_result = write_message(
-            &mut *self.writer.lock().await,
-            &IpcEnvelope {
-                protocol_version: MODEL_IPC_VERSION,
-                request_id: request_id.to_string(),
-                kind: kind as i32,
-                payload,
-            },
-        )
-        .await;
+        // Each stage has its own IPC ID so a late response or cancellation can
+        // never match a later stage of the same phone request.
+        let stage_id = format!("{request_id}:{}", uuid::Uuid::new_v4());
+        let request_id = if kind == IpcRequestKind::Schedule {
+            stage_id.as_str()
+        } else {
+            request_id
+        };
+        if kind == IpcRequestKind::Schedule {
+            let mut job: ModelJob = serde_json::from_slice(&payload).map_err(|e| e.to_string())?;
+            job.request_id = request_id.to_string();
+            job.deadline_unix_ms = job.deadline_unix_ms.min(
+                unix_millis()
+                    + deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .as_millis() as i64,
+            );
+            job.remote_snapshot = REQUEST_CONTEXT
+                .try_with(|(_, providers)| providers.clone())
+                .ok();
+            payload = serde_json::to_vec(&job).map_err(|e| e.to_string())?;
+        }
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if pending.contains_key(request_id) {
+                return Err("模型调度器请求 ID 重复".to_string());
+            }
+            pending.insert(request_id.to_string(), sender);
+        }
+        let mut guard = PendingCall {
+            client: self.clone(),
+            id: request_id.into(),
+            cancel: kind == IpcRequestKind::Schedule,
+            complete: false,
+            write_started: false,
+            sent: false,
+        };
+        let write_result = tokio::time::timeout_at(deadline, async {
+            let mut writer = self.writer.lock().await;
+            guard.write_started = true;
+            write_message(
+                &mut *writer,
+                &IpcEnvelope {
+                    protocol_version: MODEL_IPC_VERSION,
+                    request_id: request_id.to_string(),
+                    kind: kind as i32,
+                    payload,
+                },
+            )
+            .await
+        })
+        .await
+        .map_err(|_| "IPC_WRITE_TIMEOUT".to_string())?;
         if let Err(error) = write_result {
             self.alive.store(false, Ordering::Release);
             self.pending.lock().await.remove(request_id);
             return Err(error.to_string());
         }
-        let reply = match tokio::time::timeout(Duration::from_secs(95), receiver).await {
+        guard.sent = true;
+        let reply = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(reply)) => reply?,
             Ok(Err(_)) => return Err("模型调度器响应通道已关闭".to_string()),
             Err(_) => {
@@ -449,6 +519,8 @@ impl ModeldClient {
                 return Err("模型调度器响应超时".to_string());
             }
         };
+        guard.cancel = false;
+        guard.complete = true;
         if reply.protocol_version != MODEL_IPC_VERSION || reply.request_id != request_id {
             return Err("模型调度器返回了无法关联的响应".to_string());
         }
@@ -464,13 +536,44 @@ impl ModeldClient {
 }
 
 impl SupervisedModeldClient {
+    pub async fn update_config(&self, config: AppConfig) -> Result<(), String> {
+        let mut state = self.state.lock().await;
+        let revision = state.revision + 1;
+        if let Some(client) = &state.client {
+            let _: serde_json::Value = client
+                .call_json(
+                    IpcRequestKind::ConfigureRemote,
+                    &provider_set(&config, revision),
+                )
+                .await?;
+        }
+        state.config = config;
+        state.revision = revision;
+        state.restart_blocked = false;
+        state.consecutive_failures = 0;
+        state.last_error = None;
+        Ok(())
+    }
+    pub async fn with_request<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        let client = self.connection().await?;
+        let providers = {
+            let state = self.state.lock().await;
+            provider_set(&state.config, state.revision)
+        };
+        REQUEST_CONTEXT.scope((client, providers), future).await
+    }
     pub async fn start(config: &AppConfig) -> Self {
-        let (client, consecutive_failures, last_error) = match ModeldClient::start(config).await {
+        let (client, consecutive_failures, last_error) = match ModeldClient::start(config, 0).await
+        {
             Ok(client) => (Some(client), 0, None),
             Err(error) => (None, 1, Some(error)),
         };
         Self {
             state: Arc::new(Mutex::new(SupervisorState {
+                revision: 0,
                 config: config.clone(),
                 client,
                 consecutive_failures,
@@ -560,13 +663,6 @@ impl SupervisedModeldClient {
         result
     }
 
-    pub async fn cancel(&self, target_request_id: &str) -> Result<(), String> {
-        let client = self.connection().await?;
-        let result = client.cancel(target_request_id).await;
-        self.record_result(&client, result.is_ok()).await;
-        result
-    }
-
     pub async fn retry_after_user_request(&self) {
         let mut state = self.state.lock().await;
         if state.restart_blocked {
@@ -596,6 +692,9 @@ impl SupervisedModeldClient {
     }
 
     async fn connection(&self) -> Result<ModeldClient, String> {
+        if let Ok(client) = REQUEST_CONTEXT.try_with(|(client, _)| client.clone()) {
+            return Ok(client);
+        }
         let mut state = self.state.lock().await;
         if state.client.as_ref().is_some_and(ModeldClient::is_alive) {
             return Ok(state
@@ -617,7 +716,7 @@ impl SupervisedModeldClient {
             ));
         }
 
-        match ModeldClient::start(&state.config).await {
+        match ModeldClient::start(&state.config, state.revision).await {
             Ok(client) => {
                 state.client = Some(client.clone());
                 Ok(client)
@@ -732,8 +831,25 @@ fn record_process_failure(state: &mut SupervisorState, error: String) {
     }
 }
 
+fn provider_set(config: &AppConfig, revision: u64) -> RemoteProviderSet {
+    RemoteProviderSet {
+        revision,
+        primary: endpoint(&config.cloud_api),
+        transcription: config
+            .transcription
+            .enabled
+            .then(|| endpoint(&config.transcription.endpoint)),
+        backup: config.remote_routing.backup.as_ref().map(endpoint),
+        backup_enabled: config.remote_routing.backup_enabled,
+        backup_pre_authorized: config.remote_routing.backup_pre_authorized,
+        circuit_failure_threshold: config.remote_routing.circuit_failure_threshold,
+        circuit_open_seconds: config.remote_routing.circuit_open_seconds,
+    }
+}
+
 fn endpoint(config: &CloudApiConfig) -> RemoteEndpointConfig {
     RemoteEndpointConfig {
+        wire_api: config.wire_api,
         provider: config.provider.clone(),
         api_key: config.api_key.clone(),
         api_url: config.api_url.clone(),
@@ -842,8 +958,209 @@ fn unix_millis() -> i64 {
 mod supervisor_tests {
     use super::*;
 
+    #[cfg(unix)]
+    async fn mock_client() -> (ModeldClient, LocalStream) {
+        let (stream, peer) = LocalStream::pair().unwrap();
+        let (mut reader, writer) = tokio::io::split(stream);
+        let pending = Arc::new(Mutex::new(PendingReplies::new()));
+        let replies = pending.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let reader_alive = alive.clone();
+        tokio::spawn(async move {
+            while let Ok(reply) = read_message::<_, IpcReply>(&mut reader).await {
+                if let Some(sender) = replies.lock().await.remove(&reply.request_id) {
+                    let _ = sender.send(Ok(reply));
+                }
+            }
+            reader_alive.store(false, Ordering::Release);
+        });
+        let mut child = Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        let client = ModeldClient {
+            writer: Arc::new(Mutex::new(writer)),
+            pending,
+            alive,
+            instance_id: uuid::Uuid::new_v4(),
+            _process: Arc::new(ModeldProcess {
+                child: std::sync::Mutex::new(child),
+                endpoint: PathBuf::from(format!("/tmp/ale-unused-{}.sock", uuid::Uuid::new_v4())),
+            }),
+        };
+        (client, peer)
+    }
+
+    #[cfg(unix)]
+    fn test_job() -> ModelJob {
+        ModelJob {
+            request_id: "same-phone-request".into(),
+            capability: ModelCapability::RemotePlanning,
+            priority: SchedulerPriority::InteractiveRequest,
+            deadline_unix_ms: unix_millis() + 90_000,
+            risk_ceiling: ale_core::actions::RiskLevel::Low,
+            snapshot_id: None,
+            privacy: JobPrivacy::default(),
+            payload: serde_json::Value::Null,
+            remote_snapshot: None,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn reply(peer: &mut LocalStream, request_id: String) {
+        write_message(
+            peer,
+            &IpcReply {
+                protocol_version: MODEL_IPC_VERSION,
+                request_id,
+                status: IpcReplyStatus::Ok as i32,
+                payload: b"null".to_vec(),
+                error_code: String::new(),
+                error_message: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hot_update_keeps_inflight_snapshot_and_process_and_bounds_all_stages() {
+        let (client, mut peer) = mock_client().await;
+        let instance = client.instance_id;
+        let mut inner = state();
+        inner.config.cloud_api.model = "old-model".into();
+        inner.client = Some(client);
+        let supervisor = SupervisedModeldClient {
+            state: Arc::new(Mutex::new(inner)),
+        };
+        let server = tokio::spawn(async move {
+            let mut jobs = Vec::new();
+            for _ in 0..4 {
+                let request: IpcEnvelope = read_message(&mut peer).await.unwrap();
+                if request.kind == IpcRequestKind::Schedule as i32 {
+                    jobs.push(serde_json::from_slice::<ModelJob>(&request.payload).unwrap());
+                }
+                reply(&mut peer, request.request_id).await;
+            }
+            jobs
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        ale_core::model_api::DEADLINE
+            .scope(
+                deadline,
+                supervisor.with_request(async {
+                    let client = supervisor.connection().await?;
+                    let _: serde_json::Value = client
+                        .call_json_with_id(
+                            "same-phone-request",
+                            IpcRequestKind::Schedule,
+                            &test_job(),
+                        )
+                        .await?;
+                    let mut updated = AppConfig::default();
+                    updated.cloud_api.model = "new-model".into();
+                    supervisor.update_config(updated).await?;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _: serde_json::Value = client
+                        .call_json_with_id(
+                            "same-phone-request",
+                            IpcRequestKind::Schedule,
+                            &test_job(),
+                        )
+                        .await?;
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .with_request(async {
+                let client = supervisor.connection().await?;
+                let _: serde_json::Value = client
+                    .call_json_with_id("same-phone-request", IpcRequestKind::Schedule, &test_job())
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let jobs = server.await.unwrap();
+        assert_eq!(
+            jobs[0].remote_snapshot.as_ref().unwrap().primary.model,
+            "old-model"
+        );
+        assert_eq!(
+            jobs[1].remote_snapshot.as_ref().unwrap().primary.model,
+            "old-model"
+        );
+        assert_eq!(
+            jobs[2].remote_snapshot.as_ref().unwrap().primary.model,
+            "new-model"
+        );
+        assert_ne!(jobs[0].request_id, jobs[1].request_id);
+        assert!((jobs[1].deadline_unix_ms - jobs[0].deadline_unix_ms).abs() <= 5);
+        assert_eq!(
+            supervisor
+                .state
+                .lock()
+                .await
+                .client
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            instance
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_stage_cancels_original_instance_and_late_reply_cannot_match_next_stage() {
+        let (client, mut peer) = mock_client().await;
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .call_json_with_id::<serde_json::Value>(
+                    "same-phone-request",
+                    IpcRequestKind::Schedule,
+                    &test_job(),
+                )
+                .await
+        });
+        let old: IpcEnvelope = read_message(&mut peer).await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let cancellation: IpcEnvelope =
+            tokio::time::timeout(Duration::from_secs(1), read_message(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(cancellation.kind, IpcRequestKind::Cancel as i32);
+        let target: CancelModelJob = serde_json::from_slice(&cancellation.payload).unwrap();
+        assert_eq!(target.target_request_id, old.request_id);
+        reply(&mut peer, cancellation.request_id).await;
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .call_json_with_id::<serde_json::Value>(
+                    "same-phone-request",
+                    IpcRequestKind::Schedule,
+                    &test_job(),
+                )
+                .await
+        });
+        let new: IpcEnvelope = read_message(&mut peer).await.unwrap();
+        assert_ne!(old.request_id, new.request_id);
+        reply(&mut peer, old.request_id).await;
+        reply(&mut peer, new.request_id).await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        assert!(client.pending.lock().await.is_empty());
+    }
+
     fn state() -> SupervisorState {
         SupervisorState {
+            revision: 0,
             config: AppConfig::default(),
             client: None,
             consecutive_failures: 0,

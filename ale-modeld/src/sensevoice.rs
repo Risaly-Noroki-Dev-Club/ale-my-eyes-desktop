@@ -19,6 +19,16 @@ struct LoadedRecognizer {
 }
 
 impl SenseVoiceAdapter {
+    pub fn state(&self) -> ale_core::model_scheduler::LocalModelState {
+        use ale_core::model_scheduler::LocalModelState;
+        match self.loaded.try_lock() {
+            Ok(loaded) if loaded.is_some() => LocalModelState::Ready,
+            Ok(_) => LocalModelState::Stopped,
+            Err(std::sync::TryLockError::WouldBlock) => LocalModelState::Busy,
+            Err(_) => LocalModelState::Failed,
+        }
+    }
+
     pub fn available(config: &ModelRuntimeConfig) -> bool {
         cfg!(all(
             feature = "sensevoice",

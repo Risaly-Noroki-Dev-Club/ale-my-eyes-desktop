@@ -36,6 +36,7 @@ url = "2"
 dirs = "5"
 urlencoding = "2"
 keyring = "4.1"
+jsonschema = { version = "0.33", default-features = false }
 
 [features]
 default = ["cloud"]
@@ -44,3 +45,6 @@ cloud = []
 local-inference = ["tts", "dep:ort", "dep:whisper-rs"]
 cloud-inference = ["cloud"]
 adaptive = ["local-inference", "cloud-inference"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

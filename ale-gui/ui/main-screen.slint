@@ -1,189 +1,139 @@
-import { AppTheme, IconButton, StatusBadge, ActionButton } from "widgets.slint";
-import { Palette } from "std-widgets.slint";
-
+import { ScrollView, ComboBox } from "std-widgets.slint";
+import { Ui } from "state.slint";
+import { AppTheme, ActionButton, StatusBadge, Panel, SectionTitle } from "widgets.slint";
 export component MainScreen inherits Rectangle {
-    in property <string> status-text: "就绪";
-    in property <string> status-type: "ready";
-    in property <string> vad-state: "silent";
-    in property <string> transcription: "";
-    in property <string> ai-response: "";
-    in property <string> action-steps: "";
-    in property <bool> show-confirmation: false;
-    in property <string> confirmation-text: "";
-    in property <bool> is-busy: false;
-    in property <bool> engine-ready: false;
-    in property <bool> listening-enabled: true;
-    in property <string> capability-text: "";
-    in property <int> session-tokens: 0;
-    in property <string> remote-status: "";
-    in property <bool> remote-connected: false;
-
-    callback toggle-listening();
-    callback confirm-action();
-    callback cancel-action();
-    callback open-settings();
-
-    background: Palette.background;
-
-    VerticalLayout {
-        padding: AppTheme.pad + 4px;
-        spacing: AppTheme.gap + 4px;
-
-        // 顶部状态栏
-        HorizontalLayout {
-            spacing: 8px;
-            alignment: space-between;
-
+    background: AppTheme.background;
+    in-out property <bool> details: false;
+    in-out property <bool> log-details: false;
+    ScrollView {
+        width: parent.width; height: parent.height;
+        VerticalLayout {
+            alignment: start;
+            padding: 24px; spacing: 16px;
             HorizontalLayout {
-                spacing: 6px;
                 alignment: center;
-
-                StatusBadge {
-                    text: root.vad-state == "speaking" ? "说话中"
-                        : root.vad-state == "speech_ended" ? "处理中"
-                        : root.is-busy ? root.status-text
-                        : root.status-text;
-                    state: root.vad-state == "speaking" ? "speaking"
-                        : root.is-busy ? "processing"
-                        : !root.engine-ready ? "error"
-                        : "ready";
+                VerticalLayout {
+                    alignment: start;
+                    width: min(root.width - 48px, 440px); spacing: 16px;
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 0px; spacing: 0px;
+                            Rectangle {
+                                background: AppTheme.selected;
+                                border-top-left-radius: 16px; border-top-right-radius: 16px;
+                                HorizontalLayout {
+                                padding: 20px;
+                                spacing: 10px;
+                                Image { source: @image-url("assets/accessibility.svg"); width: 24px; height: 24px; colorize: AppTheme.accent; }
+                                Text { text: "Ale-my-Eyes!"; color: AppTheme.text; font-weight: 700; font-size: 18px; }
+                                StatusBadge { text: Ui.paused ? Ui.tr("已暂停", "Paused") : Ui.tr("已连接", "Connected"); good: !Ui.paused; }
+                                }
+                            }
+                            VerticalLayout {
+                            alignment: start; padding: 20px; spacing: 20px;
+                            if Ui.devices.length > 1: ComboBox {
+                                model: Ui.device-names;
+                                current-index: Ui.selected-device;
+                                enabled: !Ui.leave-prompt;
+                                selected(value) => { Ui.select-device(self.current-index); }
+                            }
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Rectangle {
+                                    background: AppTheme.soft; border-radius: 12px;
+                                    VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px; spacing: 8px;
+                                    Text { text: Ui.tr("配对设备", "Paired device"); color: AppTheme.muted; font-size: 12px; }
+                                    Text { text: Ui.device-name; color: AppTheme.text; font-size: 18px; wrap: word-wrap; }
+                                    Text { text: Ui.device-address; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; }
+                                    }
+                                }
+                                Rectangle {
+                                    background: AppTheme.soft; border-radius: 12px;
+                                    VerticalLayout {
+                                    alignment: start;
+                                    padding: 14px; spacing: 8px;
+                                    Text { text: Ui.tr("局域网延迟", "Network latency"); color: AppTheme.muted; font-size: 12px; }
+                                    Text { text: Ui.latency; color: AppTheme.text; font-size: 18px; }
+                                    Text { text: Ui.tr("Noise 加密", "Noise encrypted"); color: AppTheme.muted; font-size: 12px; }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                background: AppTheme.selected; border-radius: 12px;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 16px; spacing: 8px;
+                                    Text { text: Ui.tr("当前任务", "Current task"); color: AppTheme.muted; font-size: 12px; }
+                                    Text { text: Ui.task; color: AppTheme.text; wrap: word-wrap; }
+                                }
+                            }
+                            if Ui.decision != "": Rectangle {
+                                background: AppTheme.warning; border-radius: 12px;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 16px; spacing: 12px;
+                                    Text { text: Ui.decision-kind; color: AppTheme.text; font-weight: 600; wrap: word-wrap; }
+                                    Text { text: Ui.decision; color: AppTheme.text; wrap: word-wrap; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        ActionButton { text: Ui.tr("拒绝", "Reject"); enabled: Ui.can-confirm && !Ui.paused; clicked => { Ui.decide(false); } }
+                                        ActionButton { text: Ui.tr("确认执行", "Confirm"); icon: @image-url("assets/check.svg"); primary: true; enabled: Ui.can-confirm && !Ui.paused; clicked => { Ui.decide(true); } }
+                                    }
+                                }
+                            }
+                            if Ui.output != "": VerticalLayout {
+        alignment: start;
+                                spacing: 12px;
+                                ActionButton { text: root.details ? Ui.tr("收起详情", "Hide details") : Ui.tr("查看回复", "View response"); clicked => { root.details = !root.details; } }
+                                if root.details: Text { text: Ui.output; color: AppTheme.text; wrap: word-wrap; }
+                            }
+                            }
+                            Rectangle { height: 1px; background: AppTheme.border; }
+                            HorizontalLayout {
+                                padding: 8px; spacing: 8px;
+                                ActionButton { text: Ui.paused ? Ui.tr("恢复", "Resume") : Ui.tr("暂停", "Pause"); flat: true; icon: @image-url("assets/pause.svg"); clicked => { Ui.pause(); } }
+                                ActionButton { text: Ui.tr("断开连接", "Disconnect"); flat: true; icon: @image-url("assets/disconnect.svg"); danger: true; clicked => { Ui.disconnect(); } }
+                            }
+                        }
+                    }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 0px; spacing: 0px;
+                            SectionTitle { text: Ui.tr("本地模型", "Local models"); }
+                            for model in Ui.models: HorizontalLayout {
+                                padding: 16px; spacing: 12px;
+                                Text { text: model.name; color: AppTheme.text; horizontal-stretch: 1; wrap: word-wrap; }
+                                StatusBadge { text: model.state; }
+                            }
+                        }
+                    }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 0px; spacing: 0px;
+                            SectionTitle { text: Ui.tr("活动日志", "Activity log") + " · " + Ui.logs.length; }
+                            ActionButton { text: root.log-details ? Ui.tr("隐藏事件详情", "Hide event details") : Ui.tr("事件详情", "Event details"); flat: true; clicked => { root.log-details = !root.log-details; } }
+                            if Ui.logs.length == 0: Text { text: Ui.tr("暂无活动", "No activity yet"); color: AppTheme.muted; }
+                            ScrollView {
+                                height: 280px;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding: 16px; spacing: 16px;
+                                    for log in Ui.logs: VerticalLayout {
+        alignment: start;
+                                        spacing: 4px;
+                                        Text { text: log.time + "  " + log.message; color: AppTheme.text; wrap: word-wrap; }
+                                        if root.log-details: Text { text: log.detail; color: AppTheme.muted; font-size: 11px; wrap: word-wrap; }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-
-                if root.remote-connected : StatusBadge {
-                    text: "已连接";
-                    state: "connected";
-                }
-            }
-
-            IconButton {
-                icon: root.listening-enabled ? "⏸" : "▶";
-                tooltip: "切换监听";
-                clicked => { root.toggle-listening(); }
-            }
-
-            IconButton {
-                icon: "⚙";
-                tooltip: "设置";
-                clicked => { root.open-settings(); }
-            }
-        }
-
-        // 转写区
-        if root.transcription != "" : Rectangle {
-            height: 26px;
-            background: Palette.alternate-background;
-            border-radius: 8px;
-
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 12px;
-                alignment: start;
-
-                Text {
-                    text: "🎙  " + root.transcription;
-                    font-size: AppTheme.base-font - 2px;
-                    color: Palette.foreground;
-                    overflow: elide;
-                    vertical-alignment: center;
-                }
-            }
-        }
-
-        // AI 回答区
-        Rectangle {
-            vertical-stretch: 1;
-            background: Palette.control-background;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Palette.border;
-
-            VerticalLayout {
-                padding: 14px;
-                spacing: 8px;
-
-                if root.ai-response == "" && root.action-steps == "" : Text {
-                    text: root.listening-enabled ? "等待语音指令..." : "监听已暂停";
-                    font-size: AppTheme.base-font - 2px;
-                    color: Palette.foreground.transparentize(0.45);
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    vertical-stretch: 1;
-                }
-
-                if root.ai-response != "" : Text {
-                    text: root.ai-response;
-                    font-size: AppTheme.base-font - 2px;
-                    color: Palette.foreground;
-                    wrap: word-wrap;
-                    overflow: elide;
-                }
-
-                if root.action-steps != "" : Text {
-                    text: root.action-steps;
-                    font-size: AppTheme.base-font - 4px;
-                    color: Palette.accent-background;
-                    wrap: word-wrap;
-                    overflow: elide;
-                }
-            }
-        }
-
-        // 确认对话框
-        if root.show-confirmation : Rectangle {
-            height: 44px;
-            background: Palette.accent-background.transparentize(0.92);
-            border-radius: 10px;
-            border-width: 1px;
-            border-color: Palette.accent-background;
-
-            HorizontalLayout {
-                padding-left: 12px;
-                padding-right: 8px;
-                spacing: 8px;
-                alignment: center;
-
-                Text {
-                    text: "⚠  " + root.confirmation-text;
-                    font-size: AppTheme.base-font - 2px;
-                    color: Palette.foreground;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                    vertical-alignment: center;
-                }
-
-                ActionButton {
-                    text: "确认执行";
-                    primary: true;
-                    compact: true;
-                    clicked => { root.confirm-action(); }
-                }
-
-                ActionButton {
-                    text: "取消";
-                    compact: true;
-                    clicked => { root.cancel-action(); }
-                }
-            }
-        }
-
-        // 底部信息栏
-        HorizontalLayout {
-            spacing: 8px;
-            height: 24px;
-            alignment: space-between;
-
-            Text {
-                text: root.capability-text;
-                font-size: AppTheme.base-font - 4px;
-                color: Palette.foreground.transparentize(0.5);
-                vertical-alignment: center;
-            }
-
-            Text {
-                text: "Token: " + root.session-tokens;
-                font-size: AppTheme.base-font - 4px;
-                color: Palette.foreground.transparentize(0.35);
-                vertical-alignment: center;
             }
         }
     }

@@ -1,273 +1,151 @@
-import { LineEdit, Button, CheckBox, ScrollView, Palette } from "std-widgets.slint";
-import { AppTheme, ActionButton, IconButton } from "widgets.slint";
-
-// 辅助组件（必须在被使用前定义）
-component SettingsGroup inherits Rectangle {
-    in property <string> title;
-    height: 24px;
-
-    Text {
-        text: root.title;
-        font-size: 15px;
-        font-weight: 700;
-        color: Palette.foreground;
-        y: 4px;
-    }
-}
-
-component SettingsField inherits VerticalLayout {
-    in property <string> label;
-    spacing: 4px;
-
-    Text {
-        text: root.label;
-        font-size: 12px;
-        color: Palette.foreground.transparentize(0.45);
-    }
-
-    @children
-}
-
+import { LineEdit, ComboBox, Switch, ScrollView } from "std-widgets.slint";
+import { Ui } from "state.slint";
+import { AppTheme, ActionButton, Panel, SectionTitle, Field } from "widgets.slint";
 export component SettingsPage inherits Rectangle {
-    in property <string> provider: "";
-    in property <string> api-key: "";
-    in property <string> api-url: "";
-    in property <string> model: "";
-    in property <string> max-tokens-str: "4000";
-    in property <bool> auto-speak: true;
-    in property <bool> show-api-key: false;
-    in property <bool> is-busy: false;
-    in property <string> config-path: "";
-    in property <string> remote-address: "";
-    in property <string> remote-code: "";
-    in property <string> remote-status: "";
-    in property <bool> remote-connected: false;
-    in property <string> remote-pairing-info: "";
-
-    callback provider-changed(string);
-    callback api-key-changed(string);
-    callback api-url-changed(string);
-    callback model-changed(string);
-    callback max-tokens-changed(string);
-    callback auto-speak-changed(bool);
-    callback toggle-api-key-visible();
-    callback save-settings();
-    callback test-connection();
-    callback remote-address-changed(string);
-    callback remote-code-changed(string);
-    callback connect-remote();
-    callback disconnect-remote();
-    callback close-settings();
-
-    background: Palette.background;
-
-    VerticalLayout {
-        padding: 0;
-        spacing: 0;
-
-        // 顶部导航栏
-        HorizontalLayout {
-            padding-left: 16px;
-            padding-right: 16px;
-            padding-top: 12px;
-            padding-bottom: 12px;
-            spacing: 8px;
-            height: 48px;
-            alignment: center;
-
-            IconButton {
-                icon: "←";
-                tooltip: "返回";
-                clicked => { root.close-settings(); }
-            }
-
-            Text {
-                text: "设置";
-                font-size: 18px;
-                font-weight: 700;
-                color: Palette.foreground;
-                horizontal-alignment: center;
-                horizontal-stretch: 1;
-            }
-
-            // 占位保持居中
-            Rectangle { width: 28px; height: 28px; }
-        }
-
-        // 内容区
-        ScrollView {
-            vertical-stretch: 1;
-
-            VerticalLayout {
-                padding: 16px;
-                spacing: 20px;
-
-                // ===== API 配置 =====
-                SettingsGroup { title: "API 配置"; }
-
-                SettingsField {
-                    label: "Provider";
-                    editor := LineEdit {
-                        text: root.provider;
-                        placeholder-text: "openai";
-                        edited(text) => { root.provider-changed(text); }
-                    }
-                }
-
-                SettingsField {
-                    label: "API Key";
-                    HorizontalLayout {
-                        spacing: 8px;
-                        LineEdit {
-                            text: root.api-key;
-                            placeholder-text: "sk-...";
-                            input-type: root.show-api-key ? InputType.text : InputType.password;
-                            edited(text) => { root.api-key-changed(text); }
-                            horizontal-stretch: 1;
-                        }
-                        ActionButton {
-                            text: root.show-api-key ? "隐藏" : "显示";
-                            compact: true;
-                            clicked => { root.toggle-api-key-visible(); }
-                        }
-                    }
-                }
-
-                SettingsField {
-                    label: "Base URL";
-                    LineEdit {
-                        text: root.api-url;
-                        placeholder-text: "https://api.openai.com/v1";
-                        edited(text) => { root.api-url-changed(text); }
-                    }
-                }
-
-                SettingsField {
-                    label: "Model";
-                    LineEdit {
-                        text: root.model;
-                        placeholder-text: "gpt-4o";
-                        edited(text) => { root.model-changed(text); }
-                    }
-                }
-
-                SettingsField {
-                    label: "Max Tokens";
-                    LineEdit {
-                        text: root.max-tokens-str;
-                        placeholder-text: "4000";
-                        edited(text) => { root.max-tokens-changed(text); }
-                    }
-                }
-
-                // ===== 界面设置 =====
-                SettingsGroup { title: "界面"; }
-
-                HorizontalLayout {
-                    spacing: 8px;
+    background: AppTheme.background;
+    ScrollView {
+        width: parent.width; height: parent.height;
+        VerticalLayout {
+            alignment: start;
+            padding: root.width < 760px ? 24px : 40px; spacing: 24px;
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
                     alignment: start;
-                    CheckBox {
-                        checked: root.auto-speak;
-                        text: "自动语音播报";
-                        toggled => { root.auto-speak-changed(self.checked); }
+                    width: min(root.width - 48px, 680px); spacing: 28px;
+                    Text { text: Ui.tr("设置", "Settings"); font-size: 32px; font-weight: 700; color: AppTheme.text; }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 24px; spacing: 20px;
+                            SectionTitle { text: Ui.tr("API 配置", "API configuration"); icon: @image-url("assets/language.svg"); padding: 0px; }
+                            Field {
+                                label: Ui.tr("服务商", "Provider");
+                                GridLayout {
+                                    spacing: 6px;
+                                    ActionButton { row: 0; col: 0; text: "Anthropic"; selected: Ui.provider == "anthropic"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("anthropic"); } }
+                                    ActionButton { row: 0; col: 1; text: "OpenAI"; selected: Ui.provider == "openai"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("openai"); } }
+                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 0 : 2; text: "Google"; selected: Ui.provider == "google"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("google"); } }
+                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 1 : 3; text: Ui.tr("其他", "Other"); selected: Ui.provider != "anthropic" && Ui.provider != "openai" && Ui.provider != "google"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("custom"); } }
+                                }
+                            }
+                            if Ui.provider != "anthropic" && Ui.provider != "openai" && Ui.provider != "google": Field {
+                                label: Ui.tr("服务商标识", "Provider ID");
+                                LineEdit { accessible-label: Ui.tr("服务商标识", "Provider ID"); text <=> Ui.provider; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                            }
+                            Field {
+                                label: Ui.tr("接口协议", "API protocol");
+                                ComboBox { accessible-label: Ui.tr("接口协议", "API protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.wire-api; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                            }
+                            Field {
+                                label: "API Key";
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    LineEdit { accessible-label: "API Key"; text <=> Ui.api-key; input-type: Ui.reveal-key ? InputType.text : InputType.password; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                    ActionButton { text: Ui.reveal-key ? Ui.tr("隐藏", "Hide") : Ui.tr("显示", "Show"); clicked => { Ui.reveal(); } }
+                                }
+                                Text { text: Ui.tr("密钥仅存于系统密钥库，不写入明文配置文件。", "Keys are stored in the system credential store, not in the configuration file."); color: AppTheme.muted; font-size: 12px; wrap: word-wrap; }
+                            }
+                            Field {
+                                label: Ui.tr("API 地址", "API endpoint");
+                                LineEdit { accessible-label: Ui.tr("API 地址", "API endpoint"); text <=> Ui.api-url; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                            }
+                            Field {
+                                label: Ui.tr("模型", "Model");
+                                ComboBox {
+                                    accessible-label: Ui.tr("预设模型", "Model preset");
+                                    model: Ui.provider == "openai" ? ["gpt-4o", "gpt-4o-mini", Ui.tr("自定义", "Custom")]
+                                        : Ui.provider == "anthropic" ? ["claude-sonnet-4-20250514", Ui.tr("自定义", "Custom")]
+                                        : Ui.provider == "google" ? ["gemini-2.5-flash", Ui.tr("自定义", "Custom")] : [Ui.tr("自定义", "Custom")];
+                                    current-value: Ui.model;
+                                    enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt;
+                                    selected(value) => { if value != Ui.tr("自定义", "Custom") { Ui.model = value; Ui.edited(); } }
+                                }
+                                LineEdit { accessible-label: Ui.tr("模型标识", "Model ID"); text <=> Ui.model; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                            }
+                            Field {
+                                label: Ui.tr("请求超时（秒）", "Request timeout (seconds)");
+                                LineEdit { accessible-label: Ui.tr("请求超时（秒）", "Request timeout in seconds"); text <=> Ui.timeout; input-type: InputType.number; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                            }
+                            ActionButton { text: Ui.advanced ? Ui.tr("收起高级选项", "Hide advanced options") : Ui.tr("高级选项", "Advanced options"); clicked => { Ui.advanced = !Ui.advanced; } }
+                            if Ui.advanced: Field {
+                                label: Ui.tr("最大输出 Token", "Maximum output tokens");
+                                LineEdit { accessible-label: Ui.tr("最大输出 Token", "Maximum output tokens"); text <=> Ui.max-tokens; input-type: InputType.number; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                            }
+                            if Ui.advanced: VerticalLayout {
+                                alignment: start; spacing: 16px;
+                                Switch { text: Ui.tr("备用模型", "Backup model"); checked <=> Ui.backup-enabled; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                                if Ui.backup-enabled: VerticalLayout {
+                                    alignment: start; spacing: 12px;
+                                    ComboBox { accessible-label: Ui.tr("备用接口协议", "Backup protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.backup-wire-api; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                                    Field { label: Ui.tr("备用 API 地址", "Backup endpoint"); LineEdit { accessible-label: Ui.tr("备用 API 地址", "Backup endpoint"); text <=> Ui.backup-url;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用 API Key", "Backup API key"); LineEdit { accessible-label: Ui.tr("备用 API Key", "Backup API key"); text <=> Ui.backup-key; input-type: InputType.password; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用模型", "Backup model"); LineEdit { accessible-label: Ui.tr("备用模型", "Backup model"); text <=> Ui.backup-model;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用超时（秒）", "Backup timeout"); LineEdit { accessible-label: Ui.tr("备用超时（秒）", "Backup timeout"); text <=> Ui.backup-timeout;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Switch { text: Ui.tr("允许自动切换备用端点", "Allow automatic failover"); checked <=> Ui.backup-authorized; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                                }
+                            }
+                            ActionButton { text: Ui.tr("测试模型能力", "Test capabilities"); enabled: !Ui.busy && Ui.ready; clicked => { Ui.test(); } }
+                            if Ui.testing: ActionButton { text: Ui.tr("取消测试", "Cancel test"); clicked => { Ui.cancel-test(); } }
+                            if Ui.test-report != "": Text { text: Ui.test-report; color: AppTheme.text; wrap: word-wrap; }
+
+                        }
                     }
-                }
-
-                // ===== 局域网桌面端 =====
-                SettingsGroup { title: "局域网桌面端"; }
-
-                Text {
-                    text: root.remote-status;
-                    font-size: 13px;
-                    color: root.remote-connected ? #6b4c9a : Palette.foreground.transparentize(0.45);
-                    wrap: word-wrap;
-                }
-
-                if root.remote-pairing-info != "" : Text {
-                    text: root.remote-pairing-info;
-                    font-size: 11px;
-                    color: Palette.foreground.transparentize(0.5);
-                    wrap: word-wrap;
-                }
-
-                SettingsField {
-                    label: "桌面地址";
-                    LineEdit {
-                        text: root.remote-address;
-                        placeholder-text: "ws://192.168.1.10:37654";
-                        edited(text) => { root.remote-address-changed(text); }
+                    Panel {
+                        VerticalLayout {
+                            padding: 24px; spacing: 16px; alignment: start;
+                            SectionTitle { text: Ui.tr("云端语音识别", "Cloud transcription"); padding: 0px; }
+                            Switch { text: Ui.tr("启用云端转写", "Enable cloud transcription"); checked <=> Ui.asr-enabled; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                            if Ui.asr-enabled: VerticalLayout {
+                                alignment: start; spacing: 12px;
+                                Field { label: Ui.tr("转写 API 地址", "Transcription endpoint"); LineEdit { accessible-label: Ui.tr("转写 API 地址", "Transcription endpoint"); text <=> Ui.asr-url;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写 API Key", "Transcription API key"); LineEdit { accessible-label: Ui.tr("转写 API Key", "Transcription API key"); text <=> Ui.asr-key; input-type: InputType.password; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写模型", "Transcription model"); LineEdit { accessible-label: Ui.tr("转写模型", "Transcription model"); text <=> Ui.asr-model;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写超时（秒）", "Transcription timeout"); LineEdit { accessible-label: Ui.tr("转写超时（秒）", "Transcription timeout"); text <=> Ui.asr-timeout;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                            }
+                        }
                     }
-                }
-
-                SettingsField {
-                    label: "配对码";
-                    LineEdit {
-                        text: root.remote-code;
-                        placeholder-text: "123456";
-                        edited(text) => { root.remote-code-changed(text); }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 24px; spacing: 24px;
+                            SectionTitle { text: Ui.tr("辅助功能", "Accessibility"); icon: @image-url("assets/accessibility.svg"); padding: 0px; }
+                            Field {
+                                label: Ui.tr("界面语言", "Interface language");
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionButton { text: "中文"; selected: !Ui.english; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = false; Ui.edited(); } }
+                                    ActionButton { text: "English"; selected: Ui.english; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = true; Ui.edited(); } }
+                                }
+                            }
+                            Field {
+                                label: Ui.tr("语音播报结果", "Speak responses");
+                                Switch { accessible-label: Ui.tr("语音播报结果", "Speak responses"); checked <=> Ui.auto-speak; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
+                            }
+                            Field {
+                                label: Ui.tr("高对比度模式", "High contrast");
+                                Switch { accessible-label: Ui.tr("高对比度模式", "High contrast"); checked <=> Ui.high-contrast; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
+                            }
+                        }
                     }
-                }
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    ActionButton {
-                        text: "连接桌面";
-                        enabled: !root.is-busy;
-                        clicked => { root.connect-remote(); }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 24px; spacing: 20px;
+                            SectionTitle { text: Ui.tr("关于", "About"); icon: @image-url("assets/info.svg"); padding: 0px; }
+                            for row in [
+                                {label: Ui.tr("版本", "Version"), value: Ui.version},
+                                {label: Ui.tr("构建日期", "Build date"), value: Ui.build-date},
+                                {label: Ui.tr("开源协议", "License"), value: "MIT License"}
+                            ]: HorizontalLayout {
+                                Text { text: row.label; color: AppTheme.muted; horizontal-stretch: 1; }
+                                Text { text: row.value; color: AppTheme.text; }
+                            }
+                        }
                     }
-                    ActionButton {
-                        text: "断开";
-                        enabled: root.remote-connected;
-                        clicked => { root.disconnect-remote(); }
-                    }
+                    if Ui.feedback != "": Text { text: Ui.feedback; color: Ui.feedback-error ? AppTheme.danger : AppTheme.muted; wrap: word-wrap; }
+                    ActionButton { text: Ui.busy ? Ui.tr("处理中…", "Working…") : Ui.tr("保存设置", "Save settings"); icon: @image-url("assets/save.svg"); primary: true; enabled: !Ui.busy && Ui.ready; clicked => { Ui.save(); } }
                 }
-
-                // ===== 关于 =====
-                SettingsGroup { title: "关于"; }
-
-                if root.config-path != "" : Text {
-                    text: root.config-path;
-                    font-size: 11px;
-                    color: Palette.foreground.transparentize(0.45);
-                    wrap: word-wrap;
-                }
-
-                Text {
-                    text: "Ale, My Eyes! v0.1.0";
-                    font-size: 12px;
-                    color: Palette.foreground.transparentize(0.4);
-                }
-            }
-        }
-
-        // 分隔线
-        Rectangle {
-            height: 1px;
-            background: Palette.border;
-        }
-
-        // 底部操作栏
-        HorizontalLayout {
-            padding-left: 16px;
-            padding-right: 16px;
-            padding-top: 12px;
-            padding-bottom: 12px;
-            spacing: 8px;
-            height: 56px;
-
-            ActionButton {
-                text: "测试连接";
-                enabled: !root.is-busy;
-                clicked => { root.test-connection(); }
-            }
-
-            Rectangle { horizontal-stretch: 1; }
-
-            ActionButton {
-                text: "保存";
-                primary: true;
-                enabled: !root.is-busy;
-                clicked => { root.save-settings(); }
             }
         }
     }

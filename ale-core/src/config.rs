@@ -1,13 +1,41 @@
 use crate::secret_store::{SecretStore, SystemSecretStore};
 use crate::{AleError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
 
 /// 云端API配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloudApiConfig {
+    pub wire_api: crate::model_api::WireApi,
     pub provider: String,
     #[serde(skip_serializing, default)]
     pub api_key: String,
@@ -20,6 +48,7 @@ pub struct CloudApiConfig {
 impl Default for CloudApiConfig {
     fn default() -> Self {
         Self {
+            wire_api: Default::default(),
             provider: "openai".to_string(),
             api_key: String::new(),
             api_url: "https://api.openai.com/v1".to_string(),
@@ -208,9 +237,28 @@ impl Default for UiConfig {
 }
 
 /// 应用配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TranscriptionConfig {
+    pub enabled: bool,
+    pub endpoint: CloudApiConfig,
+}
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: CloudApiConfig {
+                model: "whisper-1".into(),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
+    pub transcription: TranscriptionConfig,
     pub cloud_api: CloudApiConfig,
     pub remote_routing: RemoteRoutingConfig,
     pub model_scheduler: ModelSchedulerConfig,
@@ -250,50 +298,52 @@ impl ConfigManager {
         }
 
         let content = std::fs::read_to_string(&self.config_path)?;
-        self.config = serde_json::from_str(&content)?;
+        let legacy_transcription = serde_json::from_str::<serde_json::Value>(&content)?
+            .get("transcription")
+            .is_none();
+        let mut config: AppConfig = serde_json::from_str(&content)?;
         #[cfg(not(feature = "local-inference"))]
-        if !self.config.model_scheduler.enabled && self.config.inference.mode != "cloud" {
-            tracing::warn!(
-                "Inference mode '{}' requires the experimental local-inference feature; using cloud",
-                self.config.inference.mode
-            );
-            self.config.inference.mode = "cloud".to_string();
-            self.config.inference.prefer_cloud = true;
-            self.config.inference.fallback_to_local = false;
+        if !config.model_scheduler.enabled && config.inference.mode != "cloud" {
+            config.inference.mode = "cloud".to_string();
+            config.inference.prefer_cloud = true;
+            config.inference.fallback_to_local = false;
         }
-        ConfigValidator::validate_cloud_api_transport(&self.config.cloud_api.api_url)?;
-        if self.config.cloud_api.api_key.trim().is_empty() {
-            self.config.cloud_api.api_key = self.secret_store.get_api_key()?.unwrap_or_default();
-        } else {
-            // Migrate legacy plaintext keys before rewriting the configuration.
-            self.secret_store
-                .set_api_key(&self.config.cloud_api.api_key)?;
+        if config.cloud_api.api_key.trim().is_empty() {
+            config.cloud_api.api_key = self.secret_store.get_api_key()?.unwrap_or_default();
         }
-        if let Some(backup) = self.config.remote_routing.backup.as_mut() {
-            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
+        if let Some(backup) = config.remote_routing.backup.as_mut() {
             if backup.api_key.trim().is_empty() {
                 backup.api_key = self.secret_store.get_backup_api_key()?.unwrap_or_default();
-            } else {
-                self.secret_store.set_backup_api_key(&backup.api_key)?;
             }
         }
-        self.save()?;
-        Ok(())
+        if legacy_transcription {
+            config.transcription = TranscriptionConfig {
+                enabled: !config.cloud_api.api_key.is_empty(),
+                endpoint: CloudApiConfig {
+                    model: "whisper-1".into(),
+                    wire_api: Default::default(),
+                    ..config.cloud_api.clone()
+                },
+            };
+        } else if config.transcription.endpoint.api_key.is_empty() {
+            config.transcription.endpoint.api_key = self
+                .secret_store
+                .get_transcription_api_key()?
+                .unwrap_or_default();
+        }
+        self.update_config(config)
     }
 
     /// 保存配置
     pub fn save(&self) -> Result<()> {
-        ConfigValidator::validate_cloud_api_transport(&self.config.cloud_api.api_url)?;
-        if let Some(backup) = &self.config.remote_routing.backup {
-            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
-        }
+        ConfigValidator::validate_model_endpoints(&self.config)?;
         // 确保目录存在
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let content = serde_json::to_string_pretty(&self.config)?;
-        std::fs::write(&self.config_path, content)?;
+        atomic_config_write(&self.config_path, content.as_bytes())?;
         Ok(())
     }
 
@@ -304,23 +354,55 @@ impl ConfigManager {
 
     /// 更新配置
     pub fn update_config(&mut self, config: AppConfig) -> Result<()> {
-        ConfigValidator::validate_cloud_api_transport(&config.cloud_api.api_url)?;
-        if let Some(backup) = &config.remote_routing.backup {
-            ConfigValidator::validate_cloud_api_transport(&backup.api_url)?;
-        }
-        if config.cloud_api.api_key.trim().is_empty() {
-            self.secret_store.delete_api_key()?;
-        } else {
-            self.secret_store.set_api_key(&config.cloud_api.api_key)?;
-        }
-        match config.remote_routing.backup.as_ref() {
-            Some(backup) if !backup.api_key.trim().is_empty() => {
-                self.secret_store.set_backup_api_key(&backup.api_key)?;
+        ConfigValidator::validate_model_endpoints(&config)?;
+        let old_keys = (
+            self.secret_store.get_api_key()?,
+            self.secret_store.get_backup_api_key()?,
+            self.secret_store.get_transcription_api_key()?,
+        );
+        let result = (|| -> Result<()> {
+            if config.cloud_api.api_key.trim().is_empty() {
+                self.secret_store.delete_api_key()?;
+            } else {
+                self.secret_store.set_api_key(&config.cloud_api.api_key)?;
             }
-            _ => self.secret_store.delete_backup_api_key()?,
+            match config.remote_routing.backup.as_ref() {
+                Some(backup) if !backup.api_key.trim().is_empty() => {
+                    self.secret_store.set_backup_api_key(&backup.api_key)?;
+                }
+                _ => self.secret_store.delete_backup_api_key()?,
+            }
+            if config.transcription.endpoint.api_key.is_empty() {
+                self.secret_store.delete_transcription_api_key()?;
+            } else {
+                self.secret_store
+                    .set_transcription_api_key(&config.transcription.endpoint.api_key)?;
+            }
+            atomic_config_write(&self.config_path, &serde_json::to_vec_pretty(&config)?)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let rollback = [
+                match old_keys.0 {
+                    Some(key) => self.secret_store.set_api_key(&key),
+                    None => self.secret_store.delete_api_key(),
+                },
+                match old_keys.1 {
+                    Some(key) => self.secret_store.set_backup_api_key(&key),
+                    None => self.secret_store.delete_backup_api_key(),
+                },
+                match old_keys.2 {
+                    Some(key) => self.secret_store.set_transcription_api_key(&key),
+                    None => self.secret_store.delete_transcription_api_key(),
+                },
+            ];
+            if rollback.iter().any(Result::is_err) {
+                return Err(AleError::ConfigError("Save failed; credential rollback also failed. Re-enter credentials before retrying.".into()));
+            }
+            return Err(error);
         }
         self.config = config;
-        self.save()
+        Ok(())
     }
 
     /// 更新云端API配置
@@ -485,9 +567,63 @@ impl ConfigMigrator {
 pub struct ConfigValidator;
 
 impl ConfigValidator {
+    pub fn validate_model_endpoints(config: &AppConfig) -> Result<()> {
+        for endpoint in std::iter::once(&config.cloud_api)
+            .chain(config.remote_routing.backup.iter())
+            .chain(std::iter::once(&config.transcription.endpoint))
+        {
+            Self::validate_cloud_api_transport(&endpoint.api_url)?;
+            if endpoint.timeout == 0 || endpoint.timeout > 80 || endpoint.max_tokens == 0 {
+                return Err(AleError::ConfigError(
+                    "Timeout must be 1-80 seconds and token limit must be positive".into(),
+                ));
+            }
+        }
+        if !config.cloud_api.api_key.trim().is_empty() {
+            Self::validate_cloud_api(&config.cloud_api)?;
+        }
+        if config.remote_routing.backup_enabled {
+            if !config.remote_routing.backup_pre_authorized {
+                return Err(AleError::ConfigError(
+                    "Backup endpoint requires explicit authorization".into(),
+                ));
+            }
+            Self::validate_cloud_api(
+                config
+                    .remote_routing
+                    .backup
+                    .as_ref()
+                    .ok_or_else(|| AleError::ConfigError("Backup endpoint is required".into()))?,
+            )?;
+        }
+        if config.transcription.enabled {
+            Self::validate_cloud_api(&config.transcription.endpoint)?;
+            if !matches!(
+                config.transcription.endpoint.wire_api,
+                crate::model_api::WireApi::OpenaiChatCompletions
+                    | crate::model_api::WireApi::OpenaiResponses
+            ) {
+                return Err(AleError::ConfigError(
+                    "Transcription requires an OpenAI-compatible endpoint".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_cloud_api_transport(api_url: &str) -> Result<()> {
         let parsed = url::Url::parse(api_url)
             .map_err(|error| AleError::ConfigError(format!("Invalid API URL: {error}")))?;
+        if parsed.host().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AleError::ConfigError(
+                "Use a base API URL without credentials, query parameters, or fragment".into(),
+            ));
+        }
         match parsed.scheme() {
             "https" => Ok(()),
             "http" => {
@@ -528,9 +664,9 @@ impl ConfigValidator {
             return Err(AleError::ConfigError("Model name is required".to_string()));
         }
 
-        if config.timeout == 0 {
+        if config.timeout == 0 || config.timeout > 80 {
             return Err(AleError::ConfigError(
-                "Timeout must be greater than 0".to_string(),
+                "Timeout must be between 1 and 80 seconds".to_string(),
             ));
         }
 
@@ -643,9 +779,35 @@ mod tests {
     use std::sync::Mutex;
 
     #[derive(Default)]
-    struct TestSecretStore(Mutex<Option<String>>);
+    struct TestSecretStore(
+        Mutex<Option<String>>,
+        Mutex<Option<String>>,
+        Mutex<Option<String>>,
+    );
 
     impl SecretStore for TestSecretStore {
+        fn get_backup_api_key(&self) -> Result<Option<String>> {
+            Ok(self.1.lock().unwrap().clone())
+        }
+        fn set_backup_api_key(&self, key: &str) -> Result<()> {
+            *self.1.lock().unwrap() = Some(key.into());
+            Ok(())
+        }
+        fn delete_backup_api_key(&self) -> Result<()> {
+            *self.1.lock().unwrap() = None;
+            Ok(())
+        }
+        fn get_transcription_api_key(&self) -> Result<Option<String>> {
+            Ok(self.2.lock().unwrap().clone())
+        }
+        fn set_transcription_api_key(&self, key: &str) -> Result<()> {
+            *self.2.lock().unwrap() = Some(key.into());
+            Ok(())
+        }
+        fn delete_transcription_api_key(&self) -> Result<()> {
+            *self.2.lock().unwrap() = None;
+            Ok(())
+        }
         fn get_api_key(&self) -> Result<Option<String>> {
             Ok(self.0.lock().unwrap().clone())
         }
@@ -672,6 +834,117 @@ mod tests {
         assert_eq!(config.ui.language, "zh-CN");
         assert_eq!(config.ui.font_size, 16);
         assert!(!config.ui.high_contrast);
+    }
+
+    #[test]
+    fn transcription_migrates_once_and_credentials_remain_independent() {
+        let dir = std::env::temp_dir().join(format!("ale-migration-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"cloud_api":{"api_key":"legacy-key","api_url":"https://example.test/v1","model":"vision"}}"#).unwrap();
+        let store = Arc::new(TestSecretStore::default());
+        let mut manager = ConfigManager::with_secret_store(&path, store.clone());
+        manager.load().unwrap();
+        assert!(manager.config().transcription.enabled);
+        assert_eq!(manager.config().transcription.endpoint.model, "whisper-1");
+        assert_eq!(
+            store.get_transcription_api_key().unwrap().as_deref(),
+            Some("legacy-key")
+        );
+        let mut updated = manager.config().clone();
+        updated.cloud_api.api_key = "primary-secret-unique".into();
+        updated.cloud_api.api_url = "https://new-primary.test/v1".into();
+        updated.cloud_api.wire_api = crate::model_api::WireApi::AnthropicMessages;
+        updated.remote_routing.backup = Some(CloudApiConfig {
+            api_key: "backup-key".into(),
+            ..Default::default()
+        });
+        manager.update_config(updated).unwrap();
+        let mut reloaded = ConfigManager::with_secret_store(&path, store.clone());
+        reloaded.load().unwrap();
+        assert_eq!(reloaded.config().cloud_api.api_key, "primary-secret-unique");
+        assert_eq!(
+            reloaded.config().transcription.endpoint.api_key,
+            "legacy-key"
+        );
+        assert_eq!(
+            reloaded.config().transcription.endpoint.api_url,
+            "https://example.test/v1"
+        );
+        assert_eq!(
+            reloaded
+                .config()
+                .remote_routing
+                .backup
+                .as_ref()
+                .unwrap()
+                .api_key,
+            "backup-key"
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        for key in ["legacy-key", "primary-secret-unique", "backup-key"] {
+            assert!(!contents.contains(key));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_atomic_save_rolls_back_all_credentials_and_memory() {
+        let dir = std::env::temp_dir().join(format!("ale-rollback-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.json");
+        let store = Arc::new(TestSecretStore::default());
+        let mut manager = ConfigManager::with_secret_store(&path, store.clone());
+        let mut original = AppConfig::default();
+        original.cloud_api.api_key = "primary-old".into();
+        original.remote_routing.backup = Some(CloudApiConfig {
+            api_key: "backup-old".into(),
+            ..Default::default()
+        });
+        original.transcription.endpoint.api_key = "asr-old".into();
+        manager.update_config(original.clone()).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        manager.config_path = dir.join("blocked");
+        std::fs::create_dir_all(&manager.config_path).unwrap();
+        let mut changed = original;
+        changed.cloud_api.api_key = "primary-new".into();
+        changed.remote_routing.backup.as_mut().unwrap().api_key = "backup-new".into();
+        changed.transcription.endpoint.api_key = "asr-new".into();
+        assert!(manager.update_config(changed).is_err());
+        assert_eq!(manager.config().cloud_api.api_key, "primary-old");
+        assert_eq!(store.get_api_key().unwrap().as_deref(), Some("primary-old"));
+        assert_eq!(
+            store.get_backup_api_key().unwrap().as_deref(),
+            Some("backup-old")
+        );
+        assert_eq!(
+            store.get_transcription_api_key().unwrap().as_deref(),
+            Some("asr-old")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), saved);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            2,
+            "temporary file leaked"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_endpoint_policy_requires_valid_timeouts_and_backup_consent() {
+        let mut config = AppConfig::default();
+        assert!(!config.transcription.enabled);
+        assert!(!config.remote_routing.backup_enabled);
+        config.cloud_api.timeout = 81;
+        assert!(ConfigValidator::validate_model_endpoints(&config).is_err());
+        config.cloud_api.timeout = 60;
+        config.remote_routing.backup_enabled = true;
+        config.remote_routing.backup = Some(CloudApiConfig {
+            api_key: "test".into(),
+            ..Default::default()
+        });
+        assert!(ConfigValidator::validate_model_endpoints(&config).is_err());
+        config.remote_routing.backup_pre_authorized = true;
+        assert!(ConfigValidator::validate_model_endpoints(&config).is_ok());
     }
 
     #[test]

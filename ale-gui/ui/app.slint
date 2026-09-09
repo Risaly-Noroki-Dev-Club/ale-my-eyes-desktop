@@ -1,160 +1,84 @@
+import { Palette, ScrollView } from "std-widgets.slint";
+import "assets/Roboto.ttf";
+import "assets/RobotoSlab.ttf";
+import "assets/JetBrainsMono.ttf";
+import { Ui, DeviceRow, ModelRow, LogRow } from "state.slint";
+import { AppTheme, ActionButton, Panel } from "widgets.slint";
 import { PairingScreen } from "pairing.slint";
 import { MainScreen } from "main-screen.slint";
 import { SettingsPage } from "settings-page.slint";
-import { AppTheme } from "widgets.slint";
-import { Palette, StyleMetrics } from "std-widgets.slint";
-
-export { AppTheme }
-
+export { Ui, AppTheme, DeviceRow, ModelRow, LogRow, Palette }
 export component AppWindow inherits Window {
     title: "Ale, My Eyes!";
-    preferred-width: 420px;
-    preferred-height: 540px;
-    background: Palette.background;
-
-    // 页面路由: "pairing" | "main" | "settings"
-    in-out property <string> current-page: "pairing";
-    out property <bool> is-dark-mode: StyleMetrics.dark-color-scheme;
-    in-out property <image> pairing-qr-image;
-
-    // ===== 配对页属性 =====
-    in-out property <string> pairing-code: "";
-    in-out property <int> pairing-timer-sec: 120;
-
-    // ===== 主界面 + 通用属性 =====
-    in-out property <string> status-text: "初始化中...";
-    in-out property <string> status-type: "info";
-    in-out property <string> vad-state: "silent";
-    in-out property <string> transcription: "";
-    in-out property <string> ai-response: "";
-    in-out property <string> action-steps: "";
-    in-out property <bool> show-confirmation: false;
-    in-out property <string> confirmation-text: "";
-    in-out property <bool> is-busy: false;
-    in-out property <bool> engine-ready: false;
-    in-out property <bool> listening-enabled: true;
-    in-out property <string> capability-text: "";
-    in-out property <int> session-tokens: 0;
-    in-out property <string> text-input: "";
-
-    // ===== 设置页属性 =====
-    in-out property <string> provider: "";
-    in-out property <string> api-key: "";
-    in-out property <string> api-url: "";
-    in-out property <string> model: "";
-    in-out property <string> max-tokens-str: "4000";
-    in-out property <bool> auto-speak: true;
-    in-out property <bool> show-api-key: false;
-    in-out property <string> config-path: "";
-    in-out property <string> remote-address: "";
-    in-out property <string> remote-code: "";
-    in-out property <string> remote-status: "未连接桌面端";
-    in-out property <bool> remote-connected: false;
-    in-out property <string> remote-pairing-info: "";
-    in-out property <bool> is-mobile: false;
-
-    // ===== 配对页回调 =====
-    callback enter-main();
-    callback retry-pairing();
-
-    // ===== 主界面回调 =====
-    callback text-submitted(string);
-    callback toggle-listening();
-    callback confirm-action();
-    callback cancel-action();
-    callback open-settings();
-
-    // ===== 设置页回调 =====
-    callback close-settings();
-    callback provider-changed(string);
-    callback api-key-changed(string);
-    callback api-url-changed(string);
-    callback model-changed(string);
-    callback max-tokens-changed(string);
-    callback auto-speak-changed(bool);
-    callback toggle-api-key-visible();
-    callback save-settings();
-    callback test-connection();
-    callback remote-address-changed(string);
-    callback remote-code-changed(string);
-    callback connect-remote();
-    callback disconnect-remote();
-
-    init => {
-        AppTheme.is-mobile = root.is-mobile;
+    preferred-width: 1032px; preferred-height: 800px;
+    min-width: 440px; min-height: 640px;
+    background: AppTheme.background;
+    default-font-size: 14px;
+    default-font-family: "Roboto";
+    init => { Ui.compact = root.width < 760px; }
+    changed width => { Ui.compact = root.width < 760px; }
+    in property <string> theme: Ui.theme;
+    changed theme => { Palette.color-scheme = root.theme == "dark" ? ColorScheme.dark : root.theme == "light" ? ColorScheme.light : ColorScheme.unknown; }
+    VerticalLayout {
+        spacing: 0; padding: 0;
+        Rectangle {
+            height: root.width < 760px ? 112px : 64px;
+            background: AppTheme.surface;
+            border-width: 1px; border-color: AppTheme.border;
+            brand := HorizontalLayout {
+                x: 24px; y: 18px; width: 180px; height: 28px; spacing: 10px;
+                Image { source: @image-url("assets/accessibility.svg"); width: 28px; height: 28px; colorize: AppTheme.accent; }
+                Text { text: "Ale-my-Eyes!"; font-size: 16px; font-weight: 700; color: AppTheme.text; vertical-alignment: center; }
+            }
+            HorizontalLayout {
+                x: root.width < 760px ? 16px : 220px;
+                y: root.width < 760px ? 60px : 10px;
+                width: root.width < 760px ? parent.width - 32px : 400px;
+                height: 44px; spacing: 8px;
+                alignment: start;
+                ActionButton { text: Ui.tr("配对", "Pairing"); icon: @image-url("assets/pair.svg"); flat: true; selected: Ui.page == "pairing"; clicked => { Ui.navigate("pairing"); } }
+                ActionButton { text: Ui.tr("工作", "Work"); icon: @image-url("assets/work.svg"); flat: true; selected: Ui.page == "main"; enabled: Ui.connected; clicked => { Ui.navigate("main"); } }
+                ActionButton { text: Ui.tr("设置", "Settings"); icon: @image-url("assets/settings.svg"); flat: true; selected: Ui.page == "settings"; clicked => { Ui.navigate("settings"); } }
+            }
+        }
+        if Ui.page == "pairing": PairingScreen { vertical-stretch: 1; }
+        if Ui.page == "main": MainScreen { vertical-stretch: 1; }
+        if Ui.page == "settings": SettingsPage { vertical-stretch: 1; }
     }
-
-    changed is-mobile => {
-        AppTheme.is-mobile = root.is-mobile;
+    if Ui.leave-prompt: Rectangle {
+        background: #00000088;
+        TouchArea {}
+        Panel {
+            width: min(parent.width - 40px, 420px); height: 224px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            VerticalLayout {
+                alignment: start;
+                padding: 24px; spacing: 16px;
+                Text { text: Ui.tr("保存更改？", "Save changes?"); font-size: 22px; color: AppTheme.text; }
+                Text { text: Ui.tr("设置中有尚未保存的更改。", "Your settings have unsaved changes."); wrap: word-wrap; color: AppTheme.muted; }
+                ActionButton { text: Ui.tr("保存", "Save"); modal-control: true; primary: true; enabled: !Ui.busy; clicked => { Ui.leave(1); } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    ActionButton { text: Ui.tr("放弃", "Discard"); modal-control: true; enabled: !Ui.busy; clicked => { Ui.leave(2); } }
+                    ActionButton { text: Ui.tr("继续编辑", "Keep editing"); modal-control: true; auto-focus: true; clicked => { Ui.leave(0); } }
+                }
+            }
+        }
     }
-
-    // 配对页
-    if root.current-page == "pairing": PairingScreen {
-        pairing-code: root.pairing-code;
-        pairing-timer-sec: root.pairing-timer-sec;
-        remote-connected: root.remote-connected;
-        remote-status: root.remote-status;
-        is-busy: root.is-busy;
-        pairing-qr-image: root.pairing-qr-image;
-
-        enter-main => { root.enter-main(); }
-        retry-pairing => { root.retry-pairing(); }
-    }
-
-    // 主界面
-    if root.current-page == "main": MainScreen {
-        status-text: root.status-text;
-        status-type: root.status-type;
-        vad-state: root.vad-state;
-        transcription: root.transcription;
-        ai-response: root.ai-response;
-        action-steps: root.action-steps;
-        show-confirmation: root.show-confirmation;
-        confirmation-text: root.confirmation-text;
-        is-busy: root.is-busy;
-        engine-ready: root.engine-ready;
-        listening-enabled: root.listening-enabled;
-        capability-text: root.capability-text;
-        session-tokens: root.session-tokens;
-        remote-status: root.remote-status;
-        remote-connected: root.remote-connected;
-
-        toggle-listening => { root.toggle-listening(); }
-        confirm-action => { root.confirm-action(); }
-        cancel-action => { root.cancel-action(); }
-        open-settings => { root.open-settings(); }
-    }
-
-    // 设置页（全屏覆盖）
-    if root.current-page == "settings": SettingsPage {
-        provider: root.provider;
-        api-key: root.api-key;
-        api-url: root.api-url;
-        model: root.model;
-        max-tokens-str: root.max-tokens-str;
-        auto-speak: root.auto-speak;
-        show-api-key: root.show-api-key;
-        is-busy: root.is-busy;
-        config-path: root.config-path;
-        remote-address: root.remote-address;
-        remote-code: root.remote-code;
-        remote-status: root.remote-status;
-        remote-connected: root.remote-connected;
-        remote-pairing-info: root.remote-pairing-info;
-
-        provider-changed(text) => { root.provider-changed(text); }
-        api-key-changed(text) => { root.api-key-changed(text); }
-        api-url-changed(text) => { root.api-url-changed(text); }
-        model-changed(text) => { root.model-changed(text); }
-        max-tokens-changed(text) => { root.max-tokens-changed(text); }
-        auto-speak-changed(val) => { root.auto-speak-changed(val); }
-        toggle-api-key-visible => { root.toggle-api-key-visible(); }
-        save-settings => { root.save-settings(); }
-        test-connection => { root.test-connection(); }
-        remote-address-changed(text) => { root.remote-address-changed(text); }
-        remote-code-changed(text) => { root.remote-code-changed(text); }
-        connect-remote => { root.connect-remote(); }
-        disconnect-remote => { root.disconnect-remote(); }
-        close-settings => { root.close-settings(); }
+    if Ui.test-prompt: Rectangle {
+        background: #00000088;
+        TouchArea {}
+        Panel {
+            width: min(parent.width - 40px, 480px); height: 360px;
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            VerticalLayout {
+                padding: 24px; spacing: 16px; alignment: start;
+                Text { text: Ui.tr("测试模型能力？", "Test model capabilities?"); color: AppTheme.text; font-size: 22px; }
+                Text { text: Ui.tr("将发送内置测试样例，可能产生少量推理费用。", "Built-in samples will be sent. Small inference charges may apply."); wrap: word-wrap; color: AppTheme.text; }
+                ScrollView { height: 100px; VerticalLayout { alignment: start; Text { text: Ui.test-targets; color: AppTheme.muted; wrap: word-wrap; } } }
+                ActionButton { text: Ui.tr("开始完整测试", "Start full test"); modal-control: true; primary: true; clicked => { Ui.run-test(); } }
+                ActionButton { text: Ui.tr("取消", "Cancel"); modal-control: true; auto-focus: true; clicked => { Ui.test-prompt = false; } }
+            }
+        }
     }
 }

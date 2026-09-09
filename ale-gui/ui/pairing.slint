@@ -1,111 +1,89 @@
-import { AppTheme, ActionButton, StatusBadge } from "widgets.slint";
-import { Palette } from "std-widgets.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Ui } from "state.slint";
+import { AppTheme, ActionButton, StatusBadge, Panel } from "widgets.slint";
+
+component PairingStep inherits Panel {
+    in property <string> text;
+    in property <image> icon;
+    HorizontalLayout {
+        padding: 16px; spacing: 12px;
+        Image { source: root.icon; width: 24px; height: 24px; colorize: AppTheme.text; }
+        Text { text: root.text; color: AppTheme.muted; wrap: word-wrap; }
+    }
+}
 
 export component PairingScreen inherits Rectangle {
-    in property <string> pairing-code: "";
-    in property <int> pairing-timer-sec: 120;
-    in property <bool> remote-connected: false;
-    in property <string> remote-status: "等待连接...";
-    in property <bool> is-busy: false;
-    in property <image> pairing-qr-image;
-
-    callback enter-main();
-    callback retry-pairing();
-
-    background: Palette.background;
-
-    VerticalLayout {
-        alignment: center;
-        padding: 24px;
-        spacing: 20px;
-
-        // 标题
-        Text {
-            text: "连接助手设备";
-            font-size: 22px;
-            font-weight: 700;
-            color: Palette.foreground;
-            horizontal-alignment: center;
-        }
-
-        Text {
-            text: "使用手机扫描二维码，或输入以下配对码";
-            font-size: 13px;
-            color: Palette.foreground.transparentize(0.45);
-            horizontal-alignment: center;
-            wrap: word-wrap;
-        }
-
-        // 配对卡片
-        Rectangle {
-            height: 320px;
-            background: Palette.control-background;
-            border-radius: 16px;
-            border-width: 1px;
-            border-color: Palette.border;
-
-            VerticalLayout {
-                padding: 20px;
-                spacing: 16px;
+    background: AppTheme.background;
+    ScrollView {
+        width: parent.width; height: parent.height;
+        VerticalLayout {
+            alignment: start;
+            padding: 24px; padding-top: Ui.compact ? 24px : 64px; spacing: 24px;
+            HorizontalLayout {
                 alignment: center;
-
-                // QR 码（由 Rust 生成并传入）
-                Rectangle {
-                    height: 160px;
-                    width: 160px;
-                    background: Palette.background;
-                    border-radius: 12px;
-                    border-width: 1px;
-                    border-color: Palette.border;
-                    clip: true;
-
-                    Image {
-                        width: 100%;
-                        height: 100%;
-                        source: root.pairing-qr-image;
-                        image-fit: contain;
+                VerticalLayout {
+                    alignment: start;
+                    width: min(root.width - 48px, 680px); spacing: 24px;
+                    Text { text: Ui.tr("连接", "Connect"); font-size: 36px; font-weight: 700; color: AppTheme.text; }
+                    Panel {
+                        GridLayout {
+                            spacing: 0px;
+                            Rectangle {
+                                row: 0; col: 0;
+                                width: Ui.compact ? parent.width : 296px;
+                                background: AppTheme.soft;
+                                border-top-left-radius: 16px;
+                                border-top-right-radius: Ui.compact ? 16px : 0px;
+                                border-bottom-left-radius: Ui.compact ? 0px : 16px;
+                                VerticalLayout {
+                                    alignment: center; padding: 32px; spacing: 20px;
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        Rectangle {
+                                            width: 216px; height: 216px; background: white; border-radius: 8px;
+                                            border-color: #e7e0ec; border-width: 1px;
+                                            Image { x: 12px; y: 12px; width: 192px; height: 192px; source: Ui.qr; image-fit: contain; }
+                                            if Ui.pairing-code == "": Text { text: Ui.tr("二维码暂不可用", "QR unavailable"); color: #49454f; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap; }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        ActionButton { text: Ui.tr("刷新二维码", "Refresh QR code"); enabled: Ui.ready && !Ui.busy; clicked => { Ui.refresh(); } }
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: start;
+                                row: Ui.compact ? 1 : 0; col: Ui.compact ? 0 : 1;
+                                padding: 32px; spacing: 16px;
+                                Text { text: Ui.tr("配对码", "Pairing code"); color: AppTheme.muted; font-size: 13px; }
+                                Rectangle {
+                                    height: 60px; background: AppTheme.selected; border-radius: 8px;
+                                    Text { text: Ui.pairing-code == "" ? "------" : Ui.pairing-code; font-family: "JetBrains Mono"; font-size: 32px; font-weight: 700; color: AppTheme.accent; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                Text { text: Ui.tr("有效期", "Expires in"); color: AppTheme.muted; font-size: 13px; }
+                                HorizontalLayout {
+                                    spacing: 8px; alignment: start;
+                                    Image { source: @image-url("assets/clock.svg"); width: 24px; height: 24px; y: (parent.height - self.height) / 2; colorize: AppTheme.text; }
+                                    Text { text: Ui.remaining > 0 ? "0" + floor(Ui.remaining / 60) + ":" + (mod(Ui.remaining, 60) < 10 ? "0" : "") + mod(Ui.remaining, 60) : Ui.tr("已过期", "Expired"); font-family: "JetBrains Mono"; font-size: 28px; color: AppTheme.text; }
+                                }
+                                Text { text: Ui.tr("当前状态", "Status"); color: AppTheme.muted; font-size: 13px; }
+                                StatusBadge { text: Ui.pairing-status; good: Ui.connected; }
+                                Rectangle { height: 1px; background: AppTheme.border; }
+                                Text { text: Ui.pairing-uri; color: AppTheme.muted; wrap: word-wrap; font-size: 12px; }
+                                if Ui.connected: ActionButton { text: Ui.tr("进入工作页", "Open workspace"); primary: true; clicked => { Ui.navigate("main"); } }
+                            }
+                        }
                     }
-                }
-
-                // 配对码
-                Text {
-                    text: root.pairing-code;
-                    font-size: 32px;
-                    font-weight: 800;
-                    letter-spacing: 6px;
-                    color: #6b4c9a;
-                    horizontal-alignment: center;
-                }
-
-                // 倒计时
-                Text {
-                    text: "有效期 " + floor(root.pairing-timer-sec / 60) + ":" + mod(root.pairing-timer-sec, 60);
-                    font-size: 13px;
-                    color: Palette.foreground.transparentize(0.4);
-                    horizontal-alignment: center;
+                    GridLayout {
+                        spacing: 12px;
+                        PairingStep { row: 0; col: 0; text: Ui.tr("确保手机与本机连接同一 Wi-Fi / 局域网", "Connect your phone and computer to the same Wi-Fi or local network."); icon: @image-url("assets/wifi.svg"); }
+                        PairingStep { row: Ui.compact ? 1 : 0; col: Ui.compact ? 0 : 1; text: Ui.tr("打开手机上的 Ale-my-Eyes，扫描此二维码", "Open Ale-my-Eyes on your phone and scan this QR code."); icon: @image-url("assets/photo.svg"); }
+                        PairingStep { row: Ui.compact ? 2 : 0; col: Ui.compact ? 0 : 2; text: Ui.tr("核对配对码一致后，在手机上确认连接", "Check the pairing code and confirm on your phone."); icon: @image-url("assets/check.svg"); }
+                    }
+                    if Ui.feedback != "": Text { text: Ui.feedback; color: Ui.feedback-error ? AppTheme.danger : AppTheme.muted; wrap: word-wrap; }
                 }
             }
-        }
-
-        // 状态
-        StatusBadge {
-            text: root.remote-status;
-            connected: root.remote-connected;
-        }
-
-        // 进入主界面按钮（连接成功后显示）
-        if root.remote-connected : ActionButton {
-            text: "进入主界面";
-            primary: true;
-            enabled: !root.is-busy;
-            clicked => { root.enter-main(); }
-        }
-
-        // 重新生成按钮
-        if !root.remote-connected : ActionButton {
-            text: "重新生成配对码";
-            enabled: !root.is-busy;
-            clicked => { root.retry-pairing(); }
         }
     }
 }

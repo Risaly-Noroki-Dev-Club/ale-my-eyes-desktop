@@ -12,8 +12,11 @@ use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+tokio::task_local! { static PROVIDERS: Option<RemoteProviderSet>; }
+
 #[derive(Default)]
 struct CircuitState {
+    revision: u64,
     consecutive_failures: u32,
     open_until: Option<Instant>,
 }
@@ -49,7 +52,8 @@ impl ModelScheduler {
                     .remote
                     .lock()
                     .expect("remote provider lock poisoned")
-                    .is_some()
+                    .as_ref()
+                    .is_some_and(|providers| !providers.primary.api_key.trim().is_empty())
                 {
                     available_capabilities.push(ModelCapability::RemotePlanning);
                 }
@@ -75,6 +79,7 @@ impl ModelScheduler {
                         gpus: crate::gpu::probe_with_runtime(runtime.as_ref()),
                         available_capabilities,
                         hot_worker: self.llama.worker_health(),
+                        sensevoice_state: Some(self.sensevoice.state()),
                     },
                 )
             }
@@ -116,11 +121,31 @@ impl ModelScheduler {
         }
 
         let remaining = Duration::from_millis((job.deadline_unix_ms - now) as u64);
-        let stage_timeout = remaining.min(ale_core::model_scheduler::MODEL_STAGE_TIMEOUT);
+        let stage_timeout = if matches!(
+            job.capability,
+            ModelCapability::RemotePlanning | ModelCapability::SpeechRecognition
+        ) {
+            remaining
+        } else {
+            remaining.min(ale_core::model_scheduler::MODEL_STAGE_TIMEOUT)
+        };
+        let providers = job
+            .remote_snapshot
+            .clone()
+            .or_else(|| self.remote.lock().unwrap().clone());
+        let deadline = tokio::time::Instant::now() + stage_timeout;
         let request_id = request.request_id;
-        match tokio::time::timeout(stage_timeout, self.run_job(request_id.clone(), job)).await {
-            Ok(reply) => reply,
-            Err(_) => error_reply(
+        match tokio::time::timeout_at(
+            deadline,
+            ale_core::model_api::DEADLINE.scope(
+                deadline,
+                PROVIDERS.scope(providers, self.run_job(request_id.clone(), job)),
+            ),
+        )
+        .await
+        {
+            Ok(reply) if tokio::time::Instant::now() < deadline => reply,
+            _ => error_reply(
                 request_id,
                 "DEADLINE_EXCEEDED",
                 "model stage exceeded its deadline",
@@ -289,13 +314,6 @@ impl ModelScheduler {
                 )
             }
         };
-        if providers.primary.api_key.trim().is_empty() {
-            return error_reply(
-                request.request_id,
-                "MISSING_API_KEY",
-                "primary API key is required",
-            );
-        }
         if providers.backup_enabled
             && (!providers.backup_pre_authorized || providers.backup.is_none())
         {
@@ -305,6 +323,10 @@ impl ModelScheduler {
                 "enabled backup endpoint requires configuration and pre-authorization",
             );
         }
+        *self.primary_circuit.lock().unwrap() = CircuitState {
+            revision: providers.revision,
+            ..Default::default()
+        };
         *self.remote.lock().expect("remote provider lock poisoned") = Some(providers);
         ok_json(request.request_id, &serde_json::json!({"configured": true}))
     }
@@ -342,12 +364,14 @@ impl ModelScheduler {
         let adapter = self.sensevoice.clone();
         let local_wav = wav.clone();
         let local_result = match runtime {
-            Some(config) => {
-                tokio::task::spawn_blocking(move || adapter.transcribe_wav(&config, &local_wav))
-                    .await
-                    .map_err(|error| format!("SenseVoice task failed: {error}"))
-                    .and_then(|result| result)
-            }
+            Some(config) => tokio::time::timeout(
+                ale_core::model_scheduler::MODEL_STAGE_TIMEOUT,
+                tokio::task::spawn_blocking(move || adapter.transcribe_wav(&config, &local_wav)),
+            )
+            .await
+            .map_err(|_| "SenseVoice stage timed out".to_string())
+            .and_then(|result| result.map_err(|error| format!("SenseVoice task failed: {error}")))
+            .and_then(|result| result),
             None => Err("local model runtime is not configured".to_string()),
         };
         if let Ok(text) = local_result {
@@ -374,11 +398,11 @@ impl ModelScheduler {
     }
 
     async fn remote_transcribe(&self, request_id: String, wav: &[u8]) -> IpcReply {
-        let providers = match self
-            .remote
-            .lock()
-            .expect("remote provider lock poisoned")
-            .clone()
+        let providers = match PROVIDERS
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .or_else(|| self.remote.lock().unwrap().clone())
         {
             Some(value) => value,
             None => {
@@ -389,42 +413,27 @@ impl ModelScheduler {
                 )
             }
         };
-        match call_remote_transcribe(&providers.primary, wav).await {
+        let Some(endpoint) = providers.transcription else {
+            return error_reply(
+                request_id,
+                "REMOTE_ASR_NOT_CONFIGURED",
+                "Configure an independent transcription endpoint",
+            );
+        };
+        match ale_core::model_api::retry(ale_core::model_api::deadline(), 1, || {
+            call_remote_transcribe(&endpoint, wav)
+        })
+        .await
+        {
             Ok(text) => ok_json(
                 request_id,
                 &SpeechRecognitionResult {
                     text,
-                    model_id: "remote-asr".to_string(),
+                    model_id: endpoint.model,
                     used_remote: true,
                     failover_notice: None,
                 },
             ),
-            Err(primary_error)
-                if is_transient_remote_error(&primary_error)
-                    && providers.backup_enabled
-                    && providers.backup_pre_authorized =>
-            {
-                if let Some(backup) = &providers.backup {
-                    match call_remote_transcribe(backup, wav).await {
-                        Ok(text) => ok_json(
-                            request_id,
-                            &SpeechRecognitionResult {
-                                text,
-                                model_id: "remote-asr-backup".to_string(),
-                                used_remote: true,
-                                failover_notice: Some(
-                                    "主模型不可用，语音识别已切换到备用端点".to_string(),
-                                ),
-                            },
-                        ),
-                        Err(error) => {
-                            error_reply(request_id, "REMOTE_ASR_FAILED", &error.to_string())
-                        }
-                    }
-                } else {
-                    error_reply(request_id, "REMOTE_ASR_FAILED", &primary_error.to_string())
-                }
-            }
             Err(error) => error_reply(request_id, "REMOTE_ASR_FAILED", &error.to_string()),
         }
     }
@@ -441,11 +450,11 @@ impl ModelScheduler {
                 "full screenshot payload was not authorized",
             );
         }
-        let providers = match self
-            .remote
-            .lock()
-            .expect("remote provider lock poisoned")
-            .clone()
+        let providers = match PROVIDERS
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .or_else(|| self.remote.lock().unwrap().clone())
         {
             Some(value) => value,
             None => {
@@ -457,18 +466,38 @@ impl ModelScheduler {
             }
         };
 
-        let primary_open = self
-            .primary_circuit
-            .lock()
-            .expect("circuit lock poisoned")
-            .open_until
-            .is_some_and(|until| until > Instant::now());
+        let primary_open = {
+            let circuit = self.primary_circuit.lock().expect("circuit lock poisoned");
+            circuit.revision == providers.revision
+                && circuit
+                    .open_until
+                    .is_some_and(|until| until > Instant::now())
+        };
+        let deadline = ale_core::model_api::deadline();
+        let mut failure_message = "Primary endpoint circuit is temporarily open".to_string();
+        let has_backup = providers.backup_enabled
+            && providers.backup_pre_authorized
+            && providers.backup.is_some();
+        let primary_deadline = if has_backup {
+            tokio::time::Instant::now()
+                + deadline.saturating_duration_since(tokio::time::Instant::now()) / 2
+        } else {
+            deadline
+        };
         if !primary_open {
-            match call_remote(&providers.primary, &planning).await {
+            match ale_core::model_api::retry(
+                primary_deadline,
+                if has_backup { 0 } else { 1 },
+                || call_remote(&providers.primary, &planning),
+            )
+            .await
+            {
                 Ok(response) => {
                     let mut circuit = self.primary_circuit.lock().expect("circuit lock poisoned");
-                    circuit.consecutive_failures = 0;
-                    circuit.open_until = None;
+                    if circuit.revision == providers.revision {
+                        circuit.consecutive_failures = 0;
+                        circuit.open_until = None;
+                    }
                     return ok_json(
                         request_id,
                         &RemotePlanningResult {
@@ -479,6 +508,7 @@ impl ModelScheduler {
                     );
                 }
                 Err(primary_error) => {
+                    failure_message = primary_error.to_string();
                     if !is_transient_remote_error(&primary_error) {
                         return error_reply(
                             request_id,
@@ -487,12 +517,19 @@ impl ModelScheduler {
                         );
                     }
                     let mut circuit = self.primary_circuit.lock().expect("circuit lock poisoned");
-                    circuit.consecutive_failures = circuit.consecutive_failures.saturating_add(1);
-                    if circuit.consecutive_failures >= providers.circuit_failure_threshold.max(1) {
-                        circuit.open_until = Some(
-                            Instant::now()
-                                + Duration::from_secs(providers.circuit_open_seconds.max(1) as u64),
-                        );
+                    if circuit.revision == providers.revision {
+                        circuit.consecutive_failures =
+                            circuit.consecutive_failures.saturating_add(1);
+                        if circuit.consecutive_failures
+                            >= providers.circuit_failure_threshold.max(1)
+                        {
+                            circuit.open_until = Some(
+                                Instant::now()
+                                    + Duration::from_secs(
+                                        providers.circuit_open_seconds.max(1) as u64
+                                    ),
+                            );
+                        }
                     }
                     tracing::warn!("primary remote model failed with a transient error");
                 }
@@ -501,7 +538,11 @@ impl ModelScheduler {
 
         if providers.backup_enabled && providers.backup_pre_authorized {
             if let Some(backup) = &providers.backup {
-                return match call_remote(backup, &planning).await {
+                return match ale_core::model_api::retry(deadline, 0, || {
+                    call_remote(backup, &planning)
+                })
+                .await
+                {
                     Ok(response) => ok_json(
                         request_id,
                         &RemotePlanningResult {
@@ -516,11 +557,7 @@ impl ModelScheduler {
                 };
             }
         }
-        error_reply(
-            request_id,
-            "PRIMARY_REMOTE_FAILED",
-            "primary remote model failed and no authorized backup is available",
-        )
+        error_reply(request_id, "PRIMARY_REMOTE_FAILED", &failure_message)
     }
 }
 
@@ -528,9 +565,7 @@ async fn call_remote(
     endpoint: &RemoteEndpointConfig,
     job: &RemotePlanningJob,
 ) -> ale_core::Result<ale_core::cloud::VisionResponse> {
-    use ale_core::cloud::{
-        CloudApiFactory, CloudConfig, CloudMessage, CloudProvider, VisionResponse,
-    };
+    use ale_core::cloud::{CloudApiFactory, CloudConfig, CloudProvider, VisionResponse};
     let provider = match endpoint.provider.to_ascii_lowercase().as_str() {
         "openai" => CloudProvider::OpenAI,
         "anthropic" => CloudProvider::Anthropic,
@@ -539,6 +574,7 @@ async fn call_remote(
         other => CloudProvider::Custom(other.to_string()),
     };
     let api = CloudApiFactory::create(CloudConfig {
+        wire_api: endpoint.wire_api,
         provider,
         api_key: endpoint.api_key.clone(),
         api_url: endpoint.api_url.clone(),
@@ -547,28 +583,30 @@ async fn call_remote(
         timeout: Duration::from_secs(endpoint.timeout_seconds.max(1) as u64),
         retry_count: 0,
     });
-    if let Some(image_base64) = &job.image_base64 {
-        let image = base64::engine::general_purpose::STANDARD
-            .decode(image_base64)
-            .map_err(|error| {
-                ale_core::AleError::CloudApiError(format!("invalid image payload: {error}"))
-            })?;
-        api.vision_ask(&image, &job.question, job.tools.clone())
-            .await
-    } else {
-        let response = api
-            .chat(vec![CloudMessage {
-                role: "user".to_string(),
-                content: job.question.clone(),
-            }])
-            .await?;
-        Ok(VisionResponse {
-            content: response.content,
-            tool_calls: None,
-            tokens_used: response.tokens_used,
-            model: response.model,
+    let image = job
+        .image_base64
+        .as_ref()
+        .map(|data| base64::engine::general_purpose::STANDARD.decode(data))
+        .transpose()
+        .map_err(|_| {
+            ale_core::model_api::ModelCallError::new(
+                ale_core::model_api::ErrorKind::InvalidRequest,
+                "Invalid image payload",
+            )
+        })?;
+    let response = api
+        .generate(ale_core::model_api::ModelRequest {
+            image,
+            tools: job.tools.clone().unwrap_or_default(),
+            ..ale_core::model_api::ModelRequest::text(&job.question)
         })
-    }
+        .await?;
+    Ok(VisionResponse {
+        content: response.content,
+        tool_calls: (!response.tool_calls.is_empty()).then_some(response.tool_calls),
+        tokens_used: response.tokens_used,
+        model: response.model,
+    })
 }
 
 async fn call_remote_transcribe(
@@ -589,6 +627,7 @@ fn remote_api(endpoint: &RemoteEndpointConfig) -> Box<dyn ale_core::cloud::Cloud
         other => CloudProvider::Custom(other.to_string()),
     };
     CloudApiFactory::create(CloudConfig {
+        wire_api: endpoint.wire_api,
         provider,
         api_key: endpoint.api_key.clone(),
         api_url: endpoint.api_url.clone(),
@@ -600,12 +639,7 @@ fn remote_api(endpoint: &RemoteEndpointConfig) -> Box<dyn ale_core::cloud::Cloud
 }
 
 fn is_transient_remote_error(error: &ale_core::AleError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    message.contains("request failed")
-        || message.contains("timed out")
-        || message.contains("timeout")
-        || message.contains("429 too many requests")
-        || (500..=599).any(|status| message.contains(&format!("{status} ")))
+    matches!(error, ale_core::AleError::ModelCall(error) if error.transient())
 }
 
 pub(crate) fn ok_json(request_id: String, value: &impl Serialize) -> IpcReply {
@@ -681,6 +715,7 @@ mod tests {
 
     fn endpoint(api_url: String) -> RemoteEndpointConfig {
         RemoteEndpointConfig {
+            wire_api: Default::default(),
             provider: "openai".to_string(),
             api_key: "test".to_string(),
             api_url,
@@ -693,6 +728,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_local_capability_requires_a_decision() {
         let payload = serde_json::to_vec(&ModelJob {
+            remote_snapshot: None,
             request_id: "job".to_string(),
             capability: ModelCapability::LocalPlanning,
             priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
@@ -714,12 +750,160 @@ mod tests {
         assert_eq!(reply.status, IpcReplyStatus::DecisionRequired as i32);
     }
 
+    fn providers(primary: RemoteEndpointConfig, revision: u64) -> RemoteProviderSet {
+        RemoteProviderSet {
+            primary,
+            backup: None,
+            transcription: None,
+            revision,
+            backup_enabled: false,
+            backup_pre_authorized: false,
+            circuit_failure_threshold: 1,
+            circuit_open_seconds: 60,
+        }
+    }
+
+    fn request_with_snapshot(
+        providers: RemoteProviderSet,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> IpcEnvelope {
+        IpcEnvelope {
+            protocol_version: MODEL_IPC_VERSION,
+            request_id: "pinned".into(),
+            kind: IpcRequestKind::Schedule as i32,
+            payload: serde_json::to_vec(&ModelJob {
+                request_id: "pinned".into(),
+                remote_snapshot: Some(providers),
+                capability: ModelCapability::RemotePlanning,
+                priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 65_000,
+                risk_ceiling: ale_core::actions::RiskLevel::High,
+                snapshot_id: None,
+                privacy: ale_core::model_scheduler::JobPrivacy {
+                    allow_remote: true,
+                    ..Default::default()
+                },
+                payload: serde_json::to_value(RemotePlanningJob {
+                    question: "text-only plan".into(),
+                    image_base64: None,
+                    tools,
+                })
+                .unwrap(),
+            })
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_only_planning_preserves_tools_and_uses_pinned_config() {
+        let old=mock_endpoint("200 OK",r#"{"choices":[{"finish_reason":"tool_calls","message":{"tool_calls":[{"id":"test","function":{"name":"probe","arguments":"{\"value\":\"old\"}"}}]}}]}"#).await;
+        let scheduler = ModelScheduler::default();
+        let mut no_primary = endpoint("http://127.0.0.1:1".into());
+        no_primary.api_key.clear();
+        let configured = scheduler.configure_remote(IpcEnvelope {
+            protocol_version: MODEL_IPC_VERSION,
+            request_id: "config".into(),
+            kind: IpcRequestKind::ConfigureRemote as i32,
+            payload: serde_json::to_vec(&providers(no_primary, 2)).unwrap(),
+        });
+        assert_eq!(configured.status, IpcReplyStatus::Ok as i32);
+        let health = scheduler
+            .handle(IpcEnvelope {
+                protocol_version: MODEL_IPC_VERSION,
+                request_id: "health".into(),
+                kind: IpcRequestKind::Health as i32,
+                payload: vec![],
+            })
+            .await;
+        let health: SchedulerHealth = serde_json::from_slice(&health.payload).unwrap();
+        assert!(!health
+            .available_capabilities
+            .contains(&ModelCapability::RemotePlanning));
+        let tools = vec![
+            serde_json::json!({"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}}),
+        ];
+        let reply = scheduler
+            .handle(request_with_snapshot(
+                providers(endpoint(old), 1),
+                Some(tools),
+            ))
+            .await;
+        assert_eq!(
+            reply.status,
+            IpcReplyStatus::Ok as i32,
+            "{}",
+            reply.error_message
+        );
+        let result: RemotePlanningResult = serde_json::from_slice(&reply.payload).unwrap();
+        assert_eq!(
+            result.response.tool_calls.unwrap()[0].function.name,
+            "probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_request_failure_cannot_trip_new_config_circuit() {
+        let old = mock_endpoint("503 Unavailable", "{}").await;
+        let scheduler = ModelScheduler::default();
+        scheduler.configure_remote(IpcEnvelope {
+            protocol_version: MODEL_IPC_VERSION,
+            request_id: "config".into(),
+            kind: IpcRequestKind::ConfigureRemote as i32,
+            payload: serde_json::to_vec(&providers(endpoint("http://127.0.0.1:1".into()), 2))
+                .unwrap(),
+        });
+        let reply = scheduler
+            .handle(request_with_snapshot(providers(endpoint(old), 1), None))
+            .await;
+        assert_eq!(reply.status, IpcReplyStatus::Error as i32);
+        let circuit = scheduler.primary_circuit.lock().unwrap();
+        assert_eq!(circuit.revision, 2);
+        assert_eq!(circuit.consecutive_failures, 0);
+        assert!(circuit.open_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_stage_accepts_response_after_old_thirty_second_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 8192];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            tokio::time::sleep(Duration::from_secs(31)).await;
+            let body =
+                r#"{"choices":[{"finish_reason":"stop","message":{"content":"completed"}}]}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let mut primary = endpoint(url);
+        primary.timeout_seconds = 60;
+        let reply = ModelScheduler::default()
+            .handle(request_with_snapshot(providers(primary, 0), None))
+            .await;
+        assert_eq!(
+            reply.status,
+            IpcReplyStatus::Ok as i32,
+            "{}",
+            reply.error_message
+        );
+        responder.await.unwrap();
+    }
+
     #[tokio::test]
     async fn preauthorized_backup_handles_primary_failure() {
         let primary = mock_endpoint("500 Internal Server Error", "{}").await;
         let backup = mock_endpoint(
             "200 OK",
-            r#"{"choices":[{"message":{"content":"backup response"}}],"usage":{"total_tokens":2}}"#,
+            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"backup response"}]}],"usage":{"total_tokens":2}}"#,
         )
         .await;
         let scheduler = ModelScheduler::default();
@@ -729,8 +913,13 @@ mod tests {
                 request_id: "configure".to_string(),
                 kind: IpcRequestKind::ConfigureRemote as i32,
                 payload: serde_json::to_vec(&RemoteProviderSet {
+                    transcription: None,
+                    revision: 0,
                     primary: endpoint(primary),
-                    backup: Some(endpoint(backup)),
+                    backup: Some(RemoteEndpointConfig {
+                        wire_api: ale_core::model_api::WireApi::OpenaiResponses,
+                        ..endpoint(backup)
+                    }),
                     backup_enabled: true,
                     backup_pre_authorized: true,
                     circuit_failure_threshold: 1,
@@ -752,6 +941,7 @@ mod tests {
                 request_id: "plan".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    remote_snapshot: None,
                     request_id: "plan".to_string(),
                     capability: ModelCapability::RemotePlanning,
                     priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
@@ -790,6 +980,8 @@ mod tests {
                 request_id: "configure".to_string(),
                 kind: IpcRequestKind::ConfigureRemote as i32,
                 payload: serde_json::to_vec(&RemoteProviderSet {
+                    transcription: None,
+                    revision: 0,
                     primary: endpoint(primary),
                     backup: Some(endpoint(backup)),
                     backup_enabled: true,
@@ -806,6 +998,7 @@ mod tests {
                 request_id: "plan".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    remote_snapshot: None,
                     request_id: "plan".to_string(),
                     capability: ModelCapability::RemotePlanning,
                     priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
@@ -839,6 +1032,8 @@ mod tests {
                 request_id: "configure".to_string(),
                 kind: IpcRequestKind::ConfigureRemote as i32,
                 payload: serde_json::to_vec(&RemoteProviderSet {
+                    transcription: None,
+                    revision: 0,
                     primary: endpoint(hanging_endpoint().await),
                     backup: None,
                     backup_enabled: false,
@@ -857,6 +1052,7 @@ mod tests {
                 request_id: "deadline".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    remote_snapshot: None,
                     request_id: "deadline".to_string(),
                     capability: ModelCapability::RemotePlanning,
                     priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
@@ -890,6 +1086,7 @@ mod tests {
                 request_id: "privacy".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    remote_snapshot: None,
                     request_id: "privacy".to_string(),
                     capability: ModelCapability::RemotePlanning,
                     priority: ale_core::model_scheduler::SchedulerPriority::InteractiveRequest,
