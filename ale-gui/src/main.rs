@@ -24,8 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(std::io::Error::other)?;
         return Ok(());
     }
-    let _runtime_guard = runtime.enter();
-    let app = AppWindow::new()?;
-    ale_gui::setup_app(&app);
-    Ok(app.run()?)
+    runtime.block_on(async {
+        let app = AppWindow::new()?;
+        ale_gui::setup_app(&app);
+        Ok(app.run()?)
+    })
 }
