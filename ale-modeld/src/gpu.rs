@@ -1,42 +1,106 @@
 use ale_core::model_scheduler::{GpuBackend, GpuDevice, ModelRuntimeConfig};
-use std::process::Command;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 
 const MIB: u64 = 1024 * 1024;
 
-pub fn probe() -> Vec<GpuDevice> {
-    let devices = probe_nvidia();
-    #[cfg(target_os = "linux")]
-    {
-        let mut devices = devices;
-        devices.extend(probe_linux_amd());
-        devices
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        devices
-    }
-}
-
-pub fn probe_with_runtime(runtime: Option<&ModelRuntimeConfig>) -> Vec<GpuDevice> {
-    let mut devices = probe();
-    if let Some(cli) = runtime.and_then(|runtime| runtime.llama_server.as_deref()) {
-        let output = Command::new(cli).arg("--list-devices").output();
-        if let Ok(output) = output {
-            if output.status.success() {
-                let text = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                for device in parse_llama_vulkan(&text) {
-                    if !devices.iter().any(|existing| existing.id == device.id) {
+pub async fn probe_with_runtime(
+    runtime: Option<&ModelRuntimeConfig>,
+) -> Result<Vec<GpuDevice>, &'static str> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut devices = match probe_command(
+            "nvidia-smi",
+            &[
+                "--query-gpu=index,name,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+        )
+        .await
+        {
+            Ok(Some(output)) => parse_nvidia(&output),
+            Ok(None) => Vec::new(),
+            Err(code) => return Err(code),
+        };
+        #[cfg(target_os = "linux")]
+        devices.extend(
+            tokio::task::spawn_blocking(probe_linux_amd)
+                .await
+                .map_err(|_| "GPU_SYSFS_TASK_FAILED")?,
+        );
+        if let Some(cli) = runtime.and_then(|runtime| runtime.llama_server.as_deref()) {
+            if let Some(output) = probe_command(cli, &["--list-devices"]).await? {
+                for device in parse_llama_vulkan(&output) {
+                    if !devices.iter().any(|old| old.id == device.id) {
                         devices.push(device);
                     }
                 }
             }
         }
+        Ok(devices)
+    })
+    .await
+    .map_err(|_| "GPU_PROBE_TIMEOUT")?
+}
+
+async fn probe_command(program: &str, args: &[&str]) -> Result<Option<String>, &'static str> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = match ale_core::child_process::ManagedAsyncChild::spawn(&mut command) {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("GPU_PROBE_START_FAILED"),
+    };
+    let stdout = child.child.stdout.take().ok_or("GPU_PROBE_PIPE_FAILED")?;
+    let stderr = child.child.stderr.take().ok_or("GPU_PROBE_PIPE_FAILED")?;
+    let output = tokio::time::timeout(Duration::from_secs(2), async {
+        let (out, err, status) =
+            tokio::try_join!(bounded_output(stdout), bounded_output(stderr), async {
+                child.wait().await.map_err(|_| "GPU_PROBE_WAIT_FAILED")
+            })?;
+        if !status.success() {
+            return Err("GPU_PROBE_EXIT_FAILED");
+        }
+        Ok(format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&err)
+        ))
+    })
+    .await;
+    match output {
+        Ok(Ok(text)) => Ok(Some(text)),
+        failed => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            Err(match failed {
+                Ok(Err(code)) => code,
+                _ => "GPU_PROBE_TIMEOUT",
+            })
+        }
     }
-    devices
+}
+
+async fn bounded_output(
+    reader: impl tokio::io::AsyncRead + Unpin,
+) -> Result<Vec<u8>, &'static str> {
+    let mut bytes = Vec::new();
+    reader
+        .take(256 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| "GPU_PROBE_READ_FAILED")?;
+    if bytes.len() > 256 * 1024 {
+        return Err("GPU_PROBE_OUTPUT_LIMIT");
+    }
+    Ok(bytes)
 }
 
 fn parse_llama_vulkan(output: &str) -> Vec<GpuDevice> {
@@ -66,21 +130,6 @@ fn parse_llama_vulkan(output: &str) -> Vec<GpuDevice> {
             })
         })
         .collect()
-}
-
-fn probe_nvidia() -> Vec<GpuDevice> {
-    let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=index,name,memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            parse_nvidia(&String::from_utf8_lossy(&output.stdout))
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn parse_nvidia(output: &str) -> Vec<GpuDevice> {

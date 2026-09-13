@@ -91,15 +91,27 @@ impl AutomationEngine {
             if let Some(control) = control {
                 control.check()?;
             }
-            self.execute_action(action)?;
+            let started = std::time::Instant::now();
+            if let (Action::Wait { ms }, Some(control)) = (action, control) {
+                control.wait(std::time::Duration::from_millis(*ms))?;
+            } else {
+                self.execute_action(action)?;
+            }
+            ale_core::diagnostics::record(
+                "automation_action_complete",
+                &[("elapsed_ms", started.elapsed().as_millis() as u64)],
+            );
             executed += 1;
             if let Some(control) = control {
                 control.check()?;
             }
             if self.config.action_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(
-                    self.config.action_delay_ms,
-                ));
+                let delay = std::time::Duration::from_millis(self.config.action_delay_ms);
+                if let Some(control) = control {
+                    control.wait(delay)?;
+                } else {
+                    std::thread::sleep(delay);
+                }
             }
         }
 
@@ -165,26 +177,34 @@ impl AutomationEngine {
                     .map_err(|e| AleError::Other(anyhow::anyhow!("Type failed: {}", e)))?;
             }
             Action::Key { key, modifiers } => {
-                // 先按修饰键
-                for modifier in modifiers {
-                    let mod_key = parse_key(modifier);
-                    self.enigo.key(mod_key, Direction::Press).map_err(|e| {
-                        AleError::Other(anyhow::anyhow!("Modifier key press failed: {}", e))
-                    })?;
+                let mut pressed = Vec::new();
+                let operation = (|| -> Result<()> {
+                    for modifier in modifiers {
+                        let key = parse_key(modifier);
+                        #[cfg(windows)]
+                        crate::platform_worker::keys::pressing(key)?;
+                        pressed.push(key);
+                        self.enigo.key(key, Direction::Press).map_err(|e| {
+                            AleError::Other(anyhow::anyhow!("Modifier press failed: {e}"))
+                        })?;
+                    }
+                    self.enigo
+                        .key(parse_key(key), Direction::Click)
+                        .map_err(|e| AleError::Other(anyhow::anyhow!("Key press failed: {e}")))?;
+                    Ok(())
+                })();
+                let mut release_failed = false;
+                for key in pressed.into_iter().rev() {
+                    if self.enigo.key(key, Direction::Release).is_err() {
+                        release_failed = true;
+                    } else {
+                        #[cfg(windows)]
+                        crate::platform_worker::keys::released(key);
+                    }
                 }
-
-                // 按主键
-                let main_key = parse_key(key);
-                self.enigo
-                    .key(main_key, Direction::Click)
-                    .map_err(|e| AleError::Other(anyhow::anyhow!("Key press failed: {}", e)))?;
-
-                // 释放修饰键（逆序）
-                for modifier in modifiers.iter().rev() {
-                    let mod_key = parse_key(modifier);
-                    self.enigo.key(mod_key, Direction::Release).map_err(|e| {
-                        AleError::Other(anyhow::anyhow!("Modifier key release failed: {}", e))
-                    })?;
+                operation?;
+                if release_failed {
+                    return Err(AleError::Other(anyhow::anyhow!("MODIFIER_RELEASE_FAILED")));
                 }
             }
             Action::Wait { ms } => {
@@ -272,16 +292,17 @@ fn validate_controlled_test_target(
     let script = format!(
         r#"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); Add-Type -AssemblyName UIAutomationClient; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class N {{ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }}'; $r=[System.Windows.Automation.AutomationElement]::FromHandle([N]::GetForegroundWindow()); if($null -eq $r -or $r.Current.Name -ne '{ALLOWED_WINDOW}'){{exit 3}}; $c=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'{ALLOWED_TARGET}'); $e=$r.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$c); if($null -eq $e){{exit 4}}; $b=$e.Current.BoundingRectangle; @($b.Left,$b.Top,$b.Right,$b.Bottom)|ConvertTo-Json -Compress"#
     );
-    let output = std::process::Command::new("powershell.exe")
-        .args([
+    let output = crate::platform_worker::bounded_output(
+        std::process::Command::new("powershell.exe").args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &script,
-        ])
-        .output()
-        .map_err(|error| AleError::Other(anyhow::anyhow!("UIA 目标复核失败: {error}")))?;
+        ]),
+        &ExecutionControl::new(std::time::Instant::now() + std::time::Duration::from_secs(3)),
+    )
+    .map_err(|error| AleError::Other(anyhow::anyhow!("UIA 目标复核失败: {error}")))?;
     if !output.status.success() {
         return Err(AleError::ConfigError(
             "执行前活动窗口或 UIA 目标已变化".to_string(),
@@ -429,12 +450,16 @@ fn open_application(name: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
+        let mut command = std::process::Command::new("cmd");
+        command
             .args(["/C", "start", "", name])
-            .spawn()
-            .map_err(|e| {
-                AleError::Other(anyhow::anyhow!("Failed to open app '{}': {}", name, e))
-            })?;
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        ale_core::child_process::configure_user_app(&mut command);
+        command.spawn().map_err(|e| {
+            AleError::Other(anyhow::anyhow!("Failed to open app '{}': {}", name, e))
+        })?;
     }
     #[cfg(target_os = "macos")]
     {
@@ -462,12 +487,12 @@ fn close_application(name: &str) -> Result<()> {
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("taskkill")
-            .args(["/IM", &format!("{}.exe", name), "/F"])
-            .spawn()
-            .map_err(|e| {
-                AleError::Other(anyhow::anyhow!("Failed to close app '{}': {}", name, e))
-            })?;
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/IM", &format!("{}.exe", name), "/F"]);
+        ale_core::child_process::configure(&mut command);
+        command.spawn().map_err(|e| {
+            AleError::Other(anyhow::anyhow!("Failed to close app '{}': {}", name, e))
+        })?;
     }
     #[cfg(target_os = "macos")]
     {

@@ -42,6 +42,7 @@ pub enum IpcRequestKind {
     ConfigureRemote = 4,
     Shutdown = 5,
     ConfigureModels = 6,
+    ConfigureScheduler = 7,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -52,18 +53,22 @@ pub enum IpcReplyStatus {
     DecisionRequired = 2,
 }
 
+pub fn frame_size(message: &impl Message) -> usize {
+    message.encoded_len()
+}
+
 pub async fn write_message<W, M>(writer: &mut W, message: &M) -> std::io::Result<()>
 where
     W: AsyncWrite + Unpin,
     M: Message,
 {
-    let encoded = message.encode_to_vec();
-    if encoded.len() > MAX_MODEL_IPC_MESSAGE_BYTES {
+    if message.encoded_len() > MAX_MODEL_IPC_MESSAGE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "model IPC message exceeds size limit",
         ));
     }
+    let encoded = message.encode_to_vec();
     writer.write_u32(encoded.len() as u32).await?;
     writer.write_all(&encoded).await?;
     writer.flush().await
@@ -91,6 +96,36 @@ where
     })
 }
 
+/// A single persistent reader owns this future. The reservation follows a frame through its queue/job.
+pub async fn read_message_with_budget<R, M>(
+    reader: &mut R,
+    budget: std::sync::Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<(M, tokio::sync::OwnedSemaphorePermit)>
+where
+    R: AsyncRead + Unpin,
+    M: Message + Default,
+{
+    let length = reader.read_u32().await? as usize;
+    if length == 0 || length > MAX_MODEL_IPC_MESSAGE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid model IPC frame length",
+        ));
+    }
+    let permit = budget
+        .try_acquire_many_owned(length as u32)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "IPC_INFLIGHT_LIMIT"))?;
+    let mut encoded = vec![0; length];
+    reader.read_exact(&mut encoded).await?;
+    let message = M::decode(encoded.as_slice()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid model IPC protobuf",
+        )
+    })?;
+    Ok((message, permit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +144,30 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[tokio::test]
+    async fn partial_body_eof_is_rejected_and_releases_budget() {
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+        let bytes = [0, 0, 0, 10, 8, 2];
+        let result =
+            read_message_with_budget::<_, IpcEnvelope>(&mut &bytes[..], budget.clone()).await;
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(budget.available_permits(), 64);
+    }
+    #[tokio::test]
+    async fn exhausted_payload_budget_never_waits_in_front_of_control_frames() {
+        let budget = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let bytes = [0, 0, 0, 10];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_message_with_budget::<_, IpcEnvelope>(&mut &bytes[..], budget),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
     #[tokio::test]
     async fn oversized_frame_is_rejected_before_allocation() {
         let frame_length = (MAX_MODEL_IPC_MESSAGE_BYTES as u32 + 1).to_be_bytes();

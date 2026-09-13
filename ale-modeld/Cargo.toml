@@ -36,3 +36,7 @@ tempfile = "3"
 [[bin]]
 name = "ale-modeld"
 path = "src/main.rs"
+
+[[bin]]
+name = "ale-modeld-acceptance"
+path = "src/bin/ale-modeld-acceptance.rs"

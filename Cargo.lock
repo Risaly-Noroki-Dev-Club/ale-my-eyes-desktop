@@ -196,12 +196,14 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "bzip2 0.6.1",
  "chrono",
  "dirs",
  "futures",
  "image",
  "jsonschema",
  "keyring",
+ "libc",
  "log",
  "ort",
  "prost",
@@ -210,6 +212,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "sha2",
+ "tar",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -220,6 +223,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "whisper-rs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1034,6 +1038,15 @@ checksum = "bdb116a6ef3f6c3698828873ad02c3014b3c85cadb88496095628e3ef1e347f8"
 dependencies = [
  "bzip2-sys",
  "libc",
+]
+
+[[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
 ]
 
 [[package]]
@@ -3879,6 +3892,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b357333733e8260735ba5894eb928c02ecc69c78715f01a8019e7fa7f2db4c"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6630,7 +6649,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "591c9432b20f41d47f622a73c2888b188c321e313d820824df7d9fa51dbada43"
 dependencies = [
  "bindgen 0.69.5",
- "bzip2",
+ "bzip2 0.4.4",
  "cmake",
  "dirs",
  "flate2",

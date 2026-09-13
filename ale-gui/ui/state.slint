@@ -2,6 +2,17 @@ export struct DeviceRow { id: string, name: string }
 export struct ModelRow { name: string, state: string }
 export struct LogRow { time: string, message: string, detail: string }
 export global Ui {
+    in-out property <bool> show-downloader: false;
+    in-out property <bool> downloading: false;
+    in-out property <bool> download-consent: false;
+    in-out property <int> download-model: 0;
+    in-out property <string> download-directory;
+    in-out property <string> download-status;
+    in-out property <string> log-directory;
+    callback start-download();
+    callback cancel-download();
+    callback choose-download-directory();
+    callback open-logs();
     in-out property <bool> advanced: false;
     in-out property <int> wire-api: 0;
     in-out property <bool> backup-enabled: false;
@@ -29,6 +40,10 @@ export global Ui {
     in-out property <string> page: "pairing";
     in-out property <bool> ready: false;
     in-out property <bool> busy: false;
+    in-out property <bool> saving: false;
+    in-out property <int> state-age-ms: 0;
+    in-out property <bool> auto-dump: true;
+    callback diagnostic-setting-changed();
     in-out property <bool> connected: false;
     in-out property <bool> paused: false;
     in-out property <bool> dirty: false;

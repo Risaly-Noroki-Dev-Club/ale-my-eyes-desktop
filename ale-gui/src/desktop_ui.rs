@@ -13,9 +13,15 @@ use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct State {
+    tools: Option<crate::model_download_ui::Tools>,
     engine: Option<Arc<Mutex<AleEngine>>>,
     server: Option<RemoteServerHandle>,
     saved: AppConfig,
+    settings: Option<crate::settings_service::SettingsService>,
+    cached_hub: crate::ui_state::Snapshot,
+    pairing_expires: Option<Instant>,
+    snapshot_time: Option<Instant>,
+    save_generation: u64,
     selected: String,
     destination: String,
     test_cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -34,6 +40,15 @@ fn feedback(app: &AppWindow, text: &str, error: bool) {
 
 fn apply(app: &AppWindow, config: &AppConfig) {
     let ui = app.global::<Ui>();
+    if !ui.get_downloading() && ui.get_download_directory().is_empty() {
+        let directory = std::path::PathBuf::from(&config.models.models_dir);
+        let directory = if directory.is_absolute() {
+            directory
+        } else {
+            std::env::current_dir().unwrap_or_default().join(directory)
+        };
+        ui.set_download_directory(directory.to_string_lossy().into_owned().into());
+    }
     ui.set_wire_api(protocol_index(config.cloud_api.wire_api));
     let backup = config.remote_routing.backup.clone().unwrap_or_default();
     ui.set_backup_enabled(config.remote_routing.backup_enabled);
@@ -158,20 +173,37 @@ fn page(app: &AppWindow, state: &State, target: &str) {
 }
 
 fn qr(app: &AppWindow, server: &RemoteServerHandle) {
-    let credentials = server.credentials.lock().unwrap();
+    let Ok(credentials) = server.credentials.try_lock() else {
+        return;
+    };
+    let code = credentials.info.code.clone();
+    let uri = credentials.info.uri();
+    drop(credentials);
     let ui = app.global::<Ui>();
-    ui.set_pairing_code(credentials.info.code.clone().into());
-    ui.set_pairing_uri(credentials.info.uri().into());
-    if let Ok(image) = remote_server::render_qr_image(&credentials.info.uri(), false) {
-        let mut buffer =
-            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(image.width(), image.height());
-        buffer.make_mut_bytes().copy_from_slice(image.as_raw());
-        ui.set_qr(slint::Image::from_rgba8(buffer));
-    }
+    ui.set_pairing_code(code.into());
+    ui.set_pairing_uri(uri.clone().into());
+    let weak = app.as_weak();
+    spawn(async move {
+        let encoded_uri = uri.clone();
+        let image = tokio::task::spawn_blocking(move || {
+            remote_server::render_qr_image(&encoded_uri, false)
+        })
+        .await;
+        if let (Some(app), Ok(Ok(image))) = (weak.upgrade(), image) {
+            if app.global::<Ui>().get_pairing_uri().as_str() != uri {
+                return;
+            }
+            let mut buffer =
+                slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(image.width(), image.height());
+            buffer.make_mut_bytes().copy_from_slice(image.as_raw());
+            app.global::<Ui>().set_qr(slint::Image::from_rgba8(buffer));
+        }
+    });
 }
 
 pub fn setup_app(app: &AppWindow) {
     let state = Rc::new(RefCell::new(State::default()));
+    state.borrow_mut().tools = Some(crate::model_download_ui::setup(app));
     let ui = app.global::<Ui>();
     ui.set_version(env!("CARGO_PKG_VERSION").into());
     ui.set_build_date(
@@ -184,24 +216,45 @@ pub fn setup_app(app: &AppWindow) {
         let weak = app.as_weak();
         let state = state.clone();
         spawn(async move {
-            match AleEngineFactory::create_default().await {
+            match tokio::spawn(AleEngineFactory::create_default())
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ale_core::AleError::Other(anyhow::anyhow!(
+                        "ENGINE_START_FAILED"
+                    )))
+                }) {
                 Ok(engine) => {
                     let config = engine.config().clone();
+                    let memory_available = engine.memory_available();
                     let engine = Arc::new(Mutex::new(engine));
                     if let Some(app) = weak.upgrade() {
                         apply(&app, &config);
                         state.borrow_mut().saved = config;
                         state.borrow_mut().engine = Some(engine.clone());
                         app.global::<Ui>().set_ready(true);
+                        if !memory_available {
+                            feedback(&app, "记忆文件无法加载，已保留原文件；其他功能仍可使用。 / Memory unavailable; original file preserved.", true);
+                        }
                     } else {
                         return;
                     }
-                    match remote_server::start(engine).await {
+                    state.borrow_mut().settings = Some(
+                        crate::settings_service::SettingsService::start(engine.clone(), None),
+                    );
+                    match tokio::spawn(remote_server::start(engine.clone()))
+                        .await
+                        .unwrap_or_else(|_| Err("SERVICE_START_FAILED".into()))
+                    {
                         Ok(server) => {
                             server.platform.set_sensitive_ui_visible(true);
                             if let Some(app) = weak.upgrade() {
                                 qr(&app, &server);
                             }
+                            state.borrow_mut().settings =
+                                Some(crate::settings_service::SettingsService::start(
+                                    engine.clone(),
+                                    server.modeld.clone(),
+                                ));
                             state.borrow_mut().server = Some(server);
                         }
                         Err(error) => {
@@ -307,8 +360,23 @@ pub fn setup_app(app: &AppWindow) {
                 return;
             }
             if let Some(server) = &state.borrow().server {
-                server.refresh_pairing();
-                qr(&app, server);
+                let credentials = server.credentials.clone();
+                let weak = app.as_weak();
+                let state = state.clone();
+                spawn(async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Ok(mut credentials) = credentials.lock() {
+                            credentials.info.code = crate::remote_crypto::pairing_code();
+                            credentials.expires = Instant::now() + Duration::from_secs(120);
+                        }
+                    })
+                    .await;
+                    if let Some(app) = weak.upgrade() {
+                        if let Some(server) = &state.borrow().server {
+                            qr(&app, server);
+                        }
+                    }
+                });
                 return;
             }
             let engine = state.borrow().engine.clone();
@@ -317,12 +385,19 @@ pub fn setup_app(app: &AppWindow) {
                 let weak = app.as_weak();
                 app.global::<Ui>().set_busy(true);
                 spawn(async move {
-                    let result = remote_server::start(engine).await;
+                    let result = tokio::spawn(remote_server::start(engine.clone()))
+                        .await
+                        .unwrap_or_else(|_| Err("SERVICE_START_FAILED".into()));
                     if let Some(app) = weak.upgrade() {
                         match result {
                             Ok(server) => {
                                 server.platform.set_sensitive_ui_visible(true);
                                 qr(&app, &server);
+                                state.borrow_mut().settings =
+                                    Some(crate::settings_service::SettingsService::start(
+                                        engine.clone(),
+                                        server.modeld.clone(),
+                                    ));
                                 state.borrow_mut().server = Some(server);
                                 feedback(&app, "", false);
                             }
@@ -337,17 +412,13 @@ pub fn setup_app(app: &AppWindow) {
     {
         let state = state.clone();
         ui.on_select_device(move |index| {
-            let selected = state.borrow().server.as_ref().and_then(|server| {
-                server
-                    .hub
-                    .0
-                    .lock()
-                    .unwrap()
-                    .sessions
-                    .keys()
-                    .nth(index.max(0) as usize)
-                    .cloned()
-            });
+            let selected = state
+                .borrow()
+                .cached_hub
+                .sessions
+                .keys()
+                .nth(index.max(0) as usize)
+                .cloned();
             if let Some(selected) = selected {
                 state.borrow_mut().selected = selected;
             }
@@ -360,7 +431,10 @@ pub fn setup_app(app: &AppWindow) {
             let Some(app) = weak.upgrade() else { return };
             let state = state.borrow();
             let Some(server) = &state.server else { return };
-            let mut hub = server.hub.0.lock().unwrap();
+            let Ok(mut hub) = server.hub.0.try_lock() else {
+                feedback(&app, "后台正忙，请重试 / Service busy", true);
+                return;
+            };
             let Some(session) = hub.sessions.get_mut(&state.selected) else {
                 return;
             };
@@ -388,9 +462,13 @@ pub fn setup_app(app: &AppWindow) {
                     })
                 }
             };
-            match session.controls.try_send(command) {
+            let sent = session.controls.try_send(command);
+            if sent.is_ok() {
+                session.decision = None;
+            }
+            drop(hub);
+            match sent {
                 Ok(()) => {
-                    session.decision = None;
                     app.global::<Ui>().set_can_confirm(false);
                 }
                 Err(_) => feedback(
@@ -572,7 +650,7 @@ pub fn setup_app(app: &AppWindow) {
                     .as_ref()
                     .and_then(|s| s.modeld.clone());
                 let health = if let Some(client) = client {
-                    tokio::time::timeout(Duration::from_secs(3), client.health())
+                    tokio::spawn(async move { client.health().await })
                         .await
                         .ok()
                         .and_then(Result::ok)
@@ -591,6 +669,15 @@ pub fn setup_app(app: &AppWindow) {
                             _ => ModelCapability::ElementGrounding,
                         };
                         let state = match &health {
+                            _ if *name == "SenseVoiceSmall"
+                                && cfg!(all(windows, target_env = "gnu")) =>
+                            {
+                                if en {
+                                    "Unsupported in this build"
+                                } else {
+                                    "此构建不支持"
+                                }
+                            }
                             None => {
                                 if en {
                                     "Unavailable"
@@ -676,56 +763,46 @@ fn save(app: &AppWindow, state: Rc<RefCell<State>>) {
         return;
     }
     let config = match draft(app, &state.borrow().saved) {
-        Ok(c) => c,
-        Err(e) => {
-            feedback(app, &e, true);
+        Ok(config) => config,
+        Err(error) => {
+            feedback(app, &error, true);
             return;
         }
     };
-    let Some(engine) = state.borrow().engine.clone() else {
-        return;
-    };
-    let previous = state.borrow().saved.clone();
-    let client = state
+    let receiver = match state
         .borrow()
-        .server
+        .settings
         .as_ref()
-        .and_then(|s| s.modeld.clone());
-    ui.set_busy(true);
+        .map(|service| service.submit(config))
+    {
+        Some(Ok(receiver)) => receiver,
+        Some(Err(error)) => {
+            feedback(app, &error, true);
+            return;
+        }
+        None => {
+            feedback(app, "设置服务未就绪 / Settings not ready", true);
+            return;
+        }
+    };
+    state.borrow_mut().save_generation += 1;
+    let generation = state.borrow().save_generation;
+    ui.set_saving(true);
+    feedback(app, "正在保存设置… / Saving settings…", false);
     let weak = app.as_weak();
     spawn(async move {
-        let result = async {
-            engine
-                .lock()
-                .await
-                .update_config(config.clone())
-                .map_err(|e| e.to_string())?;
-            if let Some(client) = client {
-                if let Err(error) = client.update_config(config.clone()).await {
-                    engine.lock().await.update_config(previous).map_err(|_| {
-                        "Model sync failed and settings rollback failed; re-enter settings"
-                            .to_string()
-                    })?;
-                    return Err(error);
-                }
-            }
-            Ok::<_, String>(())
+        let result = receiver
+            .await
+            .unwrap_or_else(|_| Err("SETTINGS_SERVICE_STOPPED".into()));
+        if state.borrow().save_generation != generation {
+            return;
         }
-        .await;
         if let Some(app) = weak.upgrade() {
             match result {
-                Ok(()) => {
+                Ok(config) => {
                     state.borrow_mut().saved = config.clone();
                     apply(&app, &config);
-                    feedback(
-                        &app,
-                        if app.global::<Ui>().get_english() {
-                            "Settings saved"
-                        } else {
-                            "设置已保存"
-                        },
-                        false,
-                    );
+                    feedback(&app, "设置已保存 / Settings saved", false);
                     let target = std::mem::take(&mut state.borrow_mut().destination);
                     if !target.is_empty() {
                         page(&app, &state.borrow(), &target);
@@ -733,12 +810,13 @@ fn save(app: &AppWindow, state: Rc<RefCell<State>>) {
                 }
                 Err(error) => feedback(&app, &error, true),
             }
-            app.global::<Ui>().set_busy(false);
+            app.global::<Ui>().set_saving(false);
         }
     });
 }
 
 fn render_state(app: &AppWindow, state: &mut State) {
+    let _stage = crate::diagnostics::stage("ui_snapshot");
     let ui = app.global::<Ui>();
     let en = ui.get_english();
     let Some(server) = &state.server else {
@@ -752,16 +830,26 @@ fn render_state(app: &AppWindow, state: &mut State) {
         );
         return;
     };
-    let remaining = server
-        .credentials
-        .lock()
-        .unwrap()
-        .expires
-        .saturating_duration_since(Instant::now())
-        .as_secs() as i32;
+    if let Ok(credentials) = server.credentials.try_lock() {
+        state.pairing_expires = Some(credentials.expires);
+    }
+    let remaining = state
+        .pairing_expires
+        .map(|expiry| expiry.saturating_duration_since(Instant::now()).as_secs() as i32)
+        .unwrap_or(0);
     ui.set_remaining(remaining);
-    let mut hub = server.hub.0.lock().unwrap();
-    hub.mute_speech = !state.saved.ui.auto_speak;
+    if let Ok(mut hub) = server.hub.0.try_lock() {
+        hub.mute_speech = !state.saved.ui.auto_speak;
+        state.cached_hub = hub.clone();
+        state.snapshot_time = Some(Instant::now());
+    }
+    ui.set_state_age_ms(
+        state
+            .snapshot_time
+            .map(|time| time.elapsed().as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(0),
+    );
+    let hub = &mut state.cached_hub;
     if !hub.sessions.contains_key(&state.selected) {
         state.selected = hub.sessions.keys().next().cloned().unwrap_or_default();
     }
@@ -872,7 +960,6 @@ fn render_state(app: &AppWindow, state: &mut State) {
     if ui.get_logs().iter().collect::<Vec<_>>() != logs {
         ui.set_logs(ModelRc::new(VecModel::from(logs)));
     }
-    drop(hub);
     if !connected && ui.get_page() == "main" {
         page(app, state, "pairing");
     }

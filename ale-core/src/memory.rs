@@ -2,11 +2,13 @@ use crate::{AleError, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub use crate::context::MemoryEntry;
 
 const MEMORY_SCHEMA_VERSION: u32 = 1;
+pub const MAX_MEMORY_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryFile {
@@ -30,6 +32,7 @@ impl Default for MemoryFile {
 pub struct MemoryStore {
     path: PathBuf,
     memories: Vec<MemoryEntry>,
+    available: bool,
 }
 
 /// 从一次交互中提取候选长期记忆。
@@ -57,6 +60,7 @@ impl MemoryStore {
         Self {
             path: path.into(),
             memories: Vec::new(),
+            available: true,
         }
     }
 
@@ -75,35 +79,106 @@ impl MemoryStore {
         Ok(store)
     }
 
+    /// A damaged/oversized store must never prevent startup or be overwritten by an empty store.
+    pub fn load_preserving(path: impl Into<PathBuf>) -> Self {
+        let mut store = Self::new(path);
+        if store.load().is_err() {
+            store.available = false;
+            crate::diagnostics::record("memory_disabled_preserve_original", &[]);
+            tracing::warn!(
+                stage = "memory_load",
+                result = "disabled_preserve_original",
+                "Memory unavailable; original file preserved"
+            );
+        }
+        store
+    }
+
+    pub fn available(&self) -> bool {
+        self.available
+    }
+
+    fn require_available(&self) -> Result<()> {
+        if !self.available {
+            return Err(AleError::ConfigError("Memory is disabled because its file could not be loaded; preserve and repair the original file before retrying".into()));
+        }
+        Ok(())
+    }
+
     pub fn load(&mut self) -> Result<()> {
+        self.require_available()?;
         if !self.path.exists() {
             self.save()?;
             return Ok(());
         }
-
-        let content = std::fs::read_to_string(&self.path)?;
-        if content.trim().is_empty() {
-            self.memories.clear();
-            return Ok(());
+        let file = std::fs::File::open(&self.path)?;
+        if file.metadata()?.len() > MAX_MEMORY_FILE_BYTES {
+            return Err(AleError::ConfigError(
+                "Memory file exceeds 32 MiB; original file preserved".into(),
+            ));
         }
-
-        let file: MemoryFile = serde_json::from_str(&content)?;
-        self.memories = dedupe(file.memories);
+        let mut content = String::new();
+        file.take(MAX_MEMORY_FILE_BYTES + 1)
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > MAX_MEMORY_FILE_BYTES {
+            return Err(AleError::ConfigError(
+                "Memory file exceeds 32 MiB; original file preserved".into(),
+            ));
+        }
+        let memories = if content.trim().is_empty() {
+            Vec::new()
+        } else {
+            let file: MemoryFile = serde_json::from_str(&content)?;
+            if file.version != MEMORY_SCHEMA_VERSION {
+                return Err(AleError::ConfigError(
+                    "Unsupported memory schema; original file preserved".into(),
+                ));
+            }
+            let mut memories = file.memories;
+            for memory in &mut memories {
+                normalize_entry(memory)?;
+            }
+            memories
+        };
+        self.memories = memories;
         Ok(())
     }
 
-    pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn save_entries(&self, memories: &[MemoryEntry]) -> Result<()> {
+        self.require_available()?;
+        #[derive(Serialize)]
+        struct FileRef<'a> {
+            version: u32,
+            memories: &'a [MemoryEntry],
         }
+        struct LimitedBuffer(Vec<u8>);
+        impl Write for LimitedBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.0.len().saturating_add(bytes.len()) as u64 > MAX_MEMORY_FILE_BYTES {
+                    return Err(std::io::Error::other(
+                        "Memory file would exceed 32 MiB; existing memories preserved",
+                    ));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = LimitedBuffer(Vec::new());
+        serde_json::to_writer_pretty(
+            &mut output,
+            &FileRef {
+                version: MEMORY_SCHEMA_VERSION,
+                memories,
+            },
+        )?;
+        crate::config::atomic_config_write(&self.path, &output.0)
+    }
 
-        let file = MemoryFile {
-            version: MEMORY_SCHEMA_VERSION,
-            memories: self.memories.clone(),
-        };
-        let content = serde_json::to_string_pretty(&file)?;
-        std::fs::write(&self.path, content)?;
-        Ok(())
+    pub fn save(&self) -> Result<()> {
+        self.save_entries(&self.memories)
     }
 
     pub fn path(&self) -> &Path {
@@ -118,34 +193,49 @@ impl MemoryStore {
         self.memories
     }
 
-    pub fn add(&mut self, mut entry: MemoryEntry) -> Result<bool> {
-        normalize_entry(&mut entry)?;
-        if self
-            .memories
-            .iter()
-            .any(|memory| same_memory(memory, &entry))
-        {
-            return Ok(false);
-        }
+    pub fn add(&mut self, entry: MemoryEntry) -> Result<bool> {
+        Ok(self.add_many(vec![entry])? > 0)
+    }
 
-        self.memories.push(entry);
-        self.save()?;
-        Ok(true)
+    /// One atomic commit for a whole interaction; failure leaves memory and disk unchanged.
+    pub fn add_many(&mut self, entries: Vec<MemoryEntry>) -> Result<usize> {
+        self.require_available()?;
+        let mut next = self.memories.clone();
+        let mut added = 0;
+        for mut entry in entries {
+            normalize_entry(&mut entry)?;
+            if !next.iter().any(|old| same_memory(old, &entry)) {
+                next.push(entry);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.save_entries(&next)?;
+            self.memories = next;
+        }
+        Ok(added)
     }
 
     pub fn delete(&mut self, id: &str) -> Result<bool> {
-        let before = self.memories.len();
-        self.memories.retain(|memory| memory.id != id);
-        let deleted = self.memories.len() != before;
-        if deleted {
-            self.save()?;
+        self.require_available()?;
+        let next: Vec<_> = self
+            .memories
+            .iter()
+            .filter(|m| m.id != id)
+            .cloned()
+            .collect();
+        if next.len() == self.memories.len() {
+            return Ok(false);
         }
-        Ok(deleted)
+        self.save_entries(&next)?;
+        self.memories = next;
+        Ok(true)
     }
 
     pub fn clear(&mut self) -> Result<()> {
+        self.save_entries(&[])?;
         self.memories.clear();
-        self.save()
+        Ok(())
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<&MemoryEntry> {
@@ -169,7 +259,12 @@ impl MemoryStore {
             })
             .collect::<Vec<_>>();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let keep = limit.min(scored.len());
+        if keep < scored.len() {
+            scored.select_nth_unstable_by(keep, |a, b| b.1.total_cmp(&a.1));
+            scored.truncate(keep);
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
         scored
             .into_iter()
             .filter(|(_, score)| *score > 0.0)
@@ -182,6 +277,11 @@ impl MemoryStore {
 fn normalize_entry(entry: &mut MemoryEntry) -> Result<()> {
     entry.content = entry.content.trim().to_string();
     entry.source = entry.source.trim().to_string();
+    if !entry.importance.is_finite() {
+        return Err(AleError::ConfigError(
+            "Memory importance must be finite".into(),
+        ));
+    }
     entry.importance = entry.importance.clamp(0.0, 1.0);
     entry.tags = entry
         .tags
@@ -506,21 +606,6 @@ fn dedupe_candidates(memories: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
     deduped
 }
 
-fn dedupe(memories: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-    for mut memory in memories {
-        if normalize_entry(&mut memory).is_err() {
-            continue;
-        }
-        let key = memory.content.to_lowercase();
-        if seen.insert(key) {
-            deduped.push(memory);
-        }
-    }
-    deduped
-}
-
 fn same_memory(left: &MemoryEntry, right: &MemoryEntry) -> bool {
     left.content.eq_ignore_ascii_case(&right.content)
 }
@@ -561,6 +646,85 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
         path
+    }
+
+    #[test]
+    fn oversized_or_invalid_memory_is_disabled_without_modifying_source() {
+        let path = test_path("oversize");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_MEMORY_FILE_BYTES + 1).unwrap();
+        drop(file);
+        let mut store = MemoryStore::load_preserving(&path);
+        assert!(!store.available());
+        assert!(store
+            .add(MemoryEntry::new("new".into(), 0.5, "test".into()))
+            .is_err());
+        assert!(store.clear().is_err());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            MAX_MEMORY_FILE_BYTES + 1
+        );
+        std::fs::write(&path, b"{invalid").unwrap();
+        let store = MemoryStore::load_preserving(&path);
+        assert!(!store.available());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{invalid");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_memory_commit_does_not_change_in_memory_state() {
+        let path = test_path("failed-commit");
+        let mut store = MemoryStore::load_or_create(&path).unwrap();
+        store
+            .add(MemoryEntry::new("old".into(), 0.5, "test".into()))
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let blocked = path.with_extension("directory");
+        std::fs::create_dir(&blocked).unwrap();
+        store.path = blocked.clone();
+        assert!(store
+            .add(MemoryEntry::new("new".into(), 0.5, "test".into()))
+            .is_err());
+        assert!(store.clear().is_err());
+        assert_eq!(store.memories().len(), 1);
+        assert_eq!(store.memories()[0].content, "old");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_dir(blocked).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn oversized_addition_preserves_existing_memories_and_file() {
+        let path = test_path("oversized-addition");
+        let mut store = MemoryStore::load_or_create(&path).unwrap();
+        store
+            .add(MemoryEntry::new("old".into(), 0.5, "test".into()))
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(store
+            .add(MemoryEntry::new(
+                "x".repeat(MAX_MEMORY_FILE_BYTES as usize),
+                0.5,
+                "test".into()
+            ))
+            .is_err());
+        assert_eq!(store.memories().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn batch_commit_preserves_all_unique_entries() {
+        let path = test_path("batch");
+        let mut store = MemoryStore::load_or_create(&path).unwrap();
+        let entries = ["one", "two", "one"]
+            .into_iter()
+            .map(|s| MemoryEntry::new(s.into(), 0.5, "test".into()))
+            .collect();
+        assert_eq!(store.add_many(entries).unwrap(), 2);
+        let loaded = MemoryStore::load_or_create(&path).unwrap();
+        assert_eq!(loaded.memories().len(), 2);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

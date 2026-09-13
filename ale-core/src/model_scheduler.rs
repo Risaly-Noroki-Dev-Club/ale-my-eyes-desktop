@@ -322,6 +322,8 @@ pub struct RouteDecision {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelJob {
     #[serde(default)]
+    pub runtime_snapshot: Option<ModelRuntimeConfig>,
+    #[serde(default)]
     pub remote_snapshot: Option<RemoteProviderSet>,
     pub request_id: String,
     pub capability: ModelCapability,
@@ -394,6 +396,8 @@ pub enum RemoteEndpointRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerHealth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SchedulerDiagnostics>,
     pub service: String,
     pub protocol_version: u32,
     pub local_vlm_gpu_only: bool,
@@ -403,6 +407,24 @@ pub struct SchedulerHealth {
     pub hot_worker: Option<ModelWorkerHealth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensevoice_state: Option<LocalModelState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchedulerDiagnostics {
+    pub gpu_probe_state: String,
+    pub gpu_sample_age_ms: Option<u64>,
+    pub gpu_error_code: Option<String>,
+    pub active_jobs: usize,
+    pub admitted_bytes: usize,
+    pub local_asr_supported: bool,
+}
+
+/// Committed as one revision; in-flight requests keep their captured configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulerConfiguration {
+    pub revision: u64,
+    pub providers: RemoteProviderSet,
+    pub models: ModelRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

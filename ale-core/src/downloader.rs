@@ -2,10 +2,12 @@ use crate::model_scheduler::{ModelArtifact, ModelManifest};
 use crate::{AleError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::io::AsyncWriteExt;
 
 /// 模型信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,17 +53,23 @@ pub struct InstalledModelPackage {
 }
 
 /// 模型下载器
+#[derive(Clone)]
 pub struct ModelDownloader {
     models_dir: PathBuf,
-    progress_callback: Option<ProgressCallback>,
+    progress_callback: Option<Arc<dyn Fn(DownloadProgress) + Send + Sync>>,
     client: reqwest::Client,
     known_models: Vec<ModelInfo>,
+    active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    test_url: Option<String>,
 }
 
 impl ModelDownloader {
     pub fn new(models_dir: &Path) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -70,12 +78,16 @@ impl ModelDownloader {
             progress_callback: None,
             client,
             known_models: Self::default_known_models(),
+            active: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(3)),
+            #[cfg(test)]
+            test_url: None,
         }
     }
 
     /// 设置进度回调
     pub fn set_progress_callback(&mut self, callback: ProgressCallback) {
-        self.progress_callback = Some(callback);
+        self.progress_callback = Some(callback.into());
     }
 
     pub fn package_consent(
@@ -91,10 +103,73 @@ impl ModelDownloader {
         })
     }
 
+    async fn run_owned<T: Send + 'static>(
+        &self,
+        run: impl FnOnce(
+                Self,
+                Arc<AtomicBool>,
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>
+            + Send
+            + 'static,
+    ) -> Result<T> {
+        let permit = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AleError::ConfigError("Model download worker is busy".into()))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = CancelOnDrop(cancel.clone());
+        let downloader = self.clone();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            run(downloader, cancel).await
+        });
+        let result = task
+            .await
+            .map_err(|_| AleError::ConfigError("Model download worker failed".into()))?;
+        drop(guard);
+        result
+    }
+
     pub async fn install_package(
         &self,
         manifest: &ModelManifest,
         consent: &ModelInstallConsent,
+    ) -> Result<InstalledModelPackage> {
+        let manifest = manifest.clone();
+        let consent = consent.clone();
+        self.run_owned(move |downloader, cancel| {
+            Box::pin(async move {
+                downloader
+                    .install_package_inner(&manifest, &consent, cancel)
+                    .await
+            })
+        })
+        .await
+    }
+
+    fn reserve(&self, target: PathBuf) -> Result<ActiveTarget> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| AleError::ConfigError("Download state unavailable".into()))?;
+        if !active.insert(target.clone()) {
+            return Err(AleError::ConfigError(
+                "A download for this destination is already active".into(),
+            ));
+        }
+        Ok(ActiveTarget {
+            active: self.active.clone(),
+            target,
+        })
+    }
+
+    async fn install_package_inner(
+        &self,
+        manifest: &ModelManifest,
+        consent: &ModelInstallConsent,
+        cancel: Arc<AtomicBool>,
     ) -> Result<InstalledModelPackage> {
         let package = manifest.package(&consent.package_id)?;
         let expected = Self::package_consent(manifest, &package.id)?;
@@ -105,14 +180,23 @@ impl ModelDownloader {
         }
 
         let package_dir = self.models_dir.join(&package.id);
-        std::fs::create_dir_all(&package_dir)?;
+        let _active = self.reserve(package_dir.clone())?;
+        tokio::fs::create_dir_all(&package_dir).await?;
         let mut installed = Vec::with_capacity(package.artifacts.len());
         for artifact in &package.artifacts {
             let target = package_dir.join(&artifact.filename);
-            if target.is_file() {
-                verify_artifact(&target, artifact)?;
+            check_cancel(&cancel)?;
+            if tokio::fs::try_exists(&target).await? {
+                let path = target.clone();
+                let artifact = artifact.clone();
+                let flag = cancel.clone();
+                tokio::task::spawn_blocking(move || {
+                    verify_artifact_cancellable(&path, &artifact, &flag)
+                })
+                .await
+                .map_err(|_| AleError::ConfigError("Model verification worker failed".into()))??;
             } else {
-                self.download_pinned_artifact(&package.id, artifact, &target)
+                self.download_pinned_artifact(&package.id, artifact, &target, &cancel)
                     .await?;
             }
             installed.push(target);
@@ -152,15 +236,13 @@ impl ModelDownloader {
         package_id: &str,
         artifact: &ModelArtifact,
         target: &Path,
+        cancel: &AtomicBool,
     ) -> Result<()> {
-        let response = self
-            .client
-            .get(&artifact.url)
-            .send()
-            .await
-            .map_err(|error| {
-                AleError::Other(anyhow::anyhow!("Download request failed: {error}"))
-            })?;
+        let response = tokio::select! {
+            response = self.client.get(&artifact.url).send() => response,
+            _ = cancelled(cancel) => return Err(cancel_error()),
+        }
+        .map_err(|error| AleError::Other(anyhow::anyhow!("Download request failed: {error}")))?;
         if !response.status().is_success() {
             return Err(AleError::Other(anyhow::anyhow!(
                 "Download failed with status: {}",
@@ -178,13 +260,15 @@ impl ModelDownloader {
 
         let temp = target.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
         let result = async {
-            let mut file = std::fs::File::create(&temp)?;
+            let mut file = tokio::fs::File::create(&temp).await?;
             let mut hasher = Sha256::new();
             let mut downloaded = 0_u64;
             let started = std::time::Instant::now();
             let mut stream = response.bytes_stream();
             use futures::StreamExt;
-            while let Some(chunk) = stream.next().await {
+            loop {
+                let chunk = tokio::select! { chunk = stream.next() => chunk, _ = cancelled(cancel) => return Err(cancel_error()) };
+                let Some(chunk) = chunk else { break };
                 let chunk = chunk
                     .map_err(|error| AleError::Other(anyhow::anyhow!("Download error: {error}")))?;
                 downloaded = downloaded.checked_add(chunk.len() as u64).ok_or_else(|| {
@@ -195,11 +279,13 @@ impl ModelDownloader {
                         "Downloaded artifact exceeds pinned size"
                     )));
                 }
-                file.write_all(&chunk)?;
+                file.write_all(&chunk).await?;
                 hasher.update(&chunk);
                 self.report_package_progress(package_id, artifact.size_bytes, downloaded, started);
             }
-            file.sync_all()?;
+            file.sync_all().await?;
+            drop(file);
+            check_cancel(cancel)?;
             if downloaded != artifact.size_bytes {
                 return Err(AleError::Other(anyhow::anyhow!(
                     "Downloaded artifact is shorter than pinned size"
@@ -211,12 +297,12 @@ impl ModelDownloader {
                     "Downloaded artifact SHA-256 mismatch"
                 )));
             }
-            std::fs::rename(&temp, target)?;
+            tokio::fs::rename(&temp, target).await?;
             Ok(())
         }
         .await;
         if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
+            let _ = tokio::fs::remove_file(&temp).await;
         }
         result
     }
@@ -245,7 +331,11 @@ impl ModelDownloader {
                 model_id: package_id.to_string(),
                 total_bytes,
                 downloaded_bytes,
-                progress: downloaded_bytes as f32 / total_bytes as f32,
+                progress: if total_bytes == 0 {
+                    0.0
+                } else {
+                    (downloaded_bytes as f32 / total_bytes as f32).min(1.0)
+                },
                 speed,
                 eta,
             });
@@ -349,95 +439,102 @@ impl ModelDownloader {
 
     /// 下载模型
     pub async fn download_model(&self, model_id: &str) -> Result<PathBuf> {
+        let id = model_id.to_owned();
+        self.run_owned(move |downloader, cancel| {
+            Box::pin(async move { downloader.download_model_inner(&id, cancel).await })
+        })
+        .await
+    }
+
+    async fn download_model_inner(
+        &self,
+        model_id: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<PathBuf> {
         let model = self
             .get_model_info(model_id)
-            .ok_or_else(|| AleError::Other(anyhow::anyhow!("Unknown model: {}", model_id)))?
+            .ok_or_else(|| AleError::ConfigError("Unknown model".into()))?
             .clone();
-
-        // 检查是否已下载
-        let target_path = self.models_dir.join(&model.filename);
-        if target_path.exists() {
-            return Ok(target_path);
+        let target = self.models_dir.join(&model.filename);
+        let _active = self.reserve(target.clone())?;
+        if tokio::fs::try_exists(&target).await? {
+            return Ok(target);
         }
-
-        // 确保目录存在
-        std::fs::create_dir_all(&self.models_dir)?;
-
-        // 构建下载URL
+        tokio::fs::create_dir_all(&self.models_dir).await?;
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             model.repo, model.filename
         );
-
-        // 开始下载
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| AleError::Other(anyhow::anyhow!("Download request failed: {}", e)))?;
-
+        #[cfg(test)]
+        let url = self.test_url.clone().unwrap_or(url);
+        let response = tokio::select! {
+            response = self.client.get(url).send() => response.map_err(|_| AleError::CloudApiError("Model download connection failed".into()))?,
+            _ = cancelled(&cancel) => return Err(cancel_error()),
+        };
         if !response.status().is_success() {
-            return Err(AleError::Other(anyhow::anyhow!(
-                "Download failed with status: {}",
-                response.status()
+            return Err(AleError::CloudApiError(format!(
+                "Model download HTTP {}",
+                response.status().as_u16()
             )));
         }
-
-        // 获取文件大小
-        let total_size = response.content_length().unwrap_or(model.size);
-
-        // 创建临时文件
-        let temp_path = target_path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temp_path)?;
-
-        // 下载并写入文件
-        let mut downloaded: u64 = 0;
-        let start_time = std::time::Instant::now();
-        let mut stream = response.bytes_stream();
-
-        use futures::StreamExt;
-        use std::io::Write;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| AleError::Other(anyhow::anyhow!("Download error: {}", e)))?;
-            file.write_all(&chunk)?;
-
-            downloaded += chunk.len() as u64;
-
-            // 计算进度
-            let progress = downloaded as f32 / total_size as f32;
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let speed = if elapsed > 0.0 {
-                downloaded as f32 / elapsed
-            } else {
-                0.0
-            };
-            let remaining_bytes = total_size - downloaded;
-            let eta = if speed > 0.0 {
-                (remaining_bytes as f32 / speed) as u32
-            } else {
-                0
-            };
-
-            // 调用进度回调
-            if let Some(callback) = &self.progress_callback {
-                callback(DownloadProgress {
-                    model_id: model_id.to_string(),
-                    total_bytes: total_size,
-                    downloaded_bytes: downloaded,
-                    progress,
-                    speed,
-                    eta,
-                });
+        let expected = response.content_length();
+        let total = expected.unwrap_or(model.size);
+        let temp = target.with_extension(format!("{}.partial", uuid::Uuid::new_v4()));
+        let result = async {
+            let mut file = tokio::fs::File::create(&temp).await?;
+            let started = std::time::Instant::now();
+            let mut downloaded = 0u64;
+            let mut stream = response.bytes_stream();
+            use futures::StreamExt;
+            loop {
+                let chunk = tokio::select! { chunk = stream.next() => chunk, _ = cancelled(&cancel) => return Err(cancel_error()) };
+                let Some(chunk) = chunk else { break };
+                let chunk = chunk.map_err(|_| AleError::CloudApiError("Model download interrupted".into()))?;
+                file.write_all(&chunk).await?;
+                downloaded = downloaded.saturating_add(chunk.len() as u64);
+                self.report_package_progress(model_id, total, downloaded, started);
             }
-        }
+            file.sync_all().await?;
+            drop(file);
+            check_cancel(&cancel)?;
+            if expected.is_some_and(|size| size != downloaded) { return Err(AleError::ConfigError("Model download incomplete".into())); }
+            if tokio::fs::try_exists(&target).await? { return Err(AleError::ConfigError("Destination appeared during download; existing model preserved".into())); }
+            tokio::fs::rename(&temp, &target).await?;
+            Ok(target.clone())
+        }.await;
+        let _ = tokio::fs::remove_file(&temp).await;
+        result
+    }
 
-        // 重命名临时文件
-        std::fs::rename(&temp_path, &target_path)?;
-
-        Ok(target_path)
+    pub async fn verify_package_async(
+        &self,
+        manifest: &ModelManifest,
+        package_id: &str,
+    ) -> Result<InstalledModelPackage> {
+        let manifest = manifest.clone();
+        let id = package_id.to_owned();
+        self.run_owned(move |downloader, cancel| {
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    let package = manifest.package(&id)?;
+                    let directory = downloader.models_dir.join(&id);
+                    let mut artifacts = Vec::new();
+                    for artifact in &package.artifacts {
+                        let path = directory.join(&artifact.filename);
+                        verify_artifact_cancellable(&path, artifact, &cancel)?;
+                        artifacts.push(path);
+                    }
+                    Ok(InstalledModelPackage {
+                        package_id: id,
+                        directory,
+                        artifacts,
+                    })
+                })
+                .await
+                .map_err(|_| AleError::ConfigError("Model verification worker failed".into()))?
+            })
+        })
+        .await
     }
 
     /// 删除模型
@@ -503,6 +600,14 @@ impl ModelDownloader {
 }
 
 fn verify_artifact(path: &Path, artifact: &ModelArtifact) -> Result<()> {
+    verify_artifact_cancellable(path, artifact, &AtomicBool::new(false))
+}
+
+fn verify_artifact_cancellable(
+    path: &Path,
+    artifact: &ModelArtifact,
+    cancel: &AtomicBool,
+) -> Result<()> {
     let metadata = std::fs::metadata(path).map_err(|error| {
         AleError::Other(anyhow::anyhow!(
             "Pinned model artifact is unavailable at {}: {error}",
@@ -519,6 +624,7 @@ fn verify_artifact(path: &Path, artifact: &ModelArtifact) -> Result<()> {
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        check_cancel(cancel)?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -537,64 +643,121 @@ fn verify_artifact(path: &Path, artifact: &ModelArtifact) -> Result<()> {
 
 /// 模型下载管理器（带缓存和并发控制）
 pub struct ModelDownloadManager {
-    downloader: Arc<Mutex<ModelDownloader>>,
+    downloader: ModelDownloader,
     max_concurrent_downloads: usize,
 }
 
 impl ModelDownloadManager {
     pub fn new(models_dir: &Path, max_concurrent: usize) -> Self {
+        let max = max_concurrent.max(1);
+        let mut downloader = ModelDownloader::new(models_dir);
+        downloader.slots = Arc::new(tokio::sync::Semaphore::new(max));
         Self {
-            downloader: Arc::new(Mutex::new(ModelDownloader::new(models_dir))),
-            max_concurrent_downloads: max_concurrent,
+            downloader,
+            max_concurrent_downloads: max,
         }
     }
 
-    /// 批量下载模型
     pub async fn download_models(&self, model_ids: &[&str]) -> Result<Vec<PathBuf>> {
-        let downloader = self.downloader.lock().await;
         let mut paths = Vec::new();
-
-        for model_id in model_ids {
-            let path = downloader.download_model(model_id).await?;
-            paths.push(path);
+        for id in model_ids {
+            paths.push(self.downloader.download_model(id).await?);
         }
-
         Ok(paths)
     }
 
-    /// 并发下载模型（限制并发数）
     pub async fn download_models_concurrent(&self, model_ids: &[&str]) -> Result<Vec<PathBuf>> {
+        use futures::{stream::FuturesUnordered, StreamExt};
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = CancelOnDrop(cancel.clone());
         let downloader = self.downloader.clone();
-        let mut handles = Vec::new();
-
-        for chunk in model_ids.chunks(self.max_concurrent_downloads) {
-            let downloader = downloader.clone();
-            let chunk: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
-
-            let handle = tokio::spawn(async move {
-                let downloader = downloader.lock().await;
-                let mut paths = Vec::new();
-
-                for model_id in chunk {
-                    let path = downloader.download_model(&model_id).await?;
-                    paths.push(path);
+        let ids: Vec<String> = model_ids.iter().map(|id| (*id).to_owned()).collect();
+        let max = self.max_concurrent_downloads;
+        // Supervisor outlives an abandoned waiter and joins every active transfer before exit.
+        let task = tokio::spawn(async move {
+            let mut next = ids.into_iter().enumerate();
+            let mut active = FuturesUnordered::new();
+            let mut results = Vec::new();
+            let mut failure = None;
+            loop {
+                while failure.is_none() && !cancel.load(Ordering::Relaxed) && active.len() < max {
+                    let Some((index, id)) = next.next() else {
+                        break;
+                    };
+                    let downloader = downloader.clone();
+                    let cancel = cancel.clone();
+                    active.push(async move {
+                        let permit =
+                            downloader.slots.clone().try_acquire_owned().map_err(|_| {
+                                AleError::ConfigError("Model download worker is busy".into())
+                            })?;
+                        let result = downloader.download_model_inner(&id, cancel).await;
+                        drop(permit);
+                        result.map(|path| (index, path))
+                    });
                 }
+                let Some(result) = active.next().await else {
+                    break;
+                };
+                match result {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            check_cancel(&cancel)?;
+            results.sort_by_key(|entry| entry.0);
+            Ok(results.into_iter().map(|entry| entry.1).collect())
+        });
+        let result = task
+            .await
+            .map_err(|_| AleError::ConfigError("Download supervisor failed".into()))?;
+        drop(guard);
+        result
+    }
+}
 
-                Ok::<Vec<PathBuf>, AleError>(paths)
-            });
-
-            handles.push(handle);
+struct CancelOnDrop(Arc<AtomicBool>);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+struct ActiveTarget {
+    active: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    target: PathBuf,
+}
+impl Drop for ActiveTarget {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.target);
         }
-
-        let mut all_paths = Vec::new();
-        for handle in handles {
-            let paths = handle
-                .await
-                .map_err(|e| AleError::Other(anyhow::anyhow!("Task join error: {}", e)))??;
-            all_paths.extend(paths);
-        }
-
-        Ok(all_paths)
+    }
+}
+fn cancel_error() -> AleError {
+    crate::model_api::ModelCallError::new(
+        crate::model_api::ErrorKind::Cancelled,
+        "Model download cancelled",
+    )
+    .into()
+}
+fn check_cancel(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(cancel_error())
+    } else {
+        Ok(())
+    }
+}
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
@@ -602,6 +765,81 @@ impl ModelDownloadManager {
 mod package_tests {
     use super::*;
     use crate::model_scheduler::{ModelCapability, ModelPackage};
+
+    #[tokio::test]
+    async fn batch_downloads_overlap_and_finish_without_temporary_files() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = std::env::temp_dir().join(format!("ale-parallel-{}", uuid::Uuid::new_v4()));
+        let mut manager = ModelDownloadManager::new(&root, 2);
+        manager.downloader.test_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut input = [0u8; 4096];
+                assert!(socket.read(&mut input).await.unwrap() > 0);
+                sockets.push(socket);
+            }
+            // Neither response is sent until both requests are in flight.
+            for mut socket in sockets {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nmodel",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let paths = manager
+            .download_models_concurrent(&["whisper-tiny", "whisper-small"])
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_eq!(std::fs::read(path).unwrap(), b"model");
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert!(manager.downloader.active.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_download_waiter_cancels_request_and_releases_destination() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = std::env::temp_dir().join(format!("ale-cancel-{}", uuid::Uuid::new_v4()));
+        let mut downloader = ModelDownloader::new(&root);
+        downloader.test_url = Some(format!("http://{}", listener.local_addr().unwrap()));
+        let observed = downloader.clone();
+        let task = tokio::spawn(async move { downloader.download_model("whisper-tiny").await });
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0u8; 4096];
+        assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.read(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        for _ in 0..100 {
+            if observed.active.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(observed.active.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
+    }
 
     fn manifest(bytes: &[u8]) -> ModelManifest {
         ModelManifest {

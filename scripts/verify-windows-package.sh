@@ -4,8 +4,9 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-archive=${1:-$repo_root/ale-my-eyes-windows.zip}
-package_dir=${2:-$repo_root/ale-my-eyes-windows}
+package_name=${WINDOWS_PACKAGE_NAME:-ale-my-eyes-windows}
+archive=${1:-$repo_root/$package_name.zip}
+package_dir=${2:-$repo_root/$package_name}
 objdump=${WINDOWS_OBJDUMP:-x86_64-w64-mingw32-objdump}
 strings_tool=${WINDOWS_STRINGS:-x86_64-w64-mingw32-strings}
 
@@ -49,7 +50,9 @@ if rg -qi 'DLL Name: (libgcc|libstdc\+\+|libwinpthread)' \
 fi
 
 rg -q '^cd /d "%~dp0"$' "$package_dir/start-gui.bat"
-rg -q '^ale-gui\.exe$' "$package_dir/start-gui.bat"
+rg -q '^start "" "%~dp0ale-gui\.exe"$' "$package_dir/start-gui.bat"
+rg -q '^exit /b$' "$package_dir/start-gui.bat"
+test -s "$package_dir/build-manifest.json"
 if rg -qi 'start-server|config/config\.json' "$package_dir"; then
     echo "Windows package contains stale startup or configuration guidance" >&2
     exit 1

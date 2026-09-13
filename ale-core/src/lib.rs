@@ -1,7 +1,12 @@
 pub mod actions;
+#[cfg(any(feature = "local-inference", test))]
+mod blocking_worker;
+pub mod child_process;
 pub mod cloud;
 pub mod config;
 pub mod context;
+pub mod desktop_download;
+pub mod diagnostics;
 pub mod downloader;
 pub mod error;
 pub mod inference;
@@ -59,10 +64,19 @@ impl AleEngine {
         config_path: &Path,
         secret_store: Arc<dyn secret_store::SecretStore>,
     ) -> Result<Self> {
-        // 加载配置
-        let mut config_manager =
-            config::ConfigManager::with_secret_store(config_path, secret_store);
-        config_manager.load()?;
+        let config_path = config_path.to_path_buf();
+        let (config_manager, memory_store) = tokio::task::spawn_blocking(move || {
+            let mut manager = config::ConfigManager::with_secret_store(&config_path, secret_store);
+            manager.load()?;
+            let memory_path = config_path
+                .parent()
+                .map(|p| p.join("memory.json"))
+                .unwrap_or_else(memory::MemoryStore::default_path);
+            let memories = memory::MemoryStore::load_preserving(memory_path);
+            Ok::<_, AleError>((manager, memories))
+        })
+        .await
+        .map_err(|_| AleError::ConfigError("Configuration worker failed".into()))??;
 
         // 检测设备性能
         let device_performance = inference::AdaptiveInference::detect_device_performance().await;
@@ -137,7 +151,7 @@ impl AleEngine {
                                     Some(config_manager.config().asr.initial_prompt.clone())
                                 },
                             );
-                        if let Err(e) = recognizer.load_model() {
+                        if let Err(e) = recognizer.load_model_async().await {
                             tracing::warn!("Failed to load whisper model weights: {}", e);
                         } else {
                             inference_engine.set_local_asr(recognizer);
@@ -156,11 +170,6 @@ impl AleEngine {
             }
         }
 
-        let memory_path = config_path
-            .parent()
-            .map(|parent| parent.join("memory.json"))
-            .unwrap_or_else(memory::MemoryStore::default_path);
-        let memory_store = memory::MemoryStore::load_or_create(memory_path)?;
         let mut context_manager = context::ContextManager::new(4000);
         context_manager.replace_memories(memory_store.memories().to_vec());
 
@@ -253,7 +262,7 @@ impl AleEngine {
                     Some(self.config_manager.config().asr.initial_prompt.clone())
                 },
             );
-        recognizer.load_model()?;
+        recognizer.load_model_async().await?;
         self.inference_engine.set_local_asr(recognizer);
         Ok(())
     }
@@ -262,7 +271,7 @@ impl AleEngine {
     #[cfg(feature = "local-inference")]
     pub async fn load_local_vlm(&mut self, model_path: &Path) -> Result<()> {
         let mut model = vlm::OnnxVlm::new(model_path).await?;
-        model.load_model()?;
+        model.load_model_async().await?;
         self.inference_engine.set_local_vlm(Arc::new(model));
         Ok(())
     }
@@ -473,13 +482,7 @@ impl AleEngine {
     /// 从一次交互中自动提取并持久化长期记忆。
     pub fn learn_from_interaction(&mut self, question: &str, answer: &str) -> Result<usize> {
         let candidates = memory::extract_memories(question, answer);
-        let mut added = 0usize;
-
-        for entry in candidates {
-            if self.memory_store.add(entry)? {
-                added += 1;
-            }
-        }
+        let added = self.memory_store.add_many(candidates)?;
 
         if added > 0 {
             self.context_manager
@@ -491,8 +494,12 @@ impl AleEngine {
 
     /// 自动下载推荐模型
     pub async fn auto_download_models(&self) -> Result<Vec<std::path::PathBuf>> {
-        let mut manager = self.model_manager.lock().await;
-        manager.auto_download_models().await
+        let ids = self.model_manager.lock().await.automatic_download_ids();
+        let mut paths = Vec::new();
+        for id in ids {
+            paths.push(self.download_model(&id).await?);
+        }
+        Ok(paths)
     }
 
     /// 获取模型状态
@@ -509,6 +516,30 @@ impl AleEngine {
     /// 更新配置
     pub fn update_config(&mut self, config: config::AppConfig) -> Result<()> {
         self.config_manager.update_config(config)?;
+        self.apply_saved_config();
+        Ok(())
+    }
+
+    /// Must be awaited to completion by the owning background transaction task.
+    /// Dropping a started transaction cannot cancel OS credential writes.
+    pub async fn update_config_async(&mut self, config: config::AppConfig) -> Result<()> {
+        let mut manager = self.config_manager.clone();
+        manager = tokio::task::spawn_blocking(move || {
+            manager.update_config(config)?;
+            Ok::<_, AleError>(manager)
+        })
+        .await
+        .map_err(|_| AleError::ConfigError("Configuration worker failed".into()))??;
+        self.config_manager = manager;
+        self.apply_saved_config();
+        Ok(())
+    }
+
+    pub fn memory_available(&self) -> bool {
+        self.memory_store.available()
+    }
+
+    fn apply_saved_config(&mut self) {
         self.inference_engine
             .configure_transcription(&self.config_manager.config().transcription);
         let cloud = &self.config_manager.config().cloud_api;
@@ -521,7 +552,6 @@ impl AleEngine {
                 .set_cloud_api(cloud::CloudApiFactory::create(cloud_config));
             self.cloud_api = true;
         }
-        Ok(())
     }
 
     /// 检查引擎状态
@@ -559,8 +589,13 @@ impl AleEngine {
 
     /// 下载指定模型
     pub async fn download_model(&self, model_id: &str) -> Result<std::path::PathBuf> {
-        let mut manager = self.model_manager.lock().await;
-        manager.download_model(model_id).await
+        let downloader = self.model_manager.lock().await.download_context();
+        let path = downloader.download_model(model_id).await?;
+        self.model_manager
+            .lock()
+            .await
+            .record_download(model_id, path.clone());
+        Ok(path)
     }
 
     pub async fn model_package_consent(
@@ -577,8 +612,8 @@ impl AleEngine {
         manifest: &model_scheduler::ModelManifest,
         consent: &downloader::ModelInstallConsent,
     ) -> Result<downloader::InstalledModelPackage> {
-        let manager = self.model_manager.lock().await;
-        manager.install_pinned_package(manifest, consent).await
+        let downloader = self.model_manager.lock().await.download_context();
+        downloader.install_package(manifest, consent).await
     }
 
     pub async fn verify_model_package(
@@ -586,20 +621,33 @@ impl AleEngine {
         manifest: &model_scheduler::ModelManifest,
         package_id: &str,
     ) -> Result<downloader::InstalledModelPackage> {
-        let manager = self.model_manager.lock().await;
-        manager.verify_pinned_package(manifest, package_id)
+        let downloader = self.model_manager.lock().await.download_context();
+        downloader.verify_package_async(manifest, package_id).await
     }
 
     /// 删除模型
     pub async fn delete_model(&self, model_id: &str) -> Result<()> {
-        let mut manager = self.model_manager.lock().await;
-        manager.delete_model(model_id)
+        let downloader = self.model_manager.lock().await.download_context();
+        let id = model_id.to_owned();
+        tokio::task::spawn_blocking(move || downloader.delete_model(&id))
+            .await
+            .map_err(|_| AleError::ConfigError("Model removal worker failed".into()))??;
+        self.model_manager.lock().await.record_delete(model_id);
+        Ok(())
     }
 
     /// 获取已下载模型列表
     pub async fn downloaded_models(&self) -> Vec<downloader::ModelInfo> {
-        let manager = self.model_manager.lock().await;
-        manager.downloaded_models().into_iter().cloned().collect()
+        let downloader = self.model_manager.lock().await.download_context();
+        tokio::task::spawn_blocking(move || {
+            downloader
+                .downloaded_models()
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// 获取所有可用模型
@@ -660,6 +708,42 @@ impl AleEngineFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slow_credentials_do_not_block_runtime_and_bad_memory_preserves_startup() {
+        struct SlowStore;
+        impl secret_store::SecretStore for SlowStore {
+            fn get_api_key(&self) -> Result<Option<String>> {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok(None)
+            }
+            fn set_api_key(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn delete_api_key(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ale-init-worker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&config::AppConfig::default()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("memory.json"), b"{bad").unwrap();
+        let engine = AleEngine::new_with_secret_store(&path, Arc::new(SlowStore));
+        tokio::pin!(engine);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {},
+            _ = &mut engine => panic!("slow credentials unexpectedly completed before heartbeat"),
+        }
+        let engine = engine.await.unwrap();
+        assert!(!engine.memory_available());
+        assert_eq!(std::fs::read(dir.join("memory.json")).unwrap(), b"{bad");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_cloud_config_from_app_openai() {

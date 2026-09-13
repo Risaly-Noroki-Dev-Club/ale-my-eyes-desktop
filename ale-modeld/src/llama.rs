@@ -1,3 +1,4 @@
+use ale_core::child_process::ManagedAsyncChild as Child;
 use ale_core::model_scheduler::{
     BoundingBox, GroundingCandidate, GroundingJob, GroundingResult, LocalPlanningJob,
     LocalPlanningResult, ModelRuntimeConfig, SemanticPlan, StateVerificationJob,
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 const MAX_STARTUP_LOG_BYTES: usize = 256 * 1024;
@@ -20,6 +21,7 @@ const WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct LlamaAdapter {
     gpu_gate: Arc<Semaphore>,
+    metadata_gate: Arc<Semaphore>,
     hot_worker: AsyncMutex<Option<Arc<HotWorker>>>,
     failed_models: Mutex<HashSet<RuntimeModel>>,
     client: reqwest::Client,
@@ -29,6 +31,7 @@ impl Default for LlamaAdapter {
     fn default() -> Self {
         Self {
             gpu_gate: Arc::new(Semaphore::new(1)),
+            metadata_gate: Arc::new(Semaphore::new(1)),
             hot_worker: AsyncMutex::new(None),
             failed_models: Mutex::new(HashSet::new()),
             client: reqwest::Client::builder()
@@ -221,11 +224,11 @@ impl LlamaAdapter {
     }
 
     pub fn maintenance(&self) {
-        let Ok(mut slot) = self.hot_worker.try_lock() else {
+        let Ok(slot) = self.hot_worker.try_lock() else {
             return;
         };
         if slot.as_ref().is_some_and(|worker| worker.is_idle_expired()) {
-            if let Some(worker) = slot.take() {
+            if let Some(worker) = slot.as_ref() {
                 tracing::info!(
                     model = ?worker.key.model,
                     pid = ?worker.process.pid(),
@@ -241,9 +244,16 @@ impl LlamaAdapter {
             .lock()
             .expect("failed model lock poisoned")
             .clear();
-        if let Ok(slot) = self.hot_worker.try_lock() {
-            if let Some(worker) = slot.as_ref() {
-                worker.terminate();
+        // The next request selects a worker from its configuration snapshot.
+        // In-flight requests retain their worker until completion/cancellation.
+    }
+
+    pub async fn shutdown(&self) {
+        let mut slot = self.hot_worker.lock().await;
+        if let Some(worker) = slot.as_ref() {
+            worker.terminate();
+            if wait_for_exit(&worker.process, WORKER_STOP_TIMEOUT).await {
+                slot.take();
             }
         }
     }
@@ -280,7 +290,6 @@ impl LlamaAdapter {
         snapshot_id: &str,
         job: LocalPlanningJob,
     ) -> Result<LocalPlanningResult, String> {
-        ensure_capability(config, RuntimeModel::Qwen)?;
         let image = decode_image(&job.image_base64)?;
         let prompt = format!(
             "Analyze this desktop screenshot and the request. Return only JSON matching \
@@ -316,7 +325,6 @@ impl LlamaAdapter {
         snapshot_id: &str,
         job: GroundingJob,
     ) -> Result<GroundingResult, String> {
-        ensure_capability(config, RuntimeModel::ShowUi)?;
         if job.image_width == 0 || job.image_height == 0 {
             return Err("grounding image dimensions are invalid".to_string());
         }
@@ -373,7 +381,6 @@ impl LlamaAdapter {
         snapshot_id: &str,
         job: StateVerificationJob,
     ) -> Result<StateVerificationResult, String> {
-        ensure_capability(config, RuntimeModel::Qwen)?;
         let image = decode_image(&job.image_base64)?;
         let prompt = format!(
             "Inspect the screenshot and decide whether this expected state is visibly true: {}. \
@@ -422,7 +429,19 @@ impl LlamaAdapter {
             return Err(format!("{model:?} was disabled after a previous GPU OOM"));
         }
 
-        let key = worker_key(config, model)?;
+        let metadata = self
+            .metadata_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "MODEL_FILESYSTEM_BUSY")?;
+        let config = config.clone();
+        let key = tokio::task::spawn_blocking(move || {
+            let _permit = metadata;
+            ensure_capability(&config, model)?;
+            worker_key(&config, model)
+        })
+        .await
+        .map_err(|_| "MODEL_METADATA_WORKER_FAILED")??;
         let worker = self.ensure_worker(key).await?;
         let request = ActiveRequest::new(worker.clone());
         let image_url = format!(
@@ -486,7 +505,7 @@ impl LlamaAdapter {
             }
         }
 
-        if let Some(worker) = slot.take() {
+        if let Some(worker) = slot.as_ref() {
             tracing::info!(
                 old_model = ?worker.key.model,
                 new_model = ?key.model,
@@ -501,7 +520,8 @@ impl LlamaAdapter {
             }
         }
 
-        let worker = match self.start_worker(key.clone()).await {
+        slot.take();
+        let worker = match self.start_worker(key.clone(), &mut slot).await {
             Ok(worker) => worker,
             Err(error) => {
                 self.disable_after_oom(key.model, &error);
@@ -512,7 +532,11 @@ impl LlamaAdapter {
         Ok(worker)
     }
 
-    async fn start_worker(&self, key: WorkerKey) -> Result<Arc<HotWorker>, String> {
+    async fn start_worker(
+        &self,
+        key: WorkerKey,
+        slot: &mut Option<Arc<HotWorker>>,
+    ) -> Result<Arc<HotWorker>, String> {
         let address = reserve_loopback_address()?;
         let mut command = Command::new(&key.server);
         command
@@ -541,14 +565,15 @@ impl LlamaAdapter {
         #[cfg(windows)]
         command.creation_flags(0x08000000);
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("start llama-server: {error}"))?;
+        let mut child =
+            Child::spawn(&mut command).map_err(|error| format!("start llama-server: {error}"))?;
         let stdout = child
+            .child
             .stdout
             .take()
             .ok_or_else(|| "llama-server stdout is unavailable".to_string())?;
         let stderr = child
+            .child
             .stderr
             .take()
             .ok_or_else(|| "llama-server stderr is unavailable".to_string())?;
@@ -567,6 +592,10 @@ impl LlamaAdapter {
             active: AtomicBool::new(false),
         });
 
+        // Register ownership before the first wait. Cancellation or failed
+        // startup must not lose the process while a replacement is admitted.
+        *slot = Some(worker.clone());
+        let startup = ActiveRequest::new(worker.clone());
         let ready = tokio::time::timeout(MODEL_START_TIMEOUT, self.wait_until_ready(&worker)).await;
         match ready {
             Ok(Ok(())) => {
@@ -576,6 +605,7 @@ impl LlamaAdapter {
                     endpoint = %worker.endpoint,
                     "llama.cpp worker is ready"
                 );
+                startup.finish();
                 Ok(worker)
             }
             Ok(Err(error)) => {
@@ -995,7 +1025,7 @@ mod tests {
             .kill_on_drop(true)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let child = command.spawn().unwrap();
+        let child = Child::spawn(&mut command).unwrap();
         let worker = Arc::new(HotWorker {
             key: key(RuntimeModel::Qwen, "qwen.gguf"),
             endpoint: "http://127.0.0.1:1".to_string(),

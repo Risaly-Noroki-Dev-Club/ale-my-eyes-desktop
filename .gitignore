@@ -19,6 +19,9 @@ Thumbs.db
 /ale-my-eyes-linux.tar.gz
 /ale-my-eyes-windows/
 /ale-my-eyes-windows.zip
+/ale-my-eyes-windows-gnu/
+/ale-my-eyes-windows-gnu.zip
+/ale-my-eyes-windows-gnu-symbols.zip
 *.exe
 *.dll
 *.so

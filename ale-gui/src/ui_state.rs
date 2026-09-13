@@ -39,7 +39,7 @@ pub struct Activity {
     pub event: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Snapshot {
     pub sessions: BTreeMap<String, Session>,
     pub logs: VecDeque<Activity>,

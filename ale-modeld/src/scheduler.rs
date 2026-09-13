@@ -1,6 +1,7 @@
 use ale_core::model_ipc::{
     IpcEnvelope, IpcReply, IpcReplyStatus, IpcRequestKind, MODEL_IPC_VERSION,
 };
+use ale_core::model_scheduler::{GpuDevice, SchedulerConfiguration, SchedulerDiagnostics};
 use ale_core::model_scheduler::{
     GroundingJob, LocalPlanningJob, ModelJob, ModelRuntimeConfig, RemoteEndpointConfig,
     RemoteEndpointRole, RemotePlanningJob, RemotePlanningResult, RemoteProviderSet,
@@ -9,10 +10,11 @@ use ale_core::model_scheduler::{
 use ale_core::model_scheduler::{ModelCapability, RouteDecision, RouteTarget};
 use base64::Engine;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-tokio::task_local! { static PROVIDERS: Option<RemoteProviderSet>; }
+tokio::task_local! { static PROVIDERS: Option<RemoteProviderSet>; static RUNTIME: Option<ModelRuntimeConfig>; }
 
 #[derive(Default)]
 struct CircuitState {
@@ -28,10 +30,89 @@ pub struct ModelScheduler {
     primary_circuit: Mutex<CircuitState>,
     sensevoice: Arc<crate::sensevoice::SenseVoiceAdapter>,
     llama: Arc<crate::llama::LlamaAdapter>,
+    cache: Arc<Mutex<HealthCache>>,
+    probing: Arc<AtomicBool>,
+    active_jobs: AtomicUsize,
+    admitted_bytes: AtomicUsize,
+}
+
+#[derive(Default)]
+struct HealthCache {
+    sampled: Option<Instant>,
+    attempt: Option<Instant>,
+    gpus: Vec<GpuDevice>,
+    capabilities: Vec<ModelCapability>,
+    error: Option<String>,
+    generation: u64,
 }
 
 impl ModelScheduler {
+    pub fn set_admission(&self, jobs: usize, bytes: usize) {
+        self.active_jobs.store(jobs, Ordering::Relaxed);
+        self.admitted_bytes.store(bytes, Ordering::Relaxed);
+    }
+    pub async fn shutdown(&self) {
+        self.sensevoice.shutdown().await;
+        self.llama.shutdown().await;
+    }
+    fn refresh_health(&self, force: bool) {
+        let due = {
+            let cache = self.cache.lock().unwrap();
+            force
+                || cache
+                    .attempt
+                    .is_none_or(|time| time.elapsed() >= Duration::from_secs(30))
+        };
+        if !due || self.probing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let runtime = self.models.lock().unwrap().clone();
+        let cache = self.cache.clone();
+        let probing = self.probing.clone();
+        let llama = self.llama.clone();
+        let generation = {
+            let mut cache = cache.lock().unwrap();
+            cache.attempt = Some(Instant::now());
+            cache.generation
+        };
+        tokio::spawn(async move {
+            let config = runtime.clone();
+            let capabilities = tokio::task::spawn_blocking(move || {
+                let mut capabilities = Vec::new();
+                if let Some(runtime) = config {
+                    if crate::sensevoice::SenseVoiceAdapter::available(&runtime) {
+                        capabilities.push(ModelCapability::SpeechRecognition);
+                    }
+                    capabilities.extend(llama.capabilities(&runtime));
+                }
+                capabilities
+            });
+            let result = crate::gpu::probe_with_runtime(runtime.as_ref()).await;
+            let capabilities = capabilities.await.unwrap_or_default();
+            let mut cache = cache.lock().unwrap();
+            if cache.generation == generation {
+                cache.capabilities = capabilities;
+                match result {
+                    Ok(devices) => {
+                        cache.gpus = devices;
+                        cache.sampled = Some(Instant::now());
+                        cache.error = None;
+                    }
+                    Err(code) => {
+                        cache.error = Some(code.into());
+                        ale_core::diagnostics::record("gpu_probe_failed", &[]);
+                        tracing::warn!(event = "gpu_probe_failed", code);
+                    }
+                }
+            } else {
+                cache.attempt = None;
+            }
+            probing.store(false, Ordering::Release);
+        });
+    }
+
     pub fn maintenance(&self) {
+        self.refresh_health(false);
         self.sensevoice.unload_if_idle();
         self.llama.maintenance();
     }
@@ -57,26 +138,39 @@ impl ModelScheduler {
                 {
                     available_capabilities.push(ModelCapability::RemotePlanning);
                 }
-                let runtime = self
-                    .models
-                    .lock()
-                    .expect("model config lock poisoned")
-                    .clone();
-                if let Some(runtime) = runtime.as_ref() {
-                    if crate::sensevoice::SenseVoiceAdapter::available(runtime) {
-                        available_capabilities.push(ModelCapability::SpeechRecognition);
+                self.refresh_health(false);
+                let cache = self.cache.lock().unwrap();
+                available_capabilities.extend(cache.capabilities.clone());
+                let age = cache
+                    .sampled
+                    .map(|time| time.elapsed().as_millis().min(u64::MAX as u128) as u64);
+                let diagnostic = SchedulerDiagnostics {
+                    gpu_probe_state: if self.probing.load(Ordering::Acquire) {
+                        "probing"
+                    } else if age.is_some_and(|age| age > 60_000) {
+                        "stale"
+                    } else if cache.error.is_some() {
+                        "failed"
+                    } else if age.is_some() {
+                        "ready"
+                    } else {
+                        "pending"
                     }
-                    available_capabilities.extend(self.llama.capabilities(runtime));
-                    available_capabilities.sort_by_key(|capability| *capability as u8);
-                    available_capabilities.dedup();
-                }
+                    .into(),
+                    gpu_sample_age_ms: age,
+                    gpu_error_code: cache.error.clone(),
+                    active_jobs: self.active_jobs.load(Ordering::Relaxed),
+                    admitted_bytes: self.admitted_bytes.load(Ordering::Relaxed),
+                    local_asr_supported: crate::sensevoice::SenseVoiceAdapter::supported(),
+                };
                 ok_json(
                     request.request_id,
                     &SchedulerHealth {
                         service: "ale-modeld".to_string(),
                         protocol_version: MODEL_IPC_VERSION,
                         local_vlm_gpu_only: true,
-                        gpus: crate::gpu::probe_with_runtime(runtime.as_ref()),
+                        gpus: cache.gpus.clone(),
+                        diagnostics: Some(diagnostic),
                         available_capabilities,
                         hot_worker: self.llama.worker_health(),
                         sensevoice_state: Some(self.sensevoice.state()),
@@ -89,6 +183,7 @@ impl ModelScheduler {
             }
             Some(IpcRequestKind::ConfigureRemote) => self.configure_remote(request),
             Some(IpcRequestKind::ConfigureModels) => self.configure_models(request),
+            Some(IpcRequestKind::ConfigureScheduler) => self.configure_scheduler(request),
             Some(IpcRequestKind::Authenticate) | None => error_reply(
                 request.request_id,
                 "INVALID_REQUEST",
@@ -129,6 +224,10 @@ impl ModelScheduler {
         } else {
             remaining.min(ale_core::model_scheduler::MODEL_STAGE_TIMEOUT)
         };
+        let runtime = job
+            .runtime_snapshot
+            .clone()
+            .or_else(|| self.models.lock().unwrap().clone());
         let providers = job
             .remote_snapshot
             .clone()
@@ -139,7 +238,10 @@ impl ModelScheduler {
             deadline,
             ale_core::model_api::DEADLINE.scope(
                 deadline,
-                PROVIDERS.scope(providers, self.run_job(request_id.clone(), job)),
+                PROVIDERS.scope(
+                    providers,
+                    RUNTIME.scope(runtime, self.run_job(request_id.clone(), job)),
+                ),
             ),
         )
         .await
@@ -193,18 +295,15 @@ impl ModelScheduler {
     }
 
     fn local_capability_available(&self, capability: ModelCapability) -> bool {
-        self.models
-            .lock()
-            .expect("model config lock poisoned")
-            .as_ref()
-            .is_some_and(|runtime| self.llama.capabilities(runtime).contains(&capability))
+        self.runtime()
+            .is_ok_and(|runtime| self.llama.capabilities(&runtime).contains(&capability))
     }
-
     fn runtime(&self) -> Result<ModelRuntimeConfig, &'static str> {
-        self.models
-            .lock()
-            .expect("model config lock poisoned")
-            .clone()
+        RUNTIME
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .or_else(|| self.models.lock().unwrap().clone())
             .ok_or("local model runtime is not configured")
     }
 
@@ -343,8 +442,55 @@ impl ModelScheduler {
             }
         };
         self.llama.reconfigure();
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.generation += 1;
+            cache.attempt = None;
+        }
         *self.models.lock().expect("model config lock poisoned") = Some(config);
+        self.refresh_health(true);
         ok_json(request.request_id, &serde_json::json!({"configured": true}))
+    }
+
+    fn configure_scheduler(&self, request: IpcEnvelope) -> IpcReply {
+        let config: SchedulerConfiguration = match serde_json::from_slice(&request.payload) {
+            Ok(config) => config,
+            Err(_) => {
+                return error_reply(
+                    request.request_id,
+                    "INVALID_CONFIG",
+                    "invalid scheduler configuration",
+                )
+            }
+        };
+        if config.providers.revision != config.revision
+            || (config.providers.backup_enabled
+                && (!config.providers.backup_pre_authorized || config.providers.backup.is_none()))
+        {
+            return error_reply(
+                request.request_id,
+                "INVALID_CONFIG",
+                "invalid scheduler configuration",
+            );
+        }
+        *self.remote.lock().unwrap() = Some(config.providers);
+        *self.models.lock().unwrap() = Some(config.models);
+        *self.primary_circuit.lock().unwrap() = CircuitState {
+            revision: config.revision,
+            ..Default::default()
+        };
+        self.llama.reconfigure();
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.generation += 1;
+            cache.attempt = None;
+        }
+        self.refresh_health(true);
+        ale_core::diagnostics::record("modeld_config_committed", &[("revision", config.revision)]);
+        ok_json(
+            request.request_id,
+            &serde_json::json!({"configured":true,"revision":config.revision}),
+        )
     }
 
     async fn speech_recognition(&self, request_id: String, job: ModelJob) -> IpcReply {
@@ -356,23 +502,9 @@ impl ModelScheduler {
             Ok(value) => value,
             Err(error) => return error_reply(request_id, "INVALID_AUDIO", &error.to_string()),
         };
-        let runtime = self
-            .models
-            .lock()
-            .expect("model config lock poisoned")
-            .clone();
-        let adapter = self.sensevoice.clone();
-        let local_wav = wav.clone();
-        let local_result = match runtime {
-            Some(config) => tokio::time::timeout(
-                ale_core::model_scheduler::MODEL_STAGE_TIMEOUT,
-                tokio::task::spawn_blocking(move || adapter.transcribe_wav(&config, &local_wav)),
-            )
-            .await
-            .map_err(|_| "SenseVoice stage timed out".to_string())
-            .and_then(|result| result.map_err(|error| format!("SenseVoice task failed: {error}")))
-            .and_then(|result| result),
-            None => Err("local model runtime is not configured".to_string()),
+        let local_result = match self.runtime() {
+            Ok(config) => self.sensevoice.transcribe_wav(&config, &wav).await,
+            Err(error) => Err(error.into()),
         };
         if let Ok(text) = local_result {
             return ok_json(
@@ -728,6 +860,7 @@ mod tests {
     #[tokio::test]
     async fn unavailable_local_capability_requires_a_decision() {
         let payload = serde_json::to_vec(&ModelJob {
+            runtime_snapshot: None,
             remote_snapshot: None,
             request_id: "job".to_string(),
             capability: ModelCapability::LocalPlanning,
@@ -772,6 +905,7 @@ mod tests {
             request_id: "pinned".into(),
             kind: IpcRequestKind::Schedule as i32,
             payload: serde_json::to_vec(&ModelJob {
+                runtime_snapshot: None,
                 request_id: "pinned".into(),
                 remote_snapshot: Some(providers),
                 capability: ModelCapability::RemotePlanning,
@@ -941,6 +1075,7 @@ mod tests {
                 request_id: "plan".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    runtime_snapshot: None,
                     remote_snapshot: None,
                     request_id: "plan".to_string(),
                     capability: ModelCapability::RemotePlanning,
@@ -998,6 +1133,7 @@ mod tests {
                 request_id: "plan".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    runtime_snapshot: None,
                     remote_snapshot: None,
                     request_id: "plan".to_string(),
                     capability: ModelCapability::RemotePlanning,
@@ -1052,6 +1188,7 @@ mod tests {
                 request_id: "deadline".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    runtime_snapshot: None,
                     remote_snapshot: None,
                     request_id: "deadline".to_string(),
                     capability: ModelCapability::RemotePlanning,
@@ -1086,6 +1223,7 @@ mod tests {
                 request_id: "privacy".to_string(),
                 kind: IpcRequestKind::Schedule as i32,
                 payload: serde_json::to_vec(&ModelJob {
+                    runtime_snapshot: None,
                     remote_snapshot: None,
                     request_id: "privacy".to_string(),
                     capability: ModelCapability::RemotePlanning,

@@ -223,6 +223,7 @@ pub struct PairingCredentials {
 }
 
 impl RemoteServerHandle {
+    #[cfg(test)]
     pub fn refresh_pairing(&self) {
         let mut credentials = self.credentials.lock().unwrap();
         credentials.info.code = remote_crypto::pairing_code();
@@ -315,8 +316,10 @@ enum ProcessingOutcome {
 
 impl Drop for RemoteServerHandle {
     fn drop(&mut self) {
-        for session in self.hub.0.lock().unwrap().sessions.values() {
-            let _ = session.controls.try_send(Control::Disconnect);
+        if let Ok(hub) = self.hub.0.try_lock() {
+            for session in hub.sessions.values() {
+                let _ = session.controls.try_send(Control::Disconnect);
+            }
         }
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
@@ -346,7 +349,11 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let listener = TcpListener::bind(("0.0.0.0", DEFAULT_REMOTE_PORT))
         .await
         .map_err(|error| error.to_string())?;
-    let platform: Arc<dyn PlatformService> = Arc::from(platform::create_platform());
+    let platform: Arc<dyn PlatformService> = Arc::from(
+        tokio::task::spawn_blocking(platform::create_platform)
+            .await
+            .map_err(|_| "PLATFORM_START_FAILED".to_string())?,
+    );
     platform.set_sensitive_ui_visible(true);
     let capabilities = platform.capabilities();
     tracing::debug!(
@@ -1688,9 +1695,11 @@ async fn handle_request(
         ProgressStage::CapturingState,
         "正在获取桌面状态",
     );
-    let image = (allow_full_screenshot || local_inference)
-        .then(|| platform.capture_image())
-        .flatten();
+    let image = if allow_full_screenshot || local_inference {
+        platform::capture_cached(platform.clone()).await
+    } else {
+        None
+    };
     report_progress(
         progress,
         &request_id,
@@ -1703,7 +1712,7 @@ async fn handle_request(
             .as_ref()
             .ok_or_else(|| "LOCAL_SCREENSHOT_UNAVAILABLE".to_string())?;
         let snapshot_id = captured_snapshot_id(image);
-        let accessibility = platform.capture_accessibility(&image.coordinate_space);
+        let accessibility = platform::accessibility(platform.clone(), image.coordinate_space).await;
         let prepared_question = {
             let engine = engine.lock().await;
             engine.prepare_vision_question(&question)
@@ -2064,8 +2073,8 @@ fn start_remote_execution(
     let task = tokio::spawn(async move {
         let status_request_id = task_request_id.clone();
         if let Some(expected_snapshot) = expected_snapshot {
-            let current_snapshot = platform
-                .capture_image_now()
+            let current_snapshot = platform::capture_now(platform.clone())
+                .await
                 .map(|image| captured_snapshot_id(&image));
             if current_snapshot.as_deref() != Some(expected_snapshot.as_str()) {
                 let _ = results.send(RemoteExecutionEvent {
@@ -2095,7 +2104,10 @@ fn start_remote_execution(
             Ok(Ok(mut status)) => {
                 if controlled_test && matches!(status.state, ExecutionState::Completed) {
                     tokio::time::sleep(Duration::from_millis(400)).await;
-                    let verification = match (modeld.as_ref(), platform.capture_image_now()) {
+                    let verification = match (
+                        modeld.as_ref(),
+                        platform::capture_now(platform.clone()).await,
+                    ) {
                         (Some(modeld), Some(image)) => {
                             let snapshot_id = captured_snapshot_id(&image);
                             modeld

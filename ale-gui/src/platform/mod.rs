@@ -35,6 +35,7 @@ pub struct ExecutionResult {
 pub struct ExecutionControl {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
+    wake: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
 impl ExecutionControl {
@@ -42,11 +43,38 @@ impl ExecutionControl {
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             deadline,
+            wake: Arc::new((std::sync::Mutex::new(()), std::sync::Condvar::new())),
         }
     }
 
     pub fn cancel(&self) {
+        let _guard = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
         self.cancelled.store(true, Ordering::Release);
+        self.wake.1.notify_all();
+    }
+
+    pub fn remaining(&self) -> std::time::Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub fn wait(&self, duration: std::time::Duration) -> Result<()> {
+        let until = Instant::now() + duration;
+        let mut guard = self.wake.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            self.check()?;
+            let remaining = until
+                .saturating_duration_since(Instant::now())
+                .min(self.remaining());
+            if remaining.is_zero() {
+                return self.check();
+            }
+            guard = self
+                .wake
+                .1
+                .wait_timeout(guard, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 
     pub fn timed_out(&self) -> bool {
@@ -117,3 +145,82 @@ pub fn create_platform() -> Box<dyn PlatformService> {
 }
 
 mod desktop;
+
+static CAPTURE_SLOT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+static ACCESSIBILITY_SLOT: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(1)));
+
+pub async fn capture_now(platform: Arc<dyn PlatformService>) -> Option<CapturedImage> {
+    capture_async(platform, true).await
+}
+pub async fn capture_cached(platform: Arc<dyn PlatformService>) -> Option<CapturedImage> {
+    capture_async(platform, false).await
+}
+async fn capture_async(platform: Arc<dyn PlatformService>, fresh: bool) -> Option<CapturedImage> {
+    let permit = CAPTURE_SLOT.clone().try_acquire_owned().ok()?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let start = Instant::now();
+        let result = if fresh {
+            platform.capture_image_now()
+        } else {
+            platform.capture_image()
+        };
+        ale_core::diagnostics::record(
+            "capture_complete",
+            &[
+                ("elapsed_ms", start.elapsed().as_millis() as u64),
+                ("success", result.is_some() as u64),
+            ],
+        );
+        result
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+        .await
+        .ok()?
+        .ok()?
+}
+
+pub async fn accessibility(
+    platform: Arc<dyn PlatformService>,
+    space: ScreenCoordinateSpace,
+) -> Option<AccessibilitySnapshot> {
+    let permit = ACCESSIBILITY_SLOT.clone().try_acquire_owned().ok()?;
+    let worker = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let start = Instant::now();
+        let result = platform.capture_accessibility(&space);
+        ale_core::diagnostics::record(
+            "accessibility_complete",
+            &[
+                ("elapsed_ms", start.elapsed().as_millis() as u64),
+                (
+                    "nodes",
+                    result.as_ref().map_or(0, |snapshot| snapshot.nodes.len()) as u64,
+                ),
+            ],
+        );
+        result
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+        .await
+        .ok()?
+        .ok()?
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    #[test]
+    fn cancellation_wakes_long_wait() {
+        let control = ExecutionControl::new(Instant::now() + std::time::Duration::from_secs(60));
+        let other = control.clone();
+        let task = std::thread::spawn(move || other.wait(std::time::Duration::from_secs(30)));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let start = Instant::now();
+        control.cancel();
+        assert!(task.join().unwrap().is_err());
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+}

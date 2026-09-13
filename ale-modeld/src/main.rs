@@ -7,6 +7,7 @@ use ale_core::model_ipc::{read_message, write_message, IpcEnvelope, IpcReply, MO
 use anyhow::{Context, Result};
 use base64::Engine;
 use futures::{stream::FuturesUnordered, StreamExt};
+use prost::Message;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
@@ -14,7 +15,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::oneshot;
 
 #[derive(Deserialize)]
@@ -25,16 +26,27 @@ struct Bootstrap {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = ale_core::diagnostics::install_from_env("modeld");
+    ale_core::diagnostics::record("modeld_start", &[]);
+    if std::env::args().any(|arg| arg == "--sensevoice-worker") {
+        return sensevoice::run_worker().await;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
-        .init();
+        .try_init()
+        .ok();
 
     let mut line = String::new();
-    BufReader::new(tokio::io::stdin())
-        .read_line(&mut line)
-        .await
-        .context("read bootstrap from inherited stdin")?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        BufReader::new(tokio::io::stdin().take(4097)).read_line(&mut line),
+    )
+    .await
+    .context("bootstrap deadline")??;
+    if line.len() > 4096 || !line.ends_with('\n') {
+        anyhow::bail!("invalid bootstrap length");
+    }
     let bootstrap: Bootstrap = serde_json::from_str(line.trim()).context("invalid bootstrap")?;
     let token = base64::engine::general_purpose::STANDARD
         .decode(bootstrap.token_base64)
@@ -58,7 +70,8 @@ async fn run_endpoint(endpoint: String, token: Vec<u8>) -> Result<()> {
     let listener = UnixListener::bind(&path).context("bind modeld unix socket")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let result = async {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), listener.accept()).await??;
         serve_connection(stream, token).await
     }
     .await;
@@ -74,20 +87,43 @@ async fn run_endpoint(endpoint: String, token: Vec<u8>) -> Result<()> {
         .first_pipe_instance(true)
         .create(&endpoint)
         .context("create modeld named pipe")?;
-    server
-        .connect()
+    tokio::time::timeout(std::time::Duration::from_secs(45), server.connect())
         .await
-        .context("connect modeld named pipe")?;
+        .context("pipe accept deadline")??;
     serve_connection(server, token).await
 }
 
 type PendingJob = Pin<Box<dyn Future<Output = (String, IpcReply)> + Send>>;
 
+struct ReplyQueue {
+    sender: tokio::sync::mpsc::Sender<(IpcReply, tokio::sync::OwnedSemaphorePermit)>,
+    budget: Arc<tokio::sync::Semaphore>,
+}
+impl ReplyQueue {
+    fn try_send(&self, reply: IpcReply) -> Result<(), ()> {
+        let length = reply.encoded_len();
+        if length > ale_core::model_ipc::MAX_MODEL_IPC_MESSAGE_BYTES {
+            return Err(());
+        }
+        let permit = self
+            .budget
+            .clone()
+            .try_acquire_many_owned(length as u32)
+            .map_err(|_| ())?;
+        self.sender.try_send((reply, permit)).map_err(|_| ())
+    }
+}
+
 async fn serve_connection<S>(mut stream: S, mut token: Vec<u8>) -> Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let auth: IpcEnvelope = read_message(&mut stream).await?;
+    let auth: IpcEnvelope = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        read_message(&mut stream),
+    )
+    .await
+    .context("authentication deadline")??;
     let authenticated = auth.protocol_version == MODEL_IPC_VERSION
         && auth.kind == ale_core::model_ipc::IpcRequestKind::Authenticate as i32
         && constant_time_eq(&auth.payload, &token);
@@ -109,96 +145,132 @@ where
     .await?;
 
     let scheduler = Arc::new(scheduler::ModelScheduler::default());
-    let mut jobs = FuturesUnordered::<PendingJob>::new();
-    let mut cancellations = HashMap::<String, oneshot::Sender<()>>::new();
-    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(5));
-    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            _ = maintenance.tick() => scheduler.maintenance(),
-            request = read_message::<_, IpcEnvelope>(&mut stream) => {
-                let request = request?;
-                let kind = ale_core::model_ipc::IpcRequestKind::try_from(request.kind).ok();
-                match kind {
-                    Some(ale_core::model_ipc::IpcRequestKind::Schedule) => {
-                        if cancellations.contains_key(&request.request_id) {
-                            write_message(
-                                &mut stream,
-                                &scheduler::error_reply(
-                                    request.request_id,
-                                    "DUPLICATE_REQUEST_ID",
-                                    "model job request ID is already running",
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let job_id = request.request_id.clone();
-                        let (cancel, cancelled) = oneshot::channel();
-                        cancellations.insert(job_id.clone(), cancel);
-                        let scheduler = scheduler.clone();
-                        jobs.push(Box::pin(async move {
-                            let reply = tokio::select! {
-                                reply = scheduler.handle(request) => reply,
-                                _ = cancelled => scheduler::error_reply(
-                                    job_id.clone(),
-                                    "CANCELLED",
-                                    "model job was cancelled",
-                                ),
-                            };
-                            (job_id, reply)
-                        }));
-                    }
-                    Some(ale_core::model_ipc::IpcRequestKind::Cancel) => {
-                        let target = serde_json::from_slice::<ale_core::model_scheduler::CancelModelJob>(
-                            &request.payload,
-                        );
-                        let reply = match target {
-                            Ok(target) if !target.target_request_id.trim().is_empty() => {
-                                let accepted = cancellations
-                                    .remove(&target.target_request_id)
-                                    .is_some_and(|cancel| cancel.send(()).is_ok());
-                                scheduler::ok_json(
-                                    request.request_id,
-                                    &serde_json::json!({"accepted": accepted}),
-                                )
-                            }
-                            Ok(_) => scheduler::error_reply(
-                                request.request_id,
-                                "INVALID_CANCEL",
-                                "cancel target request ID is empty",
-                            ),
-                            Err(error) => scheduler::error_reply(
-                                request.request_id,
-                                "INVALID_CANCEL",
-                                &error.to_string(),
-                            ),
-                        };
-                        write_message(&mut stream, &reply).await?;
-                    }
-                    Some(ale_core::model_ipc::IpcRequestKind::Shutdown) => {
-                        for (_, cancel) in cancellations.drain() {
-                            let _ = cancel.send(());
-                        }
-                        let reply = scheduler::ok_json(
-                            request.request_id,
-                            &serde_json::json!({"accepted": true}),
-                        );
-                        write_message(&mut stream, &reply).await?;
-                        return Ok(());
-                    }
-                    _ => {
-                        let reply = scheduler.handle(request).await;
-                        write_message(&mut stream, &reply).await?;
-                    }
-                }
-            }
-            Some((job_id, reply)) = jobs.next(), if !jobs.is_empty() => {
-                cancellations.remove(&job_id);
-                write_message(&mut stream, &reply).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(2);
+    let budget = Arc::new(tokio::sync::Semaphore::new(128 * 1024 * 1024));
+    let (sender, mut outgoing) =
+        tokio::sync::mpsc::channel::<(IpcReply, tokio::sync::OwnedSemaphorePermit)>(32);
+    let replies = ReplyQueue {
+        sender,
+        budget: budget.clone(),
+    };
+    let mut reader_task = tokio::spawn(async move {
+        loop {
+            let request = ale_core::model_ipc::read_message_with_budget::<_, IpcEnvelope>(
+                &mut reader,
+                budget.clone(),
+            )
+            .await?;
+            if incoming_tx.send(request).await.is_err() {
+                return Ok::<_, std::io::Error>(());
             }
         }
+    });
+    let mut writer_task = tokio::spawn(async move {
+        while let Some((reply, _reservation)) = outgoing.recv().await {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                write_message(&mut writer, &reply),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC reply deadline")
+            })??;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    let mut jobs = FuturesUnordered::<PendingJob>::new();
+    let mut cancellations = HashMap::<String, (oneshot::Sender<()>, usize)>::new();
+    let mut admitted_bytes = 0usize;
+    let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(5));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                result = &mut reader_task => { if !matches!(&result,Ok(Ok(_))) {ale_core::diagnostics::record("ipc_reader_failed",&[]);} result??; break; },
+                result = &mut writer_task => { result??; break; },
+                _ = maintenance.tick() => scheduler.maintenance(),
+                Some((request,reservation)) = incoming.recv() => {
+                    let kind = ale_core::model_ipc::IpcRequestKind::try_from(request.kind).ok();
+                    match kind {
+                        Some(ale_core::model_ipc::IpcRequestKind::Schedule) => {
+                            let bytes = request.payload.len();
+                            let code = if cancellations.contains_key(&request.request_id) { Some("DUPLICATE_REQUEST_ID") }
+                                else if cancellations.len() >= 32 || admitted_bytes.saturating_add(bytes) > 128 * 1024 * 1024 { Some("SCHEDULER_BUSY") }
+                                else { None };
+                            if let Some(code) = code {
+                                replies.try_send(scheduler::error_reply(request.request_id, code, code)).map_err(|_| anyhow::anyhow!("IPC reply queue full"))?;
+                                continue;
+                            }
+                            let job_id = request.request_id.clone();
+                            let (cancel, cancelled) = oneshot::channel();
+                            cancellations.insert(job_id.clone(), (cancel, bytes));
+                            admitted_bytes += bytes;
+                            let scheduler = scheduler.clone();
+                            ale_core::diagnostics::record("model_job_admitted",&[("operation_id", ale_core::diagnostics::correlation_id(&job_id)), ("active_jobs",cancellations.len() as u64),("bytes",admitted_bytes as u64)]);
+                            jobs.push(Box::pin(async move {
+                                let _reservation=reservation;
+                                let reply = tokio::select! {
+                                    reply = scheduler.handle(request) => reply,
+                                    _ = cancelled => scheduler::error_reply(job_id.clone(), "CANCELLED", "model job was cancelled"),
+                                };
+                                (job_id, reply)
+                            }));
+                        }
+                        Some(ale_core::model_ipc::IpcRequestKind::Cancel) => {
+                            let target = serde_json::from_slice::<ale_core::model_scheduler::CancelModelJob>(&request.payload);
+                            let reply = match target {
+                                Ok(target) if !target.target_request_id.trim().is_empty() => {
+                                    let accepted = if let Some((sender, bytes)) = cancellations.remove(&target.target_request_id) {
+                                        // Keep the admission reservation until the cancelled job has actually dropped.
+                                        cancellations.insert(target.target_request_id, (oneshot::channel().0, bytes));
+                                        sender.send(()).is_ok()
+                                    } else { false };
+                                    scheduler::ok_json(request.request_id, &serde_json::json!({"accepted":accepted}))
+                                }
+                                _ => scheduler::error_reply(request.request_id, "INVALID_CANCEL", "invalid cancellation target"),
+                            };
+                            replies.try_send(reply).map_err(|_| anyhow::anyhow!("IPC reply queue full"))?;
+                        }
+                        Some(ale_core::model_ipc::IpcRequestKind::Shutdown) => {
+                            for (_, (cancel, _)) in cancellations.drain() { let _ = cancel.send(()); }
+                            jobs.clear();
+                            replies.try_send(scheduler::ok_json(request.request_id, &serde_json::json!({"accepted":true}))).map_err(|_| anyhow::anyhow!("IPC reply queue full"))?;
+                            break;
+                        }
+                        _ => {
+                            scheduler.set_admission(cancellations.len(), admitted_bytes);
+                            let reply = scheduler.handle(request).await;
+                            replies.try_send(reply).map_err(|_| anyhow::anyhow!("IPC reply queue full"))?;
+                        }
+                    }
+                }
+                Some((id, reply)) = jobs.next(), if !jobs.is_empty() => {
+                    ale_core::diagnostics::record("model_job_finished", &[("operation_id", ale_core::diagnostics::correlation_id(&id)), ("status", reply.status as u64)]);
+                    if let Some((_, bytes)) = cancellations.remove(&id) { admitted_bytes = admitted_bytes.saturating_sub(bytes); }
+                    replies.try_send(reply).map_err(|_| anyhow::anyhow!("IPC reply queue full"))?;
+                }
+            }
+        }
+        Ok(())
+    }.await;
+    jobs.clear();
+    cancellations.clear();
+    scheduler.shutdown().await;
+    reader_task.abort();
+    drop(replies);
+    if !writer_task.is_finished()
+        && tokio::time::timeout(std::time::Duration::from_secs(3), &mut writer_task)
+            .await
+            .is_err()
+    {
+        writer_task.abort();
     }
+    tracing::info!(
+        event = "modeld_connection_stopped",
+        failed = result.is_err()
+    );
+    result
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -291,6 +363,7 @@ mod tests {
         assert_eq!(configured.status, IpcReplyStatus::Ok as i32);
 
         let job = ModelJob {
+            runtime_snapshot: None,
             remote_snapshot: None,
             request_id: "slow-job".to_string(),
             capability: ModelCapability::RemotePlanning,

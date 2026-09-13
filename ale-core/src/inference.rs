@@ -148,6 +148,12 @@ impl AdaptiveInference {
 
     /// 检测设备性能
     pub async fn detect_device_performance() -> DevicePerformance {
+        tokio::task::spawn_blocking(Self::detect_device_performance_sync)
+            .await
+            .unwrap_or(DevicePerformance::Low)
+    }
+
+    fn detect_device_performance_sync() -> DevicePerformance {
         // 检测 CPU 核心数
         let cpu_cores = std::thread::available_parallelism()
             .map(|n| n.get())

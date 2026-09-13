@@ -1,6 +1,6 @@
 use ale_core::actions::{Action, ActionPlan};
 use ale_core::{AleError, Result};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -141,7 +141,7 @@ impl Default for CaptureConfig {
 /// 屏幕捕获器（Desktop only）
 pub struct ScreenCapture {
     latest_frame: Arc<Mutex<Option<ScreenFrame>>>,
-    running: Arc<Mutex<bool>>,
+    running: Arc<AtomicBool>,
     config: CaptureConfig,
 }
 
@@ -149,23 +149,16 @@ impl ScreenCapture {
     pub fn new(config: CaptureConfig) -> Self {
         Self {
             latest_frame: Arc::new(Mutex::new(None)),
-            running: Arc::new(Mutex::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
             config,
         }
     }
 
     /// 开始持续捕获
     pub fn start(&self) -> Result<()> {
-        let mut running = self
-            .running
-            .lock()
-            .map_err(|e| AleError::Other(anyhow::anyhow!("Failed to lock running flag: {}", e)))?;
-
-        if *running {
+        if self.running.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        *running = true;
-        drop(running);
 
         let latest_frame = self.latest_frame.clone();
         let running = self.running.clone();
@@ -173,13 +166,7 @@ impl ScreenCapture {
         let scale = self.config.scale;
 
         thread::spawn(move || {
-            while {
-                let Ok(r) = running.lock() else {
-                    tracing::warn!("Screen capture running flag lock poisoned");
-                    return;
-                };
-                *r
-            } {
+            while running.load(Ordering::Acquire) {
                 if capture_is_suspended() {
                     if let Ok(mut frame) = latest_frame.lock() {
                         *frame = None;
@@ -187,6 +174,8 @@ impl ScreenCapture {
                     thread::sleep(interval);
                     continue;
                 }
+                let started = Instant::now();
+                ale_core::diagnostics::record("screen_capture_start", &[]);
                 match capture_primary_monitor(scale) {
                     Ok(frame) => {
                         if let Ok(mut lf) = latest_frame.lock() {
@@ -200,6 +189,10 @@ impl ScreenCapture {
                         tracing::warn!("Screen capture failed: {}", e);
                     }
                 }
+                ale_core::diagnostics::record(
+                    "screen_capture_end",
+                    &[("elapsed_ms", started.elapsed().as_millis() as u64)],
+                );
                 thread::sleep(interval);
             }
         });
@@ -209,14 +202,13 @@ impl ScreenCapture {
 
     /// 停止捕获
     pub fn stop(&self) {
-        if let Ok(mut running) = self.running.lock() {
-            *running = false;
-        }
+        self.running.store(false, Ordering::Release);
     }
 
     pub fn set_suspended(&self, suspended: bool) {
         set_capture_suspended(suspended);
-        if let Ok(mut frame) = self.latest_frame.lock() {
+        // The generation already invalidated old frames; never wait on capture from the UI.
+        if let Ok(mut frame) = self.latest_frame.try_lock() {
             *frame = None;
         }
     }

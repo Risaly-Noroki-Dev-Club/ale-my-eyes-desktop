@@ -18,9 +18,11 @@ pub trait VisionModel: Send + Sync {
 }
 
 /// 基于ONNX的VLM模型
+#[derive(Clone)]
 pub struct OnnxVlm {
     model_path: std::path::PathBuf,
-    session: Option<Mutex<ort::session::Session>>,
+    session: Option<std::sync::Arc<Mutex<ort::session::Session>>>,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
     img_size: usize,
 }
 
@@ -38,6 +40,7 @@ impl OnnxVlm {
         Ok(Self {
             model_path,
             session: None,
+            slot: crate::blocking_worker::slot(),
             img_size: DEFAULT_IMG_SIZE,
         })
     }
@@ -65,7 +68,19 @@ impl OnnxVlm {
             self.img_size
         );
 
-        self.session = Some(Mutex::new(session));
+        self.session = Some(std::sync::Arc::new(Mutex::new(session)));
+        Ok(())
+    }
+
+    pub async fn load_model_async(&mut self) -> Result<()> {
+        let mut owned = self.clone();
+        let (session, size) = crate::blocking_worker::run(self.slot.clone(), None, move |_| {
+            owned.load_model()?;
+            Ok((owned.session, owned.img_size))
+        })
+        .await?;
+        self.session = session;
+        self.img_size = size;
         Ok(())
     }
 
@@ -74,9 +89,13 @@ impl OnnxVlm {
     }
 }
 
-#[async_trait]
-impl VisionModel for OnnxVlm {
-    async fn describe_image(&self, image_data: &[u8]) -> Result<String> {
+impl OnnxVlm {
+    fn describe_blocking(
+        &self,
+        image_data: &[u8],
+        options: &ort::session::RunOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String> {
         let session = self.session.as_ref().ok_or_else(|| {
             AleError::VlmError("VLM model not loaded, call load_model() first".to_string())
         })?;
@@ -96,6 +115,7 @@ impl VisionModel for OnnxVlm {
             .to_rgb8();
 
         // 2. 归一化为 NCHW flat 数据
+        crate::blocking_worker::check(cancel)?;
         let data = image_to_nchw_f32(&img, self.img_size);
         let shape = vec![1usize, 3, self.img_size, self.img_size];
 
@@ -111,13 +131,42 @@ impl VisionModel for OnnxVlm {
             .map_err(|e| AleError::VlmError(format!("Failed to create ort tensor: {}", e)))?;
 
         let outputs = session
-            .run(ort::inputs![input_name.as_str() => ort_tensor])
+            .run_with_options(ort::inputs![input_name.as_str() => ort_tensor], options)
             .map_err(|e| AleError::VlmError(format!("ONNX inference failed: {}", e)))?;
 
         // 5. 解码输出
         let text = decode_output(&outputs)?;
-
+        if text.is_empty() {
+            return Err(AleError::VlmError(
+                "Model output could not be decoded; a compatible tokenizer/model is required"
+                    .into(),
+            ));
+        }
         Ok(text)
+    }
+}
+
+#[async_trait]
+impl VisionModel for OnnxVlm {
+    async fn describe_image(&self, image_data: &[u8]) -> Result<String> {
+        if self.session.is_none() {
+            return Err(AleError::NotInitialized("Local image-description model"));
+        }
+        let options = std::sync::Arc::new(
+            ort::session::RunOptions::new()
+                .map_err(|_| AleError::VlmError("Cannot create inference options".into()))?,
+        );
+        let abort = options.clone();
+        let owned = self.clone();
+        let image = image_data.to_vec();
+        crate::blocking_worker::run(
+            self.slot.clone(),
+            Some(std::sync::Arc::new(move || {
+                let _ = abort.terminate();
+            })),
+            move |cancel| owned.describe_blocking(&image, &options, &cancel),
+        )
+        .await
     }
 
     fn model_info(&self) -> crate::ModelInfo {
@@ -253,9 +302,6 @@ fn ids_to_text(ids: &[usize]) -> String {
     }
 
     let text = text.trim().to_string();
-    if text.is_empty() {
-        return "(模型输出无法解码为文本，可能需要加载对应的 tokenizer 词表文件)".to_string();
-    }
     text
 }
 

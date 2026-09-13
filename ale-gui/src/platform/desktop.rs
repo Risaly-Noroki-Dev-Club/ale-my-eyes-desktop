@@ -3,6 +3,7 @@ use super::AccessibilityNode;
 use super::{
     AccessibilitySnapshot, CapturedImage, ExecutionControl, ExecutionResult, PlatformCapabilities,
 };
+#[cfg(not(windows))]
 use crate::automation::{AutomationConfig, AutomationEngine};
 use crate::screen_capture::{CaptureConfig, ScreenCapture};
 use ale_core::actions::ActionPlan;
@@ -13,7 +14,12 @@ use std::sync::Mutex;
 /// 桌面平台服务：屏幕捕获 + enigo 自动化
 pub struct DesktopPlatform {
     screen_capture: Option<ScreenCapture>,
+    #[cfg(not(windows))]
     automation: Option<Mutex<AutomationEngine>>,
+    #[cfg(windows)]
+    execution_slot: Mutex<()>,
+    #[cfg(windows)]
+    execution_failed: AtomicBool,
     sensitive_ui_visible: AtomicBool,
 }
 
@@ -21,7 +27,12 @@ impl DesktopPlatform {
     pub fn new() -> Self {
         let mut platform = Self {
             screen_capture: None,
+            #[cfg(not(windows))]
             automation: None,
+            #[cfg(windows)]
+            execution_slot: Mutex::new(()),
+            #[cfg(windows)]
+            execution_failed: AtomicBool::new(false),
             sensitive_ui_visible: AtomicBool::new(false),
         };
         platform.init();
@@ -38,8 +49,8 @@ impl DesktopPlatform {
         }
 
         // 创建自动化引擎
-        let automation_config = AutomationConfig::default();
-        match AutomationEngine::new(automation_config) {
+        #[cfg(not(windows))]
+        match AutomationEngine::new(AutomationConfig::default()) {
             Ok(ae) => self.automation = Some(Mutex::new(ae)),
             Err(e) => tracing::warn!("Automation engine failed: {}", e),
         }
@@ -77,19 +88,11 @@ impl super::PlatformService for DesktopPlatform {
     }
 
     fn execute_plan(&self, plan: &ActionPlan, approved: bool) -> Result<ExecutionResult> {
-        let auto = self
-            .automation
-            .as_ref()
-            .ok_or_else(|| AleError::Other(anyhow::anyhow!("自动化引擎不可用")))?;
-
-        let mut guard = auto
-            .lock()
-            .map_err(|e| AleError::Other(anyhow::anyhow!("自动化引擎锁失败: {}", e)))?;
-
-        let result = guard.execute_plan(plan, approved)?;
-        Ok(ExecutionResult {
-            actions_executed: result.actions_executed,
-        })
+        self.execute_plan_controlled(
+            plan,
+            approved,
+            &ExecutionControl::new(std::time::Instant::now() + std::time::Duration::from_secs(120)),
+        )
     }
 
     fn execute_plan_controlled(
@@ -98,21 +101,64 @@ impl super::PlatformService for DesktopPlatform {
         approved: bool,
         control: &ExecutionControl,
     ) -> Result<ExecutionResult> {
-        let auto = self
-            .automation
-            .as_ref()
-            .ok_or_else(|| AleError::Other(anyhow::anyhow!("自动化引擎不可用")))?;
-        let mut guard = auto
-            .lock()
-            .map_err(|e| AleError::Other(anyhow::anyhow!("自动化引擎锁失败: {}", e)))?;
-        let result = guard.execute_plan_controlled(plan, approved, control)?;
-        Ok(ExecutionResult {
-            actions_executed: result.actions_executed,
-        })
+        #[cfg(windows)]
+        {
+            if self.execution_failed.load(Ordering::Acquire) {
+                return Err(AleError::Other(anyhow::anyhow!("EXECUTOR_UNAVAILABLE")));
+            }
+            let _slot = loop {
+                control.check()?;
+                match self.execution_slot.try_lock() {
+                    Ok(slot) => break slot,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(AleError::Other(anyhow::anyhow!("EXECUTOR_UNAVAILABLE")))
+                    }
+                    Err(_) => control.wait(std::time::Duration::from_millis(20))?,
+                }
+            };
+            let result = crate::platform_worker::execute(plan, approved, control);
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("REAP_FAILED"))
+            {
+                self.execution_failed.store(true, Ordering::Release);
+            }
+            return result.map(|actions_executed| ExecutionResult { actions_executed });
+        }
+        #[cfg(not(windows))]
+        {
+            let auto = self
+                .automation
+                .as_ref()
+                .ok_or_else(|| AleError::Other(anyhow::anyhow!("自动化引擎不可用")))?;
+            let mut guard = loop {
+                control.check()?;
+                match auto.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(AleError::Other(anyhow::anyhow!("自动化引擎锁失败")))
+                    }
+                    Err(_) => control.wait(std::time::Duration::from_millis(20))?,
+                }
+            };
+            guard
+                .execute_plan_controlled(plan, approved, control)
+                .map(|result| ExecutionResult {
+                    actions_executed: result.actions_executed,
+                })
+        }
     }
 
     fn is_automation_ready(&self) -> bool {
-        self.automation.is_some()
+        #[cfg(windows)]
+        {
+            !self.execution_failed.load(Ordering::Acquire)
+        }
+        #[cfg(not(windows))]
+        {
+            self.automation.is_some()
+        }
     }
 
     fn set_sensitive_ui_visible(&self, visible: bool) {
@@ -130,7 +176,7 @@ impl super::PlatformService for DesktopPlatform {
     fn capabilities(&self) -> PlatformCapabilities {
         PlatformCapabilities {
             image_capture: self.screen_capture.is_some(),
-            automation: self.automation.is_some(),
+            automation: self.is_automation_ready(),
             local_microphone: true,
         }
     }
@@ -171,10 +217,25 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; pu
 $root = [System.Windows.Automation.AutomationElement]::FromHandle([AleNative]::GetForegroundWindow())
 if ($null -eq $root) { exit 2 }
 $nodes = New-Object System.Collections.Generic.List[object]
-$elements = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-$limit = [Math]::Min($elements.Count, 512)
-for ($index = 0; $index -lt $limit; $index++) {
-  $element = $elements.Item($index)
+$walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+$clock = [Diagnostics.Stopwatch]::StartNew()
+$queue = New-Object System.Collections.Generic.Queue[object]
+$queue.Enqueue(@($root, 0))
+$visited = 0
+while ($queue.Count -gt 0 -and $visited -lt 512 -and $clock.ElapsedMilliseconds -lt 2000) {
+  $item = $queue.Dequeue()
+  $element = $item[0]
+  $depth = [int]$item[1]
+  $visited++
+  if ($depth -lt 16) {
+    try {
+      $child = $walker.GetFirstChild($element)
+      while ($null -ne $child -and ($queue.Count + $visited) -lt 512 -and $clock.ElapsedMilliseconds -lt 2000) {
+        $queue.Enqueue(@($child, ($depth + 1)))
+        $child = $walker.GetNextSibling($child)
+      }
+    } catch {}
+  }
   try {
     if ($element.Current.IsPassword) { continue }
     $rect = $element.Current.BoundingRectangle
@@ -192,16 +253,17 @@ for ($index = 0; $index -lt $limit; $index++) {
 }
 [ordered]@{ application_id = [string]$root.Current.Name; nodes = $nodes } | ConvertTo-Json -Depth 4 -Compress
 "#;
-    let output = std::process::Command::new("powershell.exe")
-        .args([
+    let output = crate::platform_worker::bounded_output(
+        std::process::Command::new("powershell.exe").args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             SCRIPT,
-        ])
-        .output()
-        .ok()?;
+        ]),
+        &ExecutionControl::new(std::time::Instant::now() + std::time::Duration::from_secs(3)),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }

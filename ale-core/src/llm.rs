@@ -60,9 +60,11 @@ pub trait LanguageModel: Send + Sync {
 }
 
 /// 本地LLM（基于 ONNX Runtime）
+#[derive(Clone)]
 pub struct LocalLlm {
     config: LlmConfig,
-    session: Option<Mutex<ort::session::Session>>,
+    session: Option<std::sync::Arc<Mutex<ort::session::Session>>>,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl LocalLlm {
@@ -70,6 +72,7 @@ impl LocalLlm {
         Ok(Self {
             config,
             session: None,
+            slot: crate::blocking_worker::slot(),
         })
     }
 
@@ -104,7 +107,17 @@ impl LocalLlm {
             session.inputs().len()
         );
 
-        self.session = Some(Mutex::new(session));
+        self.session = Some(std::sync::Arc::new(Mutex::new(session)));
+        Ok(())
+    }
+
+    pub async fn load_model_async(&mut self) -> Result<()> {
+        let mut owned = self.clone();
+        self.session = crate::blocking_worker::run(self.slot.clone(), None, move |_| {
+            owned.load_model()?;
+            Ok(owned.session)
+        })
+        .await?;
         Ok(())
     }
 
@@ -196,9 +209,13 @@ fn pseudo_random() -> f32 {
     (hasher.finish() % 10000) as f32 / 10000.0
 }
 
-#[async_trait]
-impl LanguageModel for LocalLlm {
-    async fn generate(&self, prompt: &str) -> Result<LlmResponse> {
+impl LocalLlm {
+    fn generate_blocking(
+        &self,
+        prompt: &str,
+        options: &ort::session::RunOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<LlmResponse> {
         let session = self
             .session
             .as_ref()
@@ -214,6 +231,7 @@ impl LanguageModel for LocalLlm {
         let mut generated = 0;
 
         for _ in 0..max_tokens {
+            crate::blocking_worker::check(cancel)?;
             let seq_len = token_ids.len();
 
             let input_name = session
@@ -229,7 +247,7 @@ impl LanguageModel for LocalLlm {
                     })?;
 
             let outputs = session
-                .run(ort::inputs![input_name.as_str() => ort_tensor])
+                .run_with_options(ort::inputs![input_name.as_str() => ort_tensor], options)
                 .map_err(|e| AleError::Other(anyhow::anyhow!("LLM inference failed: {}", e)))?;
 
             let output = &outputs[0];
@@ -272,6 +290,30 @@ impl LanguageModel for LocalLlm {
                 "stop".to_string()
             },
         })
+    }
+}
+
+#[async_trait]
+impl LanguageModel for LocalLlm {
+    async fn generate(&self, prompt: &str) -> Result<LlmResponse> {
+        if self.session.is_none() {
+            return Err(AleError::NotInitialized("Local LLM model"));
+        }
+        let options = std::sync::Arc::new(
+            ort::session::RunOptions::new()
+                .map_err(|_| AleError::ConfigError("Cannot create inference options".into()))?,
+        );
+        let abort = options.clone();
+        let owned = self.clone();
+        let prompt = prompt.to_owned();
+        crate::blocking_worker::run(
+            self.slot.clone(),
+            Some(std::sync::Arc::new(move || {
+                let _ = abort.terminate();
+            })),
+            move |cancel| owned.generate_blocking(&prompt, &options, &cancel),
+        )
+        .await
     }
 
     async fn generate_stream(&self, prompt: &str) -> Result<Box<dyn tokio::io::AsyncRead + Unpin>> {
@@ -336,7 +378,11 @@ pub struct RemoteLlm {
 
 impl RemoteLlm {
     pub async fn new(config: LlmConfig) -> Result<Self> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|_| AleError::ConfigError("Cannot create model HTTP client".into()))?;
         Ok(Self { config, client })
     }
 
@@ -381,6 +427,11 @@ impl LanguageModel for RemoteLlm {
         let response = self
             .client
             .post(api_url)
+            .timeout(
+                crate::model_api::deadline()
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .min(std::time::Duration::from_secs(30)),
+            )
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&request_body)

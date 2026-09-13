@@ -15,16 +15,18 @@ pub trait SpeechRecognizer: Send + Sync {
 }
 
 /// Whisper speech recognizer backed by whisper-rs (whisper.cpp FFI)
+#[derive(Clone)]
 pub struct WhisperRecognizer {
     model_path: std::path::PathBuf,
-    ctx: Option<WhisperContext>,
+    ctx: Option<std::sync::Arc<WhisperContext>>,
     language: Option<String>,
     n_threads: i32,
     use_beam_search: bool,
     beam_size: i32,
     initial_prompt: Option<String>,
     temperature: f32,
-    is_first_utterance: AtomicBool,
+    is_first_utterance: std::sync::Arc<AtomicBool>,
+    slot: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl WhisperRecognizer {
@@ -45,7 +47,8 @@ impl WhisperRecognizer {
             beam_size: 3,
             initial_prompt: None,
             temperature: 0.0,
-            is_first_utterance: AtomicBool::new(true),
+            is_first_utterance: std::sync::Arc::new(AtomicBool::new(true)),
+            slot: crate::blocking_worker::slot(),
         })
     }
 
@@ -88,7 +91,17 @@ impl WhisperRecognizer {
         )
         .map_err(|e| AleError::AsrError(format!("Failed to load whisper model: {e}")))?;
 
-        self.ctx = Some(ctx);
+        self.ctx = Some(std::sync::Arc::new(ctx));
+        Ok(())
+    }
+
+    pub async fn load_model_async(&mut self) -> Result<()> {
+        let mut owned = self.clone();
+        self.ctx = crate::blocking_worker::run(self.slot.clone(), None, move |_| {
+            owned.load_model()?;
+            Ok(owned.ctx)
+        })
+        .await?;
         Ok(())
     }
 
@@ -96,7 +109,12 @@ impl WhisperRecognizer {
         self.ctx.is_some()
     }
 
-    fn run_inference(&self, ctx: &WhisperContext, samples: &[f32]) -> Result<String> {
+    fn run_inference(
+        &self,
+        ctx: &WhisperContext,
+        samples: &[f32],
+        cancel: std::sync::Arc<AtomicBool>,
+    ) -> Result<String> {
         let mut state = ctx
             .create_state()
             .map_err(|e| AleError::AsrError(format!("Failed to create whisper state: {e}")))?;
@@ -112,6 +130,16 @@ impl WhisperRecognizer {
         };
 
         let mut params = FullParams::new(strategy);
+        unsafe extern "C" fn should_abort(data: *mut std::ffi::c_void) -> bool {
+            // The Arc below retains this AtomicBool throughout the synchronous full() call.
+            unsafe { (&*data.cast::<AtomicBool>()).load(Ordering::Relaxed) }
+        }
+        // Use the raw callback with a retained typed allocation. whisper-rs 0.16's
+        // safe adapter erases its closure to a trait object then casts it back to F.
+        unsafe {
+            params.set_abort_callback(Some(should_abort));
+            params.set_abort_callback_user_data(std::sync::Arc::as_ptr(&cancel).cast_mut().cast());
+        }
         params.set_n_threads(self.n_threads);
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -155,9 +183,12 @@ impl WhisperRecognizer {
     }
 }
 
-#[async_trait]
-impl SpeechRecognizer for WhisperRecognizer {
-    async fn transcribe(&self, audio_data: &[u8]) -> Result<String> {
+impl WhisperRecognizer {
+    fn transcribe_blocking(
+        &self,
+        audio_data: &[u8],
+        cancel: std::sync::Arc<AtomicBool>,
+    ) -> Result<String> {
         let mut samples = parse_audio_to_f32_mono(audio_data, WHISPER_SAMPLE_RATE)?;
 
         if samples.is_empty() {
@@ -173,7 +204,20 @@ impl SpeechRecognizer for WhisperRecognizer {
             AleError::AsrError("Whisper model not loaded, call load_model() first".to_string())
         })?;
 
-        self.run_inference(ctx, &samples)
+        crate::blocking_worker::check(&cancel)?;
+        self.run_inference(ctx, &samples, cancel)
+    }
+}
+
+#[async_trait]
+impl SpeechRecognizer for WhisperRecognizer {
+    async fn transcribe(&self, audio_data: &[u8]) -> Result<String> {
+        let owned = self.clone();
+        let audio = audio_data.to_vec();
+        crate::blocking_worker::run(self.slot.clone(), None, move |cancel| {
+            owned.transcribe_blocking(&audio, cancel)
+        })
+        .await
     }
 
     fn supported_languages(&self) -> Vec<String> {
@@ -229,6 +273,11 @@ fn parse_wav(data: &[u8], target_rate: u32) -> Result<Vec<f32>> {
     let num_channels = u16::from_le_bytes([data[22], data[23]]) as u32;
     let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
     let bits_per_sample = u16::from_le_bytes([data[34], data[35]]) as u32;
+    if sample_rate == 0 || target_rate == 0 || num_channels == 0 {
+        return Err(AleError::AsrError(
+            "Invalid WAV sample rate or channels".into(),
+        ));
+    }
 
     // Find data chunk
     let mut offset = 36;
@@ -421,7 +470,12 @@ mod tests {
         // 归一化后应该有显著提升
         let new_rms: f32 =
             (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
-        assert!(new_rms > 0.05, "RMS should be boosted, got {}", new_rms);
+        // The configured 20x gain cap intentionally prevents amplifying this input to 0.1.
+        assert!(
+            (new_rms - 0.02).abs() < 1e-5,
+            "RMS should respect the 20x gain cap, got {}",
+            new_rms
+        );
     }
 
     #[test]

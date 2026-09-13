@@ -41,6 +41,10 @@ export component AppWindow inherits Window {
                 ActionButton { text: Ui.tr("设置", "Settings"); icon: @image-url("assets/settings.svg"); flat: true; selected: Ui.page == "settings"; clicked => { Ui.navigate("settings"); } }
             }
         }
+        if Ui.state-age-ms >= 3000: Rectangle {
+            height: 28px; background: AppTheme.surface;
+            Text { text: Ui.tr("后台正在更新，显示的是 ", "Updating; showing state from ") + round(Ui.state-age-ms / 1000) + Ui.tr(" 秒前的状态", " seconds ago"); color: AppTheme.muted; horizontal-alignment: center; vertical-alignment: center; }
+        }
         if Ui.page == "pairing": PairingScreen { vertical-stretch: 1; }
         if Ui.page == "main": MainScreen { vertical-stretch: 1; }
         if Ui.page == "settings": SettingsPage { vertical-stretch: 1; }

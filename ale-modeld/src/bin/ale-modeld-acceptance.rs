@@ -21,6 +21,9 @@ type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--asr-only") {
+        return asr_acceptance().await;
+    }
     let args = Arguments::parse()?;
     std::fs::create_dir_all(&args.report_dir)?;
     let endpoint = endpoint();
@@ -484,6 +487,7 @@ fn model_job(
     deadline_unix_ms: i64,
 ) -> ModelJob {
     ModelJob {
+        runtime_snapshot: None,
         remote_snapshot: None,
         request_id: request_id.to_string(),
         capability,
@@ -521,7 +525,7 @@ async fn call_raw(
     payload: Vec<u8>,
 ) -> anyhow::Result<IpcReply> {
     write_envelope(stream, request_id, kind, payload).await?;
-    Ok(read_message(stream).await?)
+    Ok(tokio::time::timeout(Duration::from_secs(90), read_message(stream)).await??)
 }
 
 async fn write_envelope(
@@ -648,4 +652,108 @@ async fn connect(endpoint: &str) -> anyhow::Result<LocalStream> {
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+async fn asr_acceptance() -> anyhow::Result<()> {
+    use ale_core::child_process::ManagedAsyncChild;
+    use ale_core::model_scheduler::{SpeechRecognitionJob, SpeechRecognitionResult};
+    let mut args = std::collections::HashMap::new();
+    let mut values = std::env::args().skip(1);
+    while let Some(flag) = values.next() {
+        if flag == "--asr-only" {
+            continue;
+        }
+        args.insert(
+            flag,
+            values
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing argument value"))?,
+        );
+    }
+    let required = |key: &str| {
+        args.get(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing {key}"))
+    };
+    let report_dir = PathBuf::from(required("--report-dir")?);
+    std::fs::create_dir_all(&report_dir)?;
+    let expected = required("--expected")?;
+    if expected.trim().is_empty() {
+        anyhow::bail!("--expected must contain a known transcript word");
+    }
+    let audio = PathBuf::from(required("--audio")?);
+    let modeld = required("--modeld")?;
+    let models_dir = PathBuf::from(required("--models-dir")?);
+    let mut results = Vec::new();
+    let result: anyhow::Result<()> = async {
+        let wav=std::fs::read(audio)?;
+        let runtime=runtime_config(&models_dir);
+        if !Path::new(&runtime.sensevoice_model).is_file() || !Path::new(&runtime.sensevoice_tokens).is_file() {anyhow::bail!("ASR_MODEL_FILES_MISSING");}
+        let mut command=tokio::process::Command::new(modeld);
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let mut child=ManagedAsyncChild::spawn(&mut command).map_err(|_|anyhow::anyhow!("MODELD_START_FAILED_OR_DEPENDENCY_MISSING"))?;
+        let endpoint=endpoint();let token=uuid::Uuid::new_v4().as_bytes().repeat(2);
+        let bootstrap=json!({"endpoint":endpoint,"token_base64":base64::engine::general_purpose::STANDARD.encode(&token)});
+        let mut input=child.child.stdin.take().ok_or_else(||anyhow::anyhow!("MODELD_BOOTSTRAP_PIPE"))?;
+        input.write_all(format!("{bootstrap}\n").as_bytes()).await?;input.shutdown().await?;
+        let mut stream=tokio::time::timeout(Duration::from_secs(10),connect(&endpoint)).await.map_err(|_|anyhow::anyhow!("MODELD_START_TIMEOUT_OR_DEPENDENCY_MISSING"))??;
+        call_raw(&mut stream,"auth",IpcRequestKind::Authenticate,token).await?;
+        let configured=call_json(&mut stream,"configure",IpcRequestKind::ConfigureModels,&runtime).await?;
+        if configured.status!=0 {anyhow::bail!("ASR_CONFIGURATION_FAILED");}
+        let health:SchedulerHealth=decode_ok(&call_json(&mut stream,"health",IpcRequestKind::Health,&Value::Null).await?)?;
+        if !health.diagnostics.as_ref().is_some_and(|d|d.local_asr_supported) {anyhow::bail!("ASR_UNSUPPORTED_BUILD_TARGET");}
+        let job=|id:&str,wav:&[u8]|ModelJob {runtime_snapshot:Some(runtime.clone()),remote_snapshot:None,request_id:id.into(),capability:ModelCapability::SpeechRecognition,priority:SchedulerPriority::InteractiveRequest,deadline_unix_ms:unix_millis()+85_000,risk_ceiling:RiskLevel::Low,snapshot_id:None,privacy:JobPrivacy::default(),payload:serde_json::to_value(SpeechRecognitionJob {wav_base64:base64::engine::general_purpose::STANDARD.encode(wav),allow_remote:false}).unwrap()};
+        let recognized:SpeechRecognitionResult=decode_ok(&call_json_with_envelope_id(&mut stream,"asr-first",IpcRequestKind::Schedule,&job("asr-first",&wav)).await?)?;
+        let text_ok=!recognized.text.trim().is_empty() && recognized.text.to_lowercase().contains(&expected.to_lowercase()) && !recognized.used_remote;
+        results.push(json!({"case":"local_transcription","passed":text_ok}));
+        if !text_ok {anyhow::bail!("ASR_TRANSCRIPT_EXPECTATION_FAILED");}
+        let long_wav=repeat_audio_for_cancel(&wav)?;
+        write_envelope(&mut stream,"asr-cancel-target",IpcRequestKind::Schedule,serde_json::to_vec(&job("asr-cancel-target",&long_wav))?).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        write_envelope(&mut stream,"cancel",IpcRequestKind::Cancel,serde_json::to_vec(&CancelModelJob {target_request_id:"asr-cancel-target".into()})?).await?;
+        let mut accepted=false;let mut cancelled=false;
+        for _ in 0..2 {
+            let reply:IpcReply=tokio::time::timeout(Duration::from_secs(5),read_message(&mut stream)).await??;
+            if reply.request_id=="cancel" {accepted=decode_ok::<Value>(&reply)?.get("accepted").and_then(Value::as_bool)==Some(true);}
+            if reply.request_id=="asr-cancel-target" {cancelled=reply.error_code=="CANCELLED";}
+        }
+        results.push(json!({"case":"cancel_active_asr","passed":accepted && cancelled}));
+        if !accepted || !cancelled {anyhow::bail!("ASR_CANCELLATION_NOT_OBSERVED");}
+        let retry:SpeechRecognitionResult=decode_ok(&call_json_with_envelope_id(&mut stream,"asr-retry",IpcRequestKind::Schedule,&job("asr-retry",&wav)).await?)?;
+        let retry_ok=retry.text.to_lowercase().contains(&expected.to_lowercase()) && !retry.used_remote;
+        results.push(json!({"case":"retry_after_cancel","passed":retry_ok}));
+        child.kill_tree_and_wait(Duration::from_secs(2)).await?;
+        if !retry_ok {anyhow::bail!("ASR_RETRY_FAILED");}Ok(())
+    }.await;
+    let report = json!({"mode":"asr_only","passed":result.is_ok(),"results":results,"failure":result.as_ref().err().map(|error|error.to_string())});
+    std::fs::write(
+        report_dir.join("asr-acceptance.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    result
+}
+
+fn repeat_audio_for_cancel(wav: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut reader = hound::WavReader::new(std::io::Cursor::new(wav))?;
+    let spec = reader.spec();
+    if spec.channels != 1
+        || spec.bits_per_sample != 16
+        || spec.sample_rate == 0
+        || spec.sample_format != hound::SampleFormat::Int
+    {
+        anyhow::bail!("ASR_FIXTURE_REQUIRES_MONO_PCM16");
+    }
+    let samples = reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?;
+    if samples.is_empty() {
+        anyhow::bail!("ASR_FIXTURE_EMPTY");
+    }
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec)?;
+        for index in 0..u64::from(spec.sample_rate) * 60 {
+            writer.write_sample(samples[index as usize % samples.len()])?;
+        }
+        writer.finalize()?;
+    }
+    Ok(cursor.into_inner())
 }

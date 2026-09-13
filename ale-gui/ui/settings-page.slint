@@ -16,6 +16,29 @@ export component SettingsPage inherits Rectangle {
                     Text { text: Ui.tr("设置", "Settings"); font-size: 32px; font-weight: 700; color: AppTheme.text; }
                     Panel {
                         VerticalLayout {
+                            padding: 20px; spacing: 12px; alignment: start;
+                            ActionButton { text: Ui.tr("模型下载器", "Model downloader"); clicked => { Ui.show-downloader = !Ui.show-downloader; } }
+                            if Ui.show-downloader: VerticalLayout {
+                                spacing: 12px; alignment: start;
+                                ComboBox { accessible-label: Ui.tr("下载模型", "Download model"); model: ["SenseVoiceSmall · 156 MiB · Apache-2.0", "Qwen2.5-VL-7B · 16.60 GB · Apache-2.0", "ShowUI-2B · 4.43 GB · MIT"]; current-index <=> Ui.download-model; enabled: !Ui.downloading; selected(value) => { Ui.download-consent = false; } }
+                                Text { text: Ui.tr("SenseVoice 可供语音运行时使用。Qwen / ShowUI 为原始模型，仍需转换 GGUF、视觉投影文件及本地运行时。", "SenseVoice supports the speech runtime. Qwen / ShowUI are source models requiring GGUF conversion, vision projectors and a local runtime."); color: AppTheme.muted; wrap: word-wrap; }
+                                Text { text: Ui.download-directory; color: AppTheme.text; wrap: word-wrap; }
+                                ActionButton { text: Ui.tr("选择下载目录", "Choose download directory"); enabled: !Ui.downloading; clicked => { Ui.choose-download-directory(); } }
+                                Text { text: Ui.tr("默认下载到当前模型目录。选择其他目录不会更改推理配置。请预留至少两倍下载大小的磁盘空间。", "Defaults to the configured model directory. Another directory does not change inference settings. Reserve at least twice the download size."); color: AppTheme.muted; wrap: word-wrap; }
+                                Switch { text: Ui.download-model == 2 ? Ui.tr("同意 MIT 许可并下载所选模型", "Accept MIT and download selected model") : Ui.tr("同意 Apache-2.0 许可并下载所选模型", "Accept Apache-2.0 and download selected model"); checked <=> Ui.download-consent; enabled: !Ui.downloading; }
+                                ActionButton { text: Ui.tr("开始下载 / 重试", "Download / Retry"); enabled: Ui.download-consent && !Ui.downloading && Ui.ready; clicked => { Ui.start-download(); } }
+                                if Ui.downloading: ActionButton { text: Ui.tr("取消下载", "Cancel download"); clicked => { Ui.cancel-download(); } }
+                                Text { text: Ui.download-status; color: AppTheme.text; wrap: word-wrap; }
+                            }
+                            Text { text: Ui.tr("诊断日志：启动时写入，之后每分钟生成一份，保留七天。", "Diagnostics: one snapshot at startup, then every minute; retained for seven days."); color: AppTheme.muted; wrap: word-wrap; }
+                            Switch { text: Ui.tr("卡死或崩溃时自动保存本机转储", "Save local dumps on hangs or crashes"); checked <=> Ui.auto-dump; toggled => { Ui.diagnostic-setting-changed(); } }
+                            Text { text: Ui.tr("转储仅保存在本机，可能包含内存中的密钥或对话片段。普通事件日志会过滤敏感内容。", "Dumps stay on this device and may contain credentials or conversation fragments from memory. Event logs filter sensitive content."); color: AppTheme.muted; wrap: word-wrap; }
+                            Text { text: Ui.log-directory; color: AppTheme.text; wrap: word-wrap; }
+                            ActionButton { text: Ui.tr("打开桌面日志文件夹", "Open desktop log folder"); clicked => { Ui.open-logs(); } }
+                        }
+                    }
+                    Panel {
+                        VerticalLayout {
                             alignment: start;
                             padding: 24px; spacing: 20px;
                             SectionTitle { text: Ui.tr("API 配置", "API configuration"); icon: @image-url("assets/language.svg"); padding: 0px; }
@@ -23,32 +46,32 @@ export component SettingsPage inherits Rectangle {
                                 label: Ui.tr("服务商", "Provider");
                                 GridLayout {
                                     spacing: 6px;
-                                    ActionButton { row: 0; col: 0; text: "Anthropic"; selected: Ui.provider == "anthropic"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("anthropic"); } }
-                                    ActionButton { row: 0; col: 1; text: "OpenAI"; selected: Ui.provider == "openai"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("openai"); } }
-                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 0 : 2; text: "Google"; selected: Ui.provider == "google"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("google"); } }
-                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 1 : 3; text: Ui.tr("其他", "Other"); selected: Ui.provider != "anthropic" && Ui.provider != "openai" && Ui.provider != "google"; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("custom"); } }
+                                    ActionButton { row: 0; col: 0; text: "Anthropic"; selected: Ui.provider == "anthropic"; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("anthropic"); } }
+                                    ActionButton { row: 0; col: 1; text: "OpenAI"; selected: Ui.provider == "openai"; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("openai"); } }
+                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 0 : 2; text: "Google"; selected: Ui.provider == "google"; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("google"); } }
+                                    ActionButton { row: Ui.compact ? 1 : 0; col: Ui.compact ? 1 : 3; text: Ui.tr("其他", "Other"); selected: Ui.provider != "anthropic" && Ui.provider != "openai" && Ui.provider != "google"; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.provider-selected("custom"); } }
                                 }
                             }
                             if Ui.provider != "anthropic" && Ui.provider != "openai" && Ui.provider != "google": Field {
                                 label: Ui.tr("服务商标识", "Provider ID");
-                                LineEdit { accessible-label: Ui.tr("服务商标识", "Provider ID"); text <=> Ui.provider; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                LineEdit { accessible-label: Ui.tr("服务商标识", "Provider ID"); text <=> Ui.provider; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                             }
                             Field {
                                 label: Ui.tr("接口协议", "API protocol");
-                                ComboBox { accessible-label: Ui.tr("接口协议", "API protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.wire-api; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                                ComboBox { accessible-label: Ui.tr("接口协议", "API protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.wire-api; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
                             }
                             Field {
                                 label: "API Key";
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    LineEdit { accessible-label: "API Key"; text <=> Ui.api-key; input-type: Ui.reveal-key ? InputType.text : InputType.password; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                    LineEdit { accessible-label: "API Key"; text <=> Ui.api-key; input-type: Ui.reveal-key ? InputType.text : InputType.password; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                                     ActionButton { text: Ui.reveal-key ? Ui.tr("隐藏", "Hide") : Ui.tr("显示", "Show"); clicked => { Ui.reveal(); } }
                                 }
                                 Text { text: Ui.tr("密钥仅存于系统密钥库，不写入明文配置文件。", "Keys are stored in the system credential store, not in the configuration file."); color: AppTheme.muted; font-size: 12px; wrap: word-wrap; }
                             }
                             Field {
                                 label: Ui.tr("API 地址", "API endpoint");
-                                LineEdit { accessible-label: Ui.tr("API 地址", "API endpoint"); text <=> Ui.api-url; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                LineEdit { accessible-label: Ui.tr("API 地址", "API endpoint"); text <=> Ui.api-url; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                             }
                             Field {
                                 label: Ui.tr("模型", "Model");
@@ -58,34 +81,34 @@ export component SettingsPage inherits Rectangle {
                                         : Ui.provider == "anthropic" ? ["claude-sonnet-4-20250514", Ui.tr("自定义", "Custom")]
                                         : Ui.provider == "google" ? ["gemini-2.5-flash", Ui.tr("自定义", "Custom")] : [Ui.tr("自定义", "Custom")];
                                     current-value: Ui.model;
-                                    enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt;
+                                    enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt;
                                     selected(value) => { if value != Ui.tr("自定义", "Custom") { Ui.model = value; Ui.edited(); } }
                                 }
-                                LineEdit { accessible-label: Ui.tr("模型标识", "Model ID"); text <=> Ui.model; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                LineEdit { accessible-label: Ui.tr("模型标识", "Model ID"); text <=> Ui.model; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                             }
                             Field {
                                 label: Ui.tr("请求超时（秒）", "Request timeout (seconds)");
-                                LineEdit { accessible-label: Ui.tr("请求超时（秒）", "Request timeout in seconds"); text <=> Ui.timeout; input-type: InputType.number; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                LineEdit { accessible-label: Ui.tr("请求超时（秒）", "Request timeout in seconds"); text <=> Ui.timeout; input-type: InputType.number; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                             }
                             ActionButton { text: Ui.advanced ? Ui.tr("收起高级选项", "Hide advanced options") : Ui.tr("高级选项", "Advanced options"); clicked => { Ui.advanced = !Ui.advanced; } }
                             if Ui.advanced: Field {
                                 label: Ui.tr("最大输出 Token", "Maximum output tokens");
-                                LineEdit { accessible-label: Ui.tr("最大输出 Token", "Maximum output tokens"); text <=> Ui.max-tokens; input-type: InputType.number; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
+                                LineEdit { accessible-label: Ui.tr("最大输出 Token", "Maximum output tokens"); text <=> Ui.max-tokens; input-type: InputType.number; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; edited => { Ui.edited(); } }
                             }
                             if Ui.advanced: VerticalLayout {
                                 alignment: start; spacing: 16px;
-                                Switch { text: Ui.tr("备用模型", "Backup model"); checked <=> Ui.backup-enabled; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                                Switch { text: Ui.tr("备用模型", "Backup model"); checked <=> Ui.backup-enabled; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
                                 if Ui.backup-enabled: VerticalLayout {
                                     alignment: start; spacing: 12px;
-                                    ComboBox { accessible-label: Ui.tr("备用接口协议", "Backup protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.backup-wire-api; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
-                                    Field { label: Ui.tr("备用 API 地址", "Backup endpoint"); LineEdit { accessible-label: Ui.tr("备用 API 地址", "Backup endpoint"); text <=> Ui.backup-url;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                    Field { label: Ui.tr("备用 API Key", "Backup API key"); LineEdit { accessible-label: Ui.tr("备用 API Key", "Backup API key"); text <=> Ui.backup-key; input-type: InputType.password; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                    Field { label: Ui.tr("备用模型", "Backup model"); LineEdit { accessible-label: Ui.tr("备用模型", "Backup model"); text <=> Ui.backup-model;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                    Field { label: Ui.tr("备用超时（秒）", "Backup timeout"); LineEdit { accessible-label: Ui.tr("备用超时（秒）", "Backup timeout"); text <=> Ui.backup-timeout;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                    Switch { text: Ui.tr("允许自动切换备用端点", "Allow automatic failover"); checked <=> Ui.backup-authorized; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                                    ComboBox { accessible-label: Ui.tr("备用接口协议", "Backup protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.backup-wire-api; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                                    Field { label: Ui.tr("备用 API 地址", "Backup endpoint"); LineEdit { accessible-label: Ui.tr("备用 API 地址", "Backup endpoint"); text <=> Ui.backup-url;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用 API Key", "Backup API key"); LineEdit { accessible-label: Ui.tr("备用 API Key", "Backup API key"); text <=> Ui.backup-key; input-type: InputType.password; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用模型", "Backup model"); LineEdit { accessible-label: Ui.tr("备用模型", "Backup model"); text <=> Ui.backup-model;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Field { label: Ui.tr("备用超时（秒）", "Backup timeout"); LineEdit { accessible-label: Ui.tr("备用超时（秒）", "Backup timeout"); text <=> Ui.backup-timeout;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                    Switch { text: Ui.tr("允许自动切换备用端点", "Allow automatic failover"); checked <=> Ui.backup-authorized; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
                                 }
                             }
-                            ActionButton { text: Ui.tr("测试模型能力", "Test capabilities"); enabled: !Ui.busy && Ui.ready; clicked => { Ui.test(); } }
+                            ActionButton { text: Ui.tr("测试模型能力", "Test capabilities"); enabled: !Ui.saving && !Ui.busy && Ui.ready; clicked => { Ui.test(); } }
                             if Ui.testing: ActionButton { text: Ui.tr("取消测试", "Cancel test"); clicked => { Ui.cancel-test(); } }
                             if Ui.test-report != "": Text { text: Ui.test-report; color: AppTheme.text; wrap: word-wrap; }
 
@@ -95,13 +118,13 @@ export component SettingsPage inherits Rectangle {
                         VerticalLayout {
                             padding: 24px; spacing: 16px; alignment: start;
                             SectionTitle { text: Ui.tr("云端语音识别", "Cloud transcription"); padding: 0px; }
-                            Switch { text: Ui.tr("启用云端转写", "Enable cloud transcription"); checked <=> Ui.asr-enabled; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
+                            Switch { text: Ui.tr("启用云端转写", "Enable cloud transcription"); checked <=> Ui.asr-enabled; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; toggled => { Ui.edited(); } }
                             if Ui.asr-enabled: VerticalLayout {
                                 alignment: start; spacing: 12px;
-                                Field { label: Ui.tr("转写 API 地址", "Transcription endpoint"); LineEdit { accessible-label: Ui.tr("转写 API 地址", "Transcription endpoint"); text <=> Ui.asr-url;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                Field { label: Ui.tr("转写 API Key", "Transcription API key"); LineEdit { accessible-label: Ui.tr("转写 API Key", "Transcription API key"); text <=> Ui.asr-key; input-type: InputType.password; enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                Field { label: Ui.tr("转写模型", "Transcription model"); LineEdit { accessible-label: Ui.tr("转写模型", "Transcription model"); text <=> Ui.asr-model;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
-                                Field { label: Ui.tr("转写超时（秒）", "Transcription timeout"); LineEdit { accessible-label: Ui.tr("转写超时（秒）", "Transcription timeout"); text <=> Ui.asr-timeout;  enabled: !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写 API 地址", "Transcription endpoint"); LineEdit { accessible-label: Ui.tr("转写 API 地址", "Transcription endpoint"); text <=> Ui.asr-url;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写 API Key", "Transcription API key"); LineEdit { accessible-label: Ui.tr("转写 API Key", "Transcription API key"); text <=> Ui.asr-key; input-type: InputType.password; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写模型", "Transcription model"); LineEdit { accessible-label: Ui.tr("转写模型", "Transcription model"); text <=> Ui.asr-model;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
+                                Field { label: Ui.tr("转写超时（秒）", "Transcription timeout"); LineEdit { accessible-label: Ui.tr("转写超时（秒）", "Transcription timeout"); text <=> Ui.asr-timeout;  enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; edited => { Ui.edited(); } } }
                             }
                         }
                     }
@@ -114,17 +137,17 @@ export component SettingsPage inherits Rectangle {
                                 label: Ui.tr("界面语言", "Interface language");
                                 HorizontalLayout {
                                     spacing: 8px;
-                                    ActionButton { text: "中文"; selected: !Ui.english; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = false; Ui.edited(); } }
-                                    ActionButton { text: "English"; selected: Ui.english; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = true; Ui.edited(); } }
+                                    ActionButton { text: "中文"; selected: !Ui.english; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = false; Ui.edited(); } }
+                                    ActionButton { text: "English"; selected: Ui.english; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; clicked => { Ui.english = true; Ui.edited(); } }
                                 }
                             }
                             Field {
                                 label: Ui.tr("语音播报结果", "Speak responses");
-                                Switch { accessible-label: Ui.tr("语音播报结果", "Speak responses"); checked <=> Ui.auto-speak; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
+                                Switch { accessible-label: Ui.tr("语音播报结果", "Speak responses"); checked <=> Ui.auto-speak; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
                             }
                             Field {
                                 label: Ui.tr("高对比度模式", "High contrast");
-                                Switch { accessible-label: Ui.tr("高对比度模式", "High contrast"); checked <=> Ui.high-contrast; enabled: !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
+                                Switch { accessible-label: Ui.tr("高对比度模式", "High contrast"); checked <=> Ui.high-contrast; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
                             }
                         }
                     }
@@ -144,7 +167,7 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
                     if Ui.feedback != "": Text { text: Ui.feedback; color: Ui.feedback-error ? AppTheme.danger : AppTheme.muted; wrap: word-wrap; }
-                    ActionButton { text: Ui.busy ? Ui.tr("处理中…", "Working…") : Ui.tr("保存设置", "Save settings"); icon: @image-url("assets/save.svg"); primary: true; enabled: !Ui.busy && Ui.ready; clicked => { Ui.save(); } }
+                    ActionButton { text: Ui.busy ? Ui.tr("处理中…", "Working…") : Ui.tr("保存设置", "Save settings"); icon: @image-url("assets/save.svg"); primary: true; enabled: !Ui.saving && !Ui.busy && Ui.ready; clicked => { Ui.save(); } }
                 }
             }
         }

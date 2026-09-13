@@ -39,7 +39,12 @@ pub struct SystemSecretStore;
 
 impl SystemSecretStore {
     fn entry(account: &str) -> Result<keyring::Entry> {
-        keyring::Entry::new(SERVICE, account)
+        let service = std::env::var("ALE_TEST_CREDENTIAL_NAMESPACE")
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .map(|id| format!("{SERVICE}.acceptance.{id}"))
+            .unwrap_or_else(|| SERVICE.to_string());
+        keyring::Entry::new(&service, account)
             .map_err(|error| AleError::ConfigError(format!("无法初始化系统凭据库: {error}")))
     }
 }

@@ -5,7 +5,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
+    crate::diagnostics::record(
+        "atomic_file_write_start",
+        &[("bytes", content.len() as u64)],
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -20,7 +24,9 @@ fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
         }
         let mut file = options.open(&temporary)?;
         file.write_all(content)?;
+        crate::diagnostics::record("atomic_file_sync_start", &[]);
         file.sync_all()?;
+        crate::diagnostics::record("atomic_file_sync_done", &[]);
         drop(file);
         std::fs::rename(&temporary, path)?;
         Ok(())
@@ -28,6 +34,10 @@ fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(temporary);
     }
+    crate::diagnostics::record(
+        "atomic_file_write_done",
+        &[("success", result.is_ok() as u64)],
+    );
     result
 }
 
@@ -270,6 +280,7 @@ pub struct AppConfig {
 }
 
 /// 配置管理器
+#[derive(Clone)]
 pub struct ConfigManager {
     config_path: PathBuf,
     config: AppConfig,
@@ -291,6 +302,7 @@ impl ConfigManager {
 
     /// 加载配置
     pub fn load(&mut self) -> Result<()> {
+        crate::diagnostics::record("config_load_start", &[]);
         if !self.config_path.exists() {
             // 如果配置文件不存在，创建默认配置
             self.save()?;
@@ -355,12 +367,15 @@ impl ConfigManager {
     /// 更新配置
     pub fn update_config(&mut self, config: AppConfig) -> Result<()> {
         ConfigValidator::validate_model_endpoints(&config)?;
+        crate::diagnostics::record("credentials_read_start", &[]);
         let old_keys = (
             self.secret_store.get_api_key()?,
             self.secret_store.get_backup_api_key()?,
             self.secret_store.get_transcription_api_key()?,
         );
+        crate::diagnostics::record("credentials_read_done", &[]);
         let result = (|| -> Result<()> {
+            crate::diagnostics::record("credentials_write_start", &[]);
             if config.cloud_api.api_key.trim().is_empty() {
                 self.secret_store.delete_api_key()?;
             } else {
@@ -378,10 +393,12 @@ impl ConfigManager {
                 self.secret_store
                     .set_transcription_api_key(&config.transcription.endpoint.api_key)?;
             }
+            crate::diagnostics::record("credentials_write_done", &[]);
             atomic_config_write(&self.config_path, &serde_json::to_vec_pretty(&config)?)?;
             Ok(())
         })();
         if let Err(error) = result {
+            crate::diagnostics::record("credentials_rollback_start", &[]);
             let rollback = [
                 match old_keys.0 {
                     Some(key) => self.secret_store.set_api_key(&key),
@@ -396,12 +413,17 @@ impl ConfigManager {
                     None => self.secret_store.delete_transcription_api_key(),
                 },
             ];
+            crate::diagnostics::record(
+                "credentials_rollback_done",
+                &[("success", rollback.iter().all(Result::is_ok) as u64)],
+            );
             if rollback.iter().any(Result::is_err) {
                 return Err(AleError::ConfigError("Save failed; credential rollback also failed. Re-enter credentials before retrying.".into()));
             }
             return Err(error);
         }
         self.config = config;
+        crate::diagnostics::record("config_commit_done", &[]);
         Ok(())
     }
 

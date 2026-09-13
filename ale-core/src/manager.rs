@@ -79,6 +79,45 @@ impl SmartModelManager {
         }
     }
 
+    pub(crate) fn download_context(&self) -> ModelDownloader {
+        self.downloader.clone()
+    }
+
+    pub(crate) fn record_delete(&mut self, model_id: &str) {
+        if let Some(status) = self.model_status.get_mut(model_id) {
+            status.downloaded = false;
+            status.path = None;
+        }
+    }
+
+    pub(crate) fn record_download(&mut self, model_id: &str, path: PathBuf) {
+        if let Some(model) = self.downloader.get_model_info(model_id) {
+            self.update_model_status(
+                model_id,
+                ModelStatus {
+                    model_id: model_id.into(),
+                    downloaded: true,
+                    path: Some(path),
+                    size: model.size,
+                    last_used: None,
+                    use_count: 0,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn automatic_download_ids(&self) -> Vec<String> {
+        if !self.config.auto_download {
+            return Vec::new();
+        }
+        self.downloader
+            .recommended_models(&self.device_performance)
+            .into_iter()
+            .filter(|m| m.size <= self.config.max_download_size)
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
     /// 设置云端API
     pub fn set_cloud_api(&mut self, api: Box<dyn crate::cloud::CloudApi>) {
         self.cloud_api = Some(api);
