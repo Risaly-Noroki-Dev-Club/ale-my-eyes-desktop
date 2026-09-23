@@ -19,6 +19,7 @@ mod ui_text;
 
 slint::include_modules!();
 pub use acceptance::setup as setup_acceptance;
+pub use acceptance::setup_app_for_launch;
 pub use desktop_ui::setup_app;
 pub use platform_worker::dispatch as dispatch_platform_worker;
 mod platform_worker;

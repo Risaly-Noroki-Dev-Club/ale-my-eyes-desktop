@@ -37,6 +37,7 @@ pub struct Status {
 pub struct Diagnostics {
     pub status: Arc<Status>,
     pub directory: PathBuf,
+    fallback_directory: PathBuf,
     pub session: String,
     started: Instant,
     ui_thread: std::thread::ThreadId,
@@ -60,6 +61,9 @@ pub fn bootstrap() -> Arc<Diagnostics> {
             let state = Arc::new(Diagnostics {
                 status: Arc::new(Status::default()),
                 directory: directory.clone(),
+                // Resolve known folders before the window starts. On Windows this
+                // can verify a redirected directory through SHGetKnownFolderPath.
+                fallback_directory: events::fallback_directory(),
                 session: session.clone(),
                 started: Instant::now(),
                 ui_thread: std::thread::current().id(),
@@ -120,8 +124,11 @@ impl Diagnostics {
             .is_some_and(|sink| sink.health.fallback_active.load(Ordering::Acquire));
         #[cfg(windows)]
         let fallback = fallback || windows::fallback_active();
+        self.directory_for_fallback(fallback)
+    }
+    fn directory_for_fallback(&self, fallback: bool) -> PathBuf {
         if fallback {
-            events::fallback_directory()
+            self.fallback_directory.clone()
         } else {
             self.directory.clone()
         }
@@ -384,6 +391,34 @@ impl HangDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fallback_selection_uses_the_resolved_directory_without_filesystem_access() {
+        // Deliberately use paths unrelated to the user's actual known folders.
+        // Neither path needs to exist, and switching back must preserve both.
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let fallback_directory = directory.join("resolved-fallback");
+        let diagnostics = Diagnostics {
+            status: Arc::new(Status::default()),
+            directory: directory.clone(),
+            fallback_directory: fallback_directory.clone(),
+            session: "test".into(),
+            started: Instant::now(),
+            ui_thread: std::thread::current().id(),
+        };
+        for fallback in [false, true, true, false] {
+            assert_eq!(
+                diagnostics.directory_for_fallback(fallback),
+                if fallback {
+                    &fallback_directory
+                } else {
+                    &directory
+                }
+                .clone()
+            );
+        }
+        assert!(!directory.exists());
+    }
+
     #[test]
     fn snapshots_are_v2_and_atomic() {
         let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());

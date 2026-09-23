@@ -41,6 +41,43 @@ enum WriterTask {
     Flush(mpsc::SyncSender<bool>),
 }
 
+struct ActiveLogFile {
+    file: File,
+    // On Windows an exclusive data-file lock also prevents diagnostic readers
+    // from reading the log. Keep the writer's lifetime lock on its receipt.
+    _ownership_lock: File,
+}
+
+fn open_event_file(path: &Path) -> io::Result<ActiveLogFile> {
+    let file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    let mut receipt_created = false;
+    let ownership = (|| -> io::Result<File> {
+        // Unix locks are advisory, so keeping this lock also protects the log
+        // from older concurrent pruners without preventing live readers.
+        #[cfg(not(windows))]
+        file.try_lock().map_err(io::Error::other)?;
+        let mut owner = create_receipt(path)?;
+        receipt_created = true;
+        owner.try_lock().map_err(io::Error::other)?;
+        owner.write_all(b"ale-diagnostics-v2")?;
+        Ok(owner)
+    })();
+    match ownership {
+        Ok(owner) => Ok(ActiveLogFile {
+            file,
+            _ownership_lock: owner,
+        }),
+        Err(error) => {
+            drop(file);
+            let _ = fs::remove_file(path);
+            if receipt_created {
+                let _ = fs::remove_file(receipt(path));
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn build_info() -> Value {
     json!({"id":env!("ALE_BUILD_ID"),"target":env!("ALE_BUILD_TARGET"),"profile":env!("ALE_BUILD_PROFILE"),"cloud":cfg!(feature="cloud"),"local_inference":cfg!(feature="local-inference")})
 }
@@ -116,7 +153,7 @@ impl Sink {
             .name("ale-event-writer".into())
             .spawn(move || {
                 let mut root = root;
-                let mut file: Option<File> = None;
+                let mut file: Option<ActiveLogFile> = None;
                 let mut bytes = ROTATE_BYTES;
                 let mut sequence = 0u64;
                 let mut retry_after = Instant::now();
@@ -124,7 +161,8 @@ impl Sink {
                     let record = match task {
                         WriterTask::Record(record) => record,
                         WriterTask::Flush(reply) => {
-                            let success = file.as_mut().is_some_and(|file| file.flush().is_ok());
+                            let success =
+                                file.as_mut().is_some_and(|file| file.file.flush().is_ok());
                             let _ = reply.try_send(success);
                             continue;
                         }
@@ -134,7 +172,7 @@ impl Sink {
                         continue;
                     }
                     if bytes >= ROTATE_BYTES || file.is_none() {
-                        // Release the previous file's advisory lock before retention runs.
+                        // Release the previous file and its receipt lock before retention runs.
                         file = None;
                         let result = fs::create_dir_all(&root).and_then(|_| {
                             sequence += 1;
@@ -142,19 +180,7 @@ impl Sink {
                                 "ale-events-{writer_session}-{component}-{}-{sequence}.jsonl",
                                 std::process::id()
                             ));
-                            let opened = OpenOptions::new()
-                                .create_new(true)
-                                .write(true)
-                                .open(&path)?;
-                            if let Err(error) = opened.try_lock().map_err(io::Error::other) {
-                                let _ = fs::remove_file(&path);
-                                return Err(error);
-                            }
-                            if let Err(error) = register_file(&path) {
-                                let _ = fs::remove_file(&path);
-                                return Err(error);
-                            }
-                            Ok(opened)
+                            open_event_file(&path)
                         });
                         match result {
                             Ok(opened) => {
@@ -173,7 +199,7 @@ impl Sink {
                             }
                         }
                     }
-                    if file.as_mut().unwrap().write_all(&record).is_err() {
+                    if file.as_mut().unwrap().file.write_all(&record).is_err() {
                         writer_health.write_failures.fetch_add(1, Ordering::Relaxed);
                         writer_health.dropped.fetch_add(1, Ordering::Relaxed);
                         file = None;
@@ -188,7 +214,7 @@ impl Sink {
                     }
                 }
                 if let Some(mut file) = file {
-                    let _ = file.flush();
+                    let _ = file.file.flush();
                 }
             })?;
         Ok(Self {
@@ -340,11 +366,14 @@ fn receipt(path: &Path) -> PathBuf {
 }
 /// Register only files just created by this feature. Retention ignores unregistered files.
 pub fn register_file(path: &Path) -> io::Result<()> {
-    let mut owner = OpenOptions::new()
+    let mut owner = create_receipt(path)?;
+    owner.write_all(b"ale-diagnostics-v2")
+}
+fn create_receipt(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(receipt(path))?;
-    owner.write_all(b"ale-diagnostics-v2")
+        .open(receipt(path))
 }
 fn registered(path: &Path) -> bool {
     use std::io::Read;
@@ -353,8 +382,13 @@ fn registered(path: &Path) -> bool {
         file.take(32).read_to_end(&mut bytes).is_ok() && bytes == b"ale-diagnostics-v2"
     })
 }
-/// Active event files hold a cross-process lock. Never delete files held by live writers.
+/// Never wait on live writers. Current writers lock their registration receipt;
+/// also check the data-file lock to protect logs from older running versions.
 fn remove_inactive(path: &Path) -> io::Result<bool> {
+    let owner = OpenOptions::new().write(true).open(receipt(path))?;
+    if owner.try_lock().is_err() {
+        return Ok(false);
+    }
     let file = OpenOptions::new().write(true).open(path)?;
     if file.try_lock().is_err() {
         return Ok(false);
@@ -446,12 +480,29 @@ mod tests {
             session: "test".into(),
             component: "test",
         };
-        for _ in 0..QUEUE_LIMIT + 5 {
-            sink.record("sample", &[]);
-        }
-        assert_eq!(sink.health.dropped.load(Ordering::Relaxed), 5);
-        sink.submit(json!({"oversized": "x".repeat(RECORD_LIMIT)}));
-        assert_eq!(sink.health.dropped.load(Ordering::Relaxed), 6);
+        let (completed, completion) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..QUEUE_LIMIT + 5 {
+                sink.record("sample", &[]);
+            }
+            let after_full_queue = sink.health.dropped.load(Ordering::Relaxed);
+            sink.submit(json!({"oversized": "x".repeat(RECORD_LIMIT)}));
+            let _ = completed.send((
+                after_full_queue,
+                sink.health.dropped.load(Ordering::Relaxed),
+            ));
+        });
+        let counts = match completion.recv_timeout(Duration::from_secs(5)) {
+            Ok(counts) => counts,
+            Err(error) => {
+                // If enqueueing regresses to a blocking send, disconnecting its
+                // receiver releases that worker. Never join a stuck test worker.
+                drop(receiver);
+                panic!("diagnostic producer did not finish before the deadline: {error}");
+            }
+        };
+        worker.join().unwrap();
+        assert_eq!(counts, (5, 6));
         let WriterTask::Record(bytes) = receiver.try_recv().unwrap() else {
             panic!("record expected")
         };
@@ -475,6 +526,42 @@ mod tests {
         prune(&dir).unwrap();
         assert!(unknown.exists());
         drop(file);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_log_registration_preserves_an_existing_receipt() {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("ale-events-existing.jsonl");
+        fs::write(receipt(&path), b"existing owner").unwrap();
+        assert!(open_event_file(&path).is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(receipt(&path)).unwrap(), b"existing owner");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn active_logs_are_readable_and_protected_until_the_writer_closes() {
+        let dir = std::env::temp_dir().join(format!("ale-diag-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ale-events-readable.jsonl");
+        let mut active = open_event_file(&path).unwrap();
+        active
+            .file
+            .write_all(b"{\"event\":\"still_running\"}\n")
+            .unwrap();
+        active.file.flush().unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"event\":\"still_running\"}\n"
+        );
+        assert!(!remove_inactive(&path).unwrap());
+        prune(&dir).unwrap();
+        assert!(path.exists());
+        drop(active);
+        assert!(remove_inactive(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!receipt(&path).exists());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]

@@ -685,9 +685,12 @@ pub struct AleEngineFactory;
 impl AleEngineFactory {
     /// 创建默认引擎
     pub async fn create_default() -> Result<AleEngine> {
-        let config_path = config::ConfigFactory::create_default()
-            .config_path()
-            .to_path_buf();
+        let config_path = resolve_default_config_path(|| {
+            config::ConfigFactory::create_default()
+                .config_path()
+                .to_path_buf()
+        })
+        .await?;
         AleEngine::new(&config_path).await
     }
 
@@ -705,9 +708,51 @@ impl AleEngineFactory {
     }
 }
 
+async fn resolve_default_config_path(
+    resolve: impl FnOnce() -> std::path::PathBuf + Send + 'static,
+) -> Result<std::path::PathBuf> {
+    // On Windows the config directory lookup calls SHGetKnownFolderPath. Keep
+    // shell/profile work off the async executor, just like credential loading.
+    let started = std::time::Instant::now();
+    diagnostics::record("config_directory_lookup_started", &[]);
+    let result = tokio::task::spawn_blocking(resolve).await;
+    diagnostics::record(
+        "config_directory_lookup_finished",
+        &[
+            ("elapsed_ms", started.elapsed().as_millis() as u64),
+            ("success", result.is_ok() as u64),
+        ],
+    );
+    result.map_err(|_| AleError::ConfigError("Configuration directory worker failed".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_config_directory_lookup_keeps_runtime_responsive() {
+        let runtime_thread = std::thread::current().id();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lookup = tokio::spawn(resolve_default_config_path(move || {
+            assert_ne!(std::thread::current().id(), runtime_thread);
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("runtime must progress while directory discovery is pending");
+            std::path::PathBuf::from("test-config.json")
+        }));
+
+        started_rx.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!lookup.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            lookup.await.unwrap().unwrap(),
+            std::path::PathBuf::from("test-config.json")
+        );
+    }
 
     #[tokio::test]
     async fn slow_credentials_do_not_block_runtime_and_bad_memory_preserves_startup() {

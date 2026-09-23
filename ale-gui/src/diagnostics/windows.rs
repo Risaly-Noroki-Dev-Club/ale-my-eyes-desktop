@@ -729,13 +729,15 @@ fn helper(name: &str, session: &str, directory: &Path) -> io::Result<()> {
 }
 
 struct Snapshot {
-    process: HANDLE,
     snapshot: HPSS,
 }
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        unsafe {
-            PssFreeSnapshot(self.process, self.snapshot);
+        // PssCaptureSnapshot creates the descriptor in this capture process,
+        // even though its contents come from the monitored GUI process.
+        let error = unsafe { PssFreeSnapshot(GetCurrentProcess(), self.snapshot) };
+        if error != 0 {
+            events::record("snapshot_release_failed", &[("os_error", error as u64)]);
         }
     }
 }
@@ -838,7 +840,6 @@ fn capture(name: &str, destination: &Path) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
     let snapshot = Snapshot {
-        process: process.0,
         snapshot: snapshot_handle,
     };
     let mut clone_info: PSS_VA_CLONE_INFORMATION = unsafe { zeroed() };

@@ -202,6 +202,13 @@ fn qr(app: &AppWindow, server: &RemoteServerHandle) {
 }
 
 pub fn setup_app(app: &AppWindow) {
+    setup_app_with_engine(app, AleEngineFactory::create_default());
+}
+
+pub(crate) fn setup_app_with_engine(
+    app: &AppWindow,
+    engine: impl std::future::Future<Output = ale_core::Result<AleEngine>> + Send + 'static,
+) {
     let state = Rc::new(RefCell::new(State::default()));
     state.borrow_mut().tools = Some(crate::model_download_ui::setup(app));
     let ui = app.global::<Ui>();
@@ -216,13 +223,11 @@ pub fn setup_app(app: &AppWindow) {
         let weak = app.as_weak();
         let state = state.clone();
         spawn(async move {
-            match tokio::spawn(AleEngineFactory::create_default())
-                .await
-                .unwrap_or_else(|_| {
-                    Err(ale_core::AleError::Other(anyhow::anyhow!(
-                        "ENGINE_START_FAILED"
-                    )))
-                }) {
+            match tokio::spawn(engine).await.unwrap_or_else(|_| {
+                Err(ale_core::AleError::Other(anyhow::anyhow!(
+                    "ENGINE_START_FAILED"
+                )))
+            }) {
                 Ok(engine) => {
                     let config = engine.config().clone();
                     let memory_available = engine.memory_available();

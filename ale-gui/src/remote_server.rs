@@ -334,10 +334,16 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let code = remote_crypto::pairing_code();
     let session_id = remote_crypto::session_id();
     let name = remote_crypto::device_name();
-    let host = local_addresses()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let host = service_native_work(
+        "network_discovery_started",
+        "network_discovery_finished",
+        local_addresses,
+    )
+    .await
+    .map_err(|_| "NETWORK_DISCOVERY_FAILED".to_string())?
+    .into_iter()
+    .next()
+    .unwrap_or_else(|| "127.0.0.1".to_string());
     let pairing = PairingInfo {
         host,
         port: DEFAULT_REMOTE_PORT,
@@ -412,7 +418,15 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
     let task = tokio::spawn(async move {
-        let mdns = advertise_mdns(&server_pairing);
+        let advertised_pairing = server_pairing.clone();
+        let mdns = service_native_work(
+            "mdns_registration_started",
+            "mdns_registration_finished",
+            move || advertise_mdns(&advertised_pairing),
+        )
+        .await
+        .ok()
+        .flatten();
         loop {
             let accepted = tokio::select! {
                 _ = &mut shutdown_rx => break,
@@ -466,7 +480,12 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
             }
         }
         if let Some(mdns) = mdns {
-            mdns.stop();
+            let _ = service_native_work(
+                "mdns_shutdown_started",
+                "mdns_shutdown_finished",
+                move || mdns.stop(),
+            )
+            .await;
         }
     });
 
@@ -478,6 +497,26 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
+}
+
+async fn service_native_work<T: Send + 'static>(
+    started_event: &'static str,
+    finished_event: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    // Interface enumeration and mDNS socket/thread setup can wait inside OS
+    // APIs. The server awaits completion without occupying an async worker.
+    let started = Instant::now();
+    ale_core::diagnostics::record(started_event, &[]);
+    let result = tokio::task::spawn_blocking(work).await;
+    ale_core::diagnostics::record(
+        finished_event,
+        &[
+            ("elapsed_ms", started.elapsed().as_millis() as u64),
+            ("worker_ok", result.is_ok() as u64),
+        ],
+    );
+    result
 }
 
 async fn handle_connection(
@@ -2666,6 +2705,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_network_discovery_keeps_runtime_responsive() {
+        let runtime_thread = std::thread::current().id();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let discovery = tokio::spawn(service_native_work(
+            "network_discovery_started",
+            "network_discovery_finished",
+            move || {
+                assert_ne!(std::thread::current().id(), runtime_thread);
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("runtime must progress while network discovery is pending");
+                vec!["192.0.2.1".to_string()]
+            },
+        ));
+
+        started_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!discovery.is_finished());
+        release_tx.send(()).unwrap();
+        assert_eq!(discovery.await.unwrap().unwrap(), vec!["192.0.2.1"]);
+    }
 
     struct MockPlatform {
         executed: AtomicUsize,

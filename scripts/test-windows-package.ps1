@@ -28,6 +28,63 @@ public static class AleWindowProbe {
  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 }
 '@
+function Read-DiagnosticEvents([string]$Directory) {
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Filter 'ale-events-*.jsonl' -ErrorAction SilentlyContinue)) {
+        foreach ($line in @(Get-Content -LiteralPath $file.FullName -ErrorAction SilentlyContinue)) {
+            # A writer may still be appending the final line. Retry it on the
+            # next poll; an incomplete line must not abort evidence collection.
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                try { $line | ConvertFrom-Json -ErrorAction Stop } catch { }
+            }
+        }
+    }
+}
+function Read-TargetSnapshots([string]$Directory, [int]$TargetPid, [string]$Session, [long]$NotBeforeUnixMs = 0) {
+    Get-ChildItem -LiteralPath $Directory -Filter 'ale-diagnostic-*.json' -ErrorAction SilentlyContinue | ForEach-Object {
+        try { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json -ErrorAction Stop } catch { }
+    } | Where-Object {
+        $_.pid -eq $TargetPid -and $_.session -eq $Session -and $_.independent_windows_monitor -and
+        $_.timestamp_unix_ms -ge $NotBeforeUnixMs
+    }
+}
+function Wait-DiagnosticCapture([string]$Directory, [int]$TargetPid, [int]$TimeoutSeconds) {
+    $deadline = [System.Diagnostics.Stopwatch]::StartNew()
+    $session = $null
+    $terminalStatus = $null
+    do {
+        $records = @(Read-DiagnosticEvents -Directory $Directory)
+        if (-not $session) {
+            $start = $records | Where-Object {
+                ($_.pid -eq $TargetPid -and $_.component -eq 'gui' -and $_.event -eq 'process_start') -or
+                ($_.component -eq 'diagnostic-helper' -and $_.event -eq 'monitor_started' -and $_.fields.target_pid -eq $TargetPid)
+            } | Select-Object -First 1
+            if ($start) { $session = $start.session }
+        }
+        if ($session) {
+            $terminal = $records | Where-Object {
+                $_.session -eq $session -and $_.component -eq 'diagnostic-helper' -and
+                $_.event -in @('dump_completed', 'dump_failed', 'dump_timeout', 'dump_spawn_failed')
+            } | Sort-Object event_sequence | Select-Object -Last 1
+            if ($terminal) {
+                $terminalStatus = $terminal.event
+                $incident = $records | Where-Object {
+                    $_.session -eq $session -and $_.component -eq 'diagnostic-helper' -and
+                    $_.event -in @('ui_hang_detected', 'crash_notification')
+                } | Sort-Object event_sequence | Select-Object -Last 1
+                $notBefore = if ($incident) { [long]$incident.timestamp_unix_ms } else { [long]0 }
+                # The snapshot writer is independent of the capture worker. A
+                # completed dump does not imply its incident snapshot is on disk.
+                $snapshotReady = @(Read-TargetSnapshots -Directory $Directory -TargetPid $TargetPid -Session $session -NotBeforeUnixMs $notBefore).Count -gt 0
+                if ($terminalStatus -ne 'dump_completed' -or $snapshotReady) {
+                    return [pscustomobject]@{ status=$terminalStatus; session=$session; waited_seconds=$deadline.Elapsed.TotalSeconds; incident_unix_ms=$notBefore }
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ($deadline.Elapsed.TotalSeconds -lt $TimeoutSeconds)
+    $status = if ($terminalStatus -eq 'dump_completed') { 'snapshot_timeout' } else { 'evidence_timeout' }
+    return [pscustomobject]@{ status=$status; session=$session; waited_seconds=$deadline.Elapsed.TotalSeconds }
+}
 try {
     Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
     $package = Join-Path $extractRoot $PackageName
@@ -45,9 +102,11 @@ try {
     $env:ALE_DIAGNOSTICS_DIRECTORY = $logRoot
     $env:ALE_TEST_CREDENTIAL_NAMESPACE = [guid]::NewGuid().ToString()
     $env:SLINT_BACKEND = switch ($Renderer) { 'software' {'winit-software'} 'opengl' {'winit-femtovg'} default {$null} }
-    $cliOutput = & (Join-Path $package 'ale-cli.exe') status 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "CLI failed: $cliOutput" }
-    $gui = Start-Process -FilePath (Join-Path $package 'ale-gui.exe') -WorkingDirectory $package -ArgumentList @('--ui-acceptance', ('"' + $report + '"'), $DurationSeconds) -PassThru
+    # --help verifies executable startup without loading or saving user config.
+    $cliOutput = & (Join-Path $package 'ale-cli.exe') --help 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "CLI help startup failed: $cliOutput" }
+    $uiProfile = Join-Path $smokeRoot 'ui-profile'
+    $gui = Start-Process -FilePath (Join-Path $package 'ale-gui.exe') -WorkingDirectory $package -ArgumentList @('--ui-acceptance-profile', ('"' + $uiProfile + '"'), '--ui-acceptance', ('"' + $report + '"'), $DurationSeconds) -PassThru
     $started = Get-Date
     $responsive = 0
     $failures = 0
@@ -76,28 +135,65 @@ try {
         $result = [ordered]@{ passed=$true; target=$manifest.target; duration_seconds=$DurationSeconds; renderer=$Renderer; moved=$moved; build_id=$manifest.build_id; native_responses=$responsive; ui=$ui; binary_hash=$manifest.files.'ale-gui.exe'.sha256 }
         $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $reportRoot "ui-$Renderer-$DurationSeconds.json") -Encoding utf8
         Write-Host 'Native window response, countdown, navigation, movement and normal exit passed.'
+    } catch {
+        $acceptanceError = $_
+        try {
+            $gui.Refresh()
+            if (-not $gui.HasExited) {
+                # Three failed window probes can precede the independent monitor's
+                # five-second hang threshold. Leave time for its 15-second capture
+                # budget before finally terminating the failed acceptance target.
+                $capture = Wait-DiagnosticCapture -Directory $logRoot -TargetPid $gui.Id -TimeoutSeconds 30
+                Write-Warning "GUI acceptance failed; diagnostic capture status: $($capture.status)"
+            }
+        } catch {
+            Write-Warning "Could not collect diagnostic capture status: $($_.Exception.Message)"
+        }
+        throw $acceptanceError
     } finally {
-        if (-not $gui.HasExited) { Stop-Process -Id $gui.Id -Force; $gui.WaitForExit() }
+        if (-not $gui.HasExited) {
+            Stop-Process -Id $gui.Id -Force
+            if (-not $gui.WaitForExit(10000)) { Write-Warning 'Failed GUI did not exit within the cleanup deadline' }
+        }
 }
 if ($FaultEvidence) {
     foreach ($fault in @('busy','lock','panic','access-violation')) {
         $faultRoot = Join-Path $smokeRoot "fault-$fault"
         New-Item -ItemType Directory -Force -Path $faultRoot | Out-Null
         $env:ALE_DIAGNOSTICS_DIRECTORY = $faultRoot
-        $faultProcess = Start-Process -FilePath (Join-Path $package 'ale-gui.exe') -WorkingDirectory $package -ArgumentList @('--ui-fault',$fault) -PassThru
-        $faultStart = Get-Date
-        while (-not $faultProcess.HasExited -and ((Get-Date)-$faultStart).TotalSeconds -lt 35) { Start-Sleep -Milliseconds 250; $faultProcess.Refresh() }
-        if (-not $faultProcess.HasExited) { Stop-Process -Id $faultProcess.Id -Force; $faultProcess.WaitForExit() }
-        Start-Sleep -Seconds 2
-        $snapshots = @(Get-ChildItem $faultRoot -Filter 'ale-diagnostic-*.json' -ErrorAction SilentlyContinue)
-        $events = @(Get-ChildItem $faultRoot -Filter 'ale-events-*.jsonl' -ErrorAction SilentlyContinue)
-        $dumps = @(Get-ChildItem $faultRoot -Filter 'ale-hang-*.dmp' -ErrorAction SilentlyContinue)
-        if ($fault -eq 'panic' -or $fault -eq 'access-violation') {
-            if ($dumps.Count -gt 1) { throw "More than one dump for one $fault incident" }
-        } elseif ($dumps.Count -ne 1) { throw "Expected one local dump for $fault; found $($dumps.Count)" }
-        if ($events.Count -eq 0 -or $snapshots.Count -eq 0) { throw "Independent evidence missing for $fault" }
-        $faultEvidence = [ordered]@{ fault=$fault; snapshots=$snapshots.Count; events=$events.Count; dumps=$dumps.Count; dump_bytes=if($dumps.Count){$dumps[0].Length}else{0}; local_only=$true }
-        $faultEvidence | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $reportRoot "fault-$fault.json") -Encoding utf8
+        $faultProfile = Join-Path $faultRoot 'profile'
+        $faultProcess = Start-Process -FilePath (Join-Path $package 'ale-gui.exe') -WorkingDirectory $package -ArgumentList @('--ui-acceptance-profile', ('"' + $faultProfile + '"'), '--ui-fault',$fault) -PassThru
+        try {
+            # This budget includes startup and the fault's five-second timer.
+            # Keep waiting after a crash exits: its capture helper may still be
+            # writing the snapshot. A terminal event replaces arbitrary sleeps.
+            $capture = Wait-DiagnosticCapture -Directory $faultRoot -TargetPid $faultProcess.Id -TimeoutSeconds 45
+            if ($capture.status -ne 'dump_completed') { throw "Capture failed for ${fault}: $($capture.status)" }
+            $session = $capture.session
+            $snapshots = @(Read-TargetSnapshots -Directory $faultRoot -TargetPid $faultProcess.Id -Session $session -NotBeforeUnixMs $capture.incident_unix_ms)
+            $events = @(Read-DiagnosticEvents -Directory $faultRoot | Where-Object { $_.session -eq $session })
+            $crash = $fault -in @('panic', 'access-violation')
+            $expectedCrashKind = if ($fault -eq 'panic') { 2 } else { 1 }
+            $prefix = if ($crash) { 'ale-crash' } else { 'ale-hang' }
+            $dumps = @(Get-ChildItem -LiteralPath $faultRoot -Filter "$prefix-*-$session-$($faultProcess.Id).dmp" -ErrorAction SilentlyContinue)
+            if ($dumps.Count -ne 1 -or $dumps[0].Length -le 0) { throw "Expected one nonempty local dump for $fault; found $($dumps.Count)" }
+            $sidecar = Get-Content -LiteralPath ([System.IO.Path]::ChangeExtension($dumps[0].FullName, 'json')) -Raw | ConvertFrom-Json
+            if ($sidecar.pid -ne $faultProcess.Id -or $sidecar.dump_bytes -ne $dumps[0].Length) { throw "Dump identity or size mismatch for $fault" }
+            $incident = @($events | Where-Object {
+                $_.component -eq 'diagnostic-helper' -and
+                (($crash -and $_.event -eq 'crash_notification' -and $_.fields.kind -eq $expectedCrashKind) -or
+                 (-not $crash -and $_.event -eq 'ui_hang_detected'))
+            })
+            if ($incident.Count -eq 0 -or $snapshots.Count -eq 0) { throw "Independent incident evidence missing for $fault" }
+            $faultEvidence = [ordered]@{ fault=$fault; pid=$faultProcess.Id; session=$session; capture_status=$capture.status; snapshots=$snapshots.Count; events=$events.Count; dumps=$dumps.Count; dump_bytes=$dumps[0].Length; local_only=$true }
+            $faultEvidence | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $reportRoot "fault-$fault.json") -Encoding utf8
+        } finally {
+            $faultProcess.Refresh()
+            if (-not $faultProcess.HasExited) {
+                Stop-Process -Id $faultProcess.Id -Force
+                if (-not $faultProcess.WaitForExit(10000)) { throw "Fault target did not exit within the cleanup deadline: $fault" }
+            }
+        }
     }
 }
 } finally {
