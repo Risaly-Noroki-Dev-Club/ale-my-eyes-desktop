@@ -37,17 +37,14 @@ jobs:
     name: Windows package and smoke test
     needs: check
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Test visible assistant controls
         run: cargo test -p ale-gui visible_assistant_controls_reach_root_callbacks --locked
-      - run: ./scripts/package-windows.sh
-        env:
-          WINDOWS_TARGET: x86_64-pc-windows-msvc
+      - name: Build and package Windows MSVC binaries
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -SkipInstall -Package
       - name: Smoke-test Windows package
         shell: pwsh
         run: ./scripts/test-windows-package.ps1

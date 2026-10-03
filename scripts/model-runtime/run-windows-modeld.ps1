@@ -9,7 +9,7 @@ if ((Test-Path -LiteralPath $cargoBin) -and $null -eq (Get-Command rustc.exe -Er
     $env:Path = "$cargoBin;$env:Path"
 }
 if ($null -eq (Get-Command rustc.exe -ErrorAction SilentlyContinue)) {
-    throw "Rust is unavailable. Run scripts\model-runtime\setup-windows-test.bat first."
+    throw "Rust is unavailable. Run scripts\build-windows.cmd first."
 }
 
 function Find-LibclangDirectory {
@@ -32,13 +32,13 @@ function Find-LibclangDirectory {
 
 $libclangPath = Find-LibclangDirectory
 if ([string]::IsNullOrWhiteSpace($libclangPath)) {
-    throw "LLVM libclang is unavailable. Run scripts\model-runtime\setup-windows-test.bat first."
+    throw "LLVM libclang is unavailable. Run scripts\build-windows.cmd first."
 }
 $env:LIBCLANG_PATH = $libclangPath
 
 function Import-VsEnvironment {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe is missing. Run setup-windows-test.bat first." }
+    if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere.exe is missing. Run scripts\build-windows.cmd first." }
     $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     if ([string]::IsNullOrWhiteSpace($installation)) { throw "Visual Studio C++ Build Tools are missing." }
     $vsDevCmd = Join-Path $installation.Trim() "Common7\Tools\VsDevCmd.bat"
@@ -85,12 +85,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $fixtures "expected.json"))) {
 }
 $hostLine = (& rustc.exe -vV | Select-String '^host:').Line
 if ($hostLine -ne "host: x86_64-pc-windows-msvc") {
-    throw "Rust MSVC is required. Run setup-windows-test.bat first. Found: $hostLine"
+    throw "Rust MSVC is required. Run scripts\build-windows.cmd first. Found: $hostLine"
 }
 Import-VsEnvironment
 
-& cargo.exe build --release --locked -p ale-cli -p ale-gui -p ale-modeld
-if ($LASTEXITCODE -ne 0) { throw "Native Windows release build failed." }
+& (Join-Path $repoRoot 'scripts\build-windows.ps1') -SkipInstall -BuildOnly
 
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $reportRoot = Join-Path $repoRoot "target\model-runtime-reports"

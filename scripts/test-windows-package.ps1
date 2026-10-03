@@ -93,6 +93,10 @@ try {
     }
     if ((Test-Path (Join-Path $package 'config')) -or (Test-Path (Join-Path $package 'config.json'))) { throw 'Package contains runtime configuration' }
     $manifest = Get-Content (Join-Path $package 'build-manifest.json') -Raw | ConvertFrom-Json
+    if (-not $manifest.runtime_dlls.'sherpa-onnx-c-api.dll' -or
+        -not (Test-Path -LiteralPath (Join-Path $package 'sherpa-onnx-c-api.dll') -PathType Leaf)) {
+        throw 'Package is missing the Sherpa native runtime DLL'
+    }
     foreach ($file in $manifest.files.PSObject.Properties) {
         $hash = (Get-FileHash (Join-Path $package $file.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($hash -ne $file.Value.sha256) { throw "Binary/manifest mismatch: $($file.Name)" }
