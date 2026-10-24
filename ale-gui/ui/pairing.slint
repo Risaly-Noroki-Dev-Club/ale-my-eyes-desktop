@@ -1,4 +1,4 @@
-import { ScrollView } from "std-widgets.slint";
+import { ScrollView, ComboBox } from "std-widgets.slint";
 import { Ui } from "state.slint";
 import { AppTheme, ActionButton, StatusBadge, Panel } from "widgets.slint";
 
@@ -26,6 +26,23 @@ export component PairingScreen inherits Rectangle {
                     width: min(root.width - 48px, 680px); spacing: 24px;
                     Text { text: Ui.tr("连接", "Connect"); font-size: 36px; font-weight: 700; color: AppTheme.text; }
                     Panel {
+                        VerticalLayout {
+                            padding: 20px; spacing: 12px;
+                            Text { text: Ui.tr("连接地址", "Connection address"); color: AppTheme.text; font-weight: 600; }
+                            ComboBox {
+                                accessible-label: Ui.tr("连接地址", "Connection address");
+                                model: Ui.pairing-addresses;
+                                current-index <=> Ui.selected-pairing-address;
+                                enabled: Ui.ready && !Ui.busy && !Ui.pairing-refreshing && Ui.pairing-available;
+                                selected(value) => { Ui.select-pairing-address(self.current-index); }
+                            }
+                            Text {
+                                text: Ui.tr("选择与手机同一局域网的地址，切换后重新扫码。开启 VPN 时，请允许局域网访问；切换网络后点击刷新二维码。", "Choose an address on your phone's local network, then scan again. Allow local network access in your VPN. Refresh the QR code after changing networks.");
+                                color: AppTheme.muted; wrap: word-wrap; font-size: 13px;
+                            }
+                        }
+                    }
+                    Panel {
                         GridLayout {
                             spacing: 0px;
                             Rectangle {
@@ -48,7 +65,7 @@ export component PairingScreen inherits Rectangle {
                                     }
                                     HorizontalLayout {
                                         alignment: center;
-                                        ActionButton { text: Ui.tr("刷新二维码", "Refresh QR code"); enabled: Ui.ready && !Ui.busy; clicked => { Ui.refresh(); } }
+                                        ActionButton { text: Ui.pairing-refreshing ? Ui.tr("正在检测网络…", "Checking network…") : Ui.tr("刷新二维码", "Refresh QR code"); enabled: Ui.ready && !Ui.busy && !Ui.pairing-refreshing; clicked => { Ui.refresh(); } }
                                     }
                                 }
                             }

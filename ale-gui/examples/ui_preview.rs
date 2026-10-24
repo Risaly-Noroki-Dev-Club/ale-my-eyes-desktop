@@ -14,6 +14,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_remaining(119);
     ui.set_pairing_status("等待手机连接".into());
     ui.set_pairing_uri("ale-my-eyes://pair?host=192.168.1.42&port=37654&code=JVVDPV".into());
+    ui.set_pairing_available(true);
+    ui.set_selected_pairing_address(0);
+    ui.set_pairing_addresses(ModelRc::new(VecModel::from(vec![
+        "en0 · 192.168.1.42".into(),
+        "utun4 · 10.8.0.2".into(),
+    ])));
     let code = qrcode::QrCode::new(b"ale-my-eyes://preview-only")?;
     let qr = code
         .render::<image::Rgba<u8>>()
@@ -100,14 +106,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (1032, 800, true, true),
                 (440, 640, true, true),
             ];
-            let case = index / 12;
+            let case = index / 18;
             if case >= cases.len() {
                 slint::quit_event_loop().unwrap();
                 return;
             }
-            let page = ["pairing", "main", "settings"][(index / 4) % 3];
+            let page = ["pairing", "main", "settings"][(index / 6) % 3];
             let (width, height, english, contrast) = cases[case];
-            if index.is_multiple_of(4) {
+            if index.is_multiple_of(6) {
                 app.window()
                     .set_size(slint::LogicalSize::new(width as f32, height as f32));
                 // Recreate the page between cases so a previous wheel gesture or
@@ -125,20 +131,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .set_theme(if contrast { "dark" } else { "light" }.into());
                 app.global::<Ui>()
                     .set_pairing_status(if english { "Connected" } else { "已连接" }.into());
-            } else if index % 4 == 2 {
+            } else if index % 6 == 3 {
                 app.window()
                     .dispatch_event(slint::platform::WindowEvent::PointerScrolled {
-                        position: slint::LogicalPosition::new(30.0, 400.0),
+                        position: slint::LogicalPosition::new(
+                            width as f32 / 2.0,
+                            height as f32 / 2.0,
+                        ),
                         delta_x: 0.0,
                         delta_y: -2000.0,
                     });
-            } else {
+            } else if index % 6 == 2 || index % 6 == 5 {
+                // Allow a full frame after page creation and scrolling before capture.
                 match app.window().take_snapshot() {
                     Ok(image) => {
                         image::save_buffer(
                             format!(
                                 "target/ui-preview/{page}-{width}-{height}-{english}{}.png",
-                                if index % 4 == 3 { "-bottom" } else { "" }
+                                if index % 6 == 5 { "-bottom" } else { "" }
                             ),
                             image.as_bytes(),
                             image.width(),

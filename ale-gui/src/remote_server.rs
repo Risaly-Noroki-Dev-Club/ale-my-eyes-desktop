@@ -29,7 +29,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::accept_async_with_config;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -213,6 +213,7 @@ pub struct RemoteServerHandle {
     pub credentials: Arc<std::sync::Mutex<PairingCredentials>>,
     pub modeld: Option<SupervisedModeldClient>,
     pub platform: Arc<dyn PlatformService>,
+    advertised_host: watch::Sender<String>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -220,9 +221,74 @@ pub struct RemoteServerHandle {
 pub struct PairingCredentials {
     pub info: PairingInfo,
     pub expires: Instant,
+    pub addresses: Vec<PairingAddress>,
+    manual_host: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingAddress {
+    pub interface: String,
+    pub ip: std::net::Ipv4Addr,
+}
+
+impl PairingCredentials {
+    pub fn select_address(&mut self, index: i32) -> Result<(), String> {
+        let address = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.addresses.get(index))
+            .ok_or("地址已不可用，请刷新二维码 / Address unavailable; refresh the QR code")?;
+        self.info.host = address.ip.to_string();
+        self.manual_host = Some(self.info.host.clone());
+        Ok(())
+    }
+
+    fn replace_addresses(&mut self, addresses: Vec<PairingAddress>) {
+        let selected = self.manual_host.as_ref().and_then(|host| {
+            addresses
+                .iter()
+                .find(|address| address.ip.to_string() == *host)
+        });
+        if selected.is_none() {
+            self.manual_host = None;
+        }
+        self.info.host = selected
+            .or_else(|| addresses.first())
+            .map(|address| address.ip.to_string())
+            .unwrap_or_default();
+        self.expires = if addresses.is_empty() {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(120)
+        };
+        self.info.code = remote_crypto::pairing_code();
+        self.addresses = addresses;
+    }
+}
+
+pub fn refresh_pairing_network(
+    credentials: &std::sync::Mutex<PairingCredentials>,
+) -> Result<(), String> {
+    // Enumeration can block in OS APIs; callers run this on a blocking worker.
+    let addresses = local_addresses()?;
+    credentials
+        .lock()
+        .map_err(|_| "配对状态不可用 / Pairing state unavailable".to_string())?
+        .replace_addresses(addresses);
+    Ok(())
 }
 
 impl RemoteServerHandle {
+    pub fn advertise_pairing_address(&self, host: &str) {
+        self.advertised_host.send_if_modified(|current| {
+            if current.as_str() == host {
+                false
+            } else {
+                *current = host.to_string();
+                true
+            }
+        });
+    }
+
     #[cfg(test)]
     pub fn refresh_pairing(&self) {
         let mut credentials = self.credentials.lock().unwrap();
@@ -334,16 +400,17 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let code = remote_crypto::pairing_code();
     let session_id = remote_crypto::session_id();
     let name = remote_crypto::device_name();
-    let host = service_native_work(
+    let addresses = service_native_work(
         "network_discovery_started",
         "network_discovery_finished",
         local_addresses,
     )
     .await
-    .map_err(|_| "NETWORK_DISCOVERY_FAILED".to_string())?
-    .into_iter()
-    .next()
-    .unwrap_or_else(|| "127.0.0.1".to_string());
+    .map_err(|_| "NETWORK_DISCOVERY_FAILED".to_string())??;
+    let host = addresses
+        .first()
+        .map(|address| address.ip.to_string())
+        .unwrap_or_default();
     let pairing = PairingInfo {
         host,
         port: DEFAULT_REMOTE_PORT,
@@ -400,7 +467,13 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     let server_pairing = pairing.clone();
     let credentials = Arc::new(std::sync::Mutex::new(PairingCredentials {
         info: pairing.clone(),
-        expires: Instant::now() + Duration::from_secs(120),
+        expires: if addresses.is_empty() {
+            Instant::now()
+        } else {
+            Instant::now() + Duration::from_secs(120)
+        },
+        addresses,
+        manual_host: None,
     }));
     let hub = UiHub::default();
     let handle_modeld = modeld.clone();
@@ -416,17 +489,10 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     )));
     let pairing_limiter = Arc::new(std::sync::Mutex::new(PairingLimiter::default()));
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (advertised_host, address_updates) = watch::channel(server_pairing.host.clone());
+    let mdns_task = tokio::spawn(maintain_mdns(server_pairing.clone(), address_updates));
 
     let task = tokio::spawn(async move {
-        let advertised_pairing = server_pairing.clone();
-        let mdns = service_native_work(
-            "mdns_registration_started",
-            "mdns_registration_finished",
-            move || advertise_mdns(&advertised_pairing),
-        )
-        .await
-        .ok()
-        .flatten();
         loop {
             let accepted = tokio::select! {
                 _ = &mut shutdown_rx => break,
@@ -479,14 +545,9 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
                 Err(error) => tracing::warn!("Remote accept failed: {}", error),
             }
         }
-        if let Some(mdns) = mdns {
-            let _ = service_native_work(
-                "mdns_shutdown_started",
-                "mdns_shutdown_finished",
-                move || mdns.stop(),
-            )
-            .await;
-        }
+        // The handle drops the address sender after signaling shutdown, so the
+        // advertiser unregisters its service independently of the accept loop.
+        let _ = mdns_task.await;
     });
 
     Ok(RemoteServerHandle {
@@ -494,9 +555,46 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
         credentials,
         modeld: handle_modeld,
         platform: handle_platform,
+        advertised_host,
         shutdown: Some(shutdown_tx),
         task: Some(task),
     })
+}
+
+async fn maintain_mdns(mut pairing: PairingInfo, mut updates: watch::Receiver<String>) {
+    let advertised_pairing = pairing.clone();
+    let mut registration = service_native_work(
+        "mdns_registration_started",
+        "mdns_registration_finished",
+        move || advertise_mdns(&advertised_pairing),
+    )
+    .await
+    .ok()
+    .flatten();
+    // Slow native mDNS calls must not delay accepting WebSocket connections.
+    while updates.changed().await.is_ok() {
+        pairing.host = updates.borrow_and_update().clone();
+        let next_pairing = pairing.clone();
+        let previous = registration.take();
+        registration =
+            service_native_work("mdns_update_started", "mdns_update_finished", move || {
+                if let Some(previous) = previous {
+                    previous.stop();
+                }
+                advertise_mdns(&next_pairing)
+            })
+            .await
+            .ok()
+            .flatten();
+    }
+    if let Some(registration) = registration {
+        let _ = service_native_work(
+            "mdns_shutdown_started",
+            "mdns_shutdown_finished",
+            move || registration.stop(),
+        )
+        .await;
+    }
 }
 
 async fn service_native_work<T: Send + 'static>(
@@ -2596,21 +2694,82 @@ fn record_pairing_failure(limiter: &Arc<std::sync::Mutex<PairingLimiter>>, addre
     }
 }
 
-fn local_addresses() -> Vec<String> {
+fn local_addresses() -> Result<Vec<PairingAddress>, String> {
     list_afinet_netifas()
-        .map(|interfaces| {
-            interfaces
-                .into_iter()
-                .filter_map(|(_, ip)| {
-                    if ip.is_ipv4() && !ip.is_loopback() {
-                        Some(ip.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        .map(rank_pairing_addresses)
+        .map_err(|error| format!("无法检测网络地址 / Network discovery failed: {error}"))
+}
+
+fn rank_pairing_addresses(interfaces: Vec<(String, IpAddr)>) -> Vec<PairingAddress> {
+    let mut addresses = interfaces
+        .into_iter()
+        .filter_map(|(interface, ip)| match ip {
+            IpAddr::V4(ip)
+                if !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast() =>
+            {
+                Some(PairingAddress { interface, ip })
+            }
+            _ => None,
         })
-        .unwrap_or_default()
+        .collect::<Vec<_>>();
+    // Private IPs alone do not identify LAN interfaces: VPNs also use them.
+    // Interface names are a heuristic, so retain other addresses for manual choice.
+    addresses.sort_by_key(|address| {
+        let name = address.interface.to_lowercase();
+        let virtual_interface = [
+            "utun",
+            "tun",
+            "tap",
+            "wg",
+            "tailscale",
+            "zerotier",
+            "zt",
+            "docker",
+            "veth",
+            "virbr",
+            "vmnet",
+            "vbox",
+            "bridge",
+            "br-",
+            "awdl",
+            "llw",
+            "p2p",
+            "ipsec",
+            "ppp",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+            || [
+                "vpn",
+                "virtual",
+                "vethernet",
+                "wireguard",
+                "clash",
+                "mihomo",
+                "虚拟",
+            ]
+            .iter()
+            .any(|part| name.contains(part));
+        let physical_interface = ["en", "eth", "wl", "wi-fi", "wifi", "以太网", "无线"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        let rank = if virtual_interface {
+            3
+        } else if address.ip.is_link_local() {
+            2
+        } else if physical_interface {
+            0
+        } else {
+            1
+        };
+        (rank, !address.ip.is_private(), name, address.ip.octets())
+    });
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|address| seen.insert(address.ip));
+    addresses
 }
 
 /// Render a QR code as an RGBA image suitable for Slint.
@@ -2667,6 +2826,9 @@ impl MdnsRegistration {
 }
 
 fn advertise_mdns(pairing: &PairingInfo) -> Option<MdnsRegistration> {
+    if pairing.host.is_empty() {
+        return None;
+    }
     let daemon = mdns_sd::ServiceDaemon::new().ok()?;
     let properties = [
         ("sid", pairing.session_id.as_str()),
@@ -2705,6 +2867,124 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn pairing_addresses(interfaces: &[(&str, &str)]) -> Vec<PairingAddress> {
+        rank_pairing_addresses(
+            interfaces
+                .iter()
+                .map(|(name, ip)| (name.to_string(), ip.parse().unwrap()))
+                .collect(),
+        )
+    }
+
+    fn network_credentials(addresses: Vec<PairingAddress>) -> PairingCredentials {
+        let mut credentials = PairingCredentials {
+            info: PairingInfo {
+                host: String::new(),
+                port: DEFAULT_REMOTE_PORT,
+                session_id: remote_crypto::session_id(),
+                code: "123456".into(),
+                name: "test-desktop".into(),
+            },
+            expires: Instant::now(),
+            addresses: Vec::new(),
+            manual_host: None,
+        };
+        credentials.replace_addresses(addresses);
+        credentials
+    }
+
+    #[test]
+    fn pairing_prefers_lan_interfaces_over_vpn_and_virtual_adapters() {
+        let interfaces = [
+            ("utun4", "10.8.0.2"),
+            ("Mihomo", "198.18.0.1"),
+            ("vEthernet (Default Switch)", "172.20.0.1"),
+            ("Wi-Fi", "192.168.1.42"),
+            ("en0", "192.168.2.42"),
+            ("wlp2s0", "192.168.3.42"),
+            ("eth0", "192.168.4.42"),
+        ];
+        let ranked = pairing_addresses(&interfaces);
+        assert!(ranked[..4].iter().all(|address| address.ip.is_private()));
+        assert!(ranked[..4].iter().all(|address| ![
+            "utun4",
+            "Mihomo",
+            "vEthernet (Default Switch)"
+        ]
+        .contains(&address.interface.as_str())));
+        let mut reversed = interfaces;
+        reversed.reverse();
+        assert_eq!(ranked, pairing_addresses(&reversed));
+        assert_eq!(
+            ranked.len(),
+            interfaces.len(),
+            "VPN addresses remain selectable"
+        );
+    }
+
+    #[test]
+    fn pairing_filters_unusable_addresses_and_deduplicates_by_ip() {
+        let addresses = pairing_addresses(&[
+            ("lo0", "127.0.0.1"),
+            ("en0", "0.0.0.0"),
+            ("en0", "224.0.0.1"),
+            ("en0", "255.255.255.255"),
+            ("en0", "fe80::1"),
+            ("utun4", "192.168.1.42"),
+            ("en0", "192.168.1.42"),
+            ("en1", "169.254.1.2"),
+        ]);
+        assert_eq!(addresses.len(), 2);
+        assert_eq!(addresses[0].interface, "en0");
+        assert_eq!(addresses[0].ip, Ipv4Addr::new(192, 168, 1, 42));
+        assert!(addresses[1].ip.is_link_local());
+    }
+
+    #[test]
+    fn refreshing_preserves_manual_address_then_falls_back_when_it_disappears() {
+        let addresses = pairing_addresses(&[("en0", "192.168.1.42"), ("utun4", "10.8.0.2")]);
+        let mut credentials = network_credentials(addresses.clone());
+        credentials.select_address(1).unwrap();
+        let before = credentials.info.clone();
+        // The existing mobile URI parser must still understand the changed QR.
+        let parsed = PairingInfo::from_uri(&credentials.info.uri()).unwrap();
+        assert_eq!(parsed.host, "10.8.0.2");
+        credentials.replace_addresses(addresses);
+        assert_eq!(credentials.info.host, "10.8.0.2");
+        assert_eq!(credentials.info.session_id, before.session_id);
+        assert!(credentials.expires > Instant::now());
+        credentials.replace_addresses(pairing_addresses(&[("en0", "192.168.2.42")]));
+        assert_eq!(credentials.info.host, "192.168.2.42");
+        assert_eq!(credentials.manual_host, None);
+    }
+
+    #[test]
+    fn refresh_recovers_after_network_loss_and_replaces_automatic_vpn_choice() {
+        let mut credentials = network_credentials(pairing_addresses(&[("utun4", "10.8.0.2")]));
+        credentials.replace_addresses(pairing_addresses(&[
+            ("utun4", "10.8.0.2"),
+            ("en0", "192.168.1.42"),
+        ]));
+        assert_eq!(credentials.info.host, "192.168.1.42");
+        credentials.replace_addresses(Vec::new());
+        assert!(credentials.info.host.is_empty());
+        assert!(credentials.addresses.is_empty());
+        assert!(credentials.expires <= Instant::now());
+        credentials.replace_addresses(pairing_addresses(&[("en0", "192.168.2.42")]));
+        assert_eq!(credentials.info.host, "192.168.2.42");
+        assert!(credentials.expires > Instant::now());
+    }
+
+    #[test]
+    fn invalid_address_selection_keeps_pairing_unchanged() {
+        let mut credentials = network_credentials(pairing_addresses(&[("en0", "192.168.1.42")]));
+        let before = credentials.info.uri();
+        assert!(credentials.select_address(-1).is_err());
+        assert!(credentials.select_address(1).is_err());
+        assert_eq!(credentials.info.uri(), before);
+        assert_eq!(credentials.manual_host, None);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn slow_network_discovery_keeps_runtime_responsive() {
@@ -3050,6 +3330,8 @@ mod tests {
             credentials: Arc::new(std::sync::Mutex::new(PairingCredentials {
                 info: pairing.clone(),
                 expires: Instant::now() + Duration::from_secs(120),
+                addresses: Vec::new(),
+                manual_host: None,
             })),
             hub: UiHub::default(),
             pairing,
@@ -3247,6 +3529,7 @@ mod tests {
                     credentials: credentials.clone(),
                     modeld: None,
                     platform: platform.clone(),
+                    advertised_host: watch::channel(String::new()).0,
                     shutdown: None,
                     task: None,
                 };

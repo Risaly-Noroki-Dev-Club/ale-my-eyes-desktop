@@ -178,8 +178,32 @@ fn qr(app: &AppWindow, server: &RemoteServerHandle) {
     };
     let code = credentials.info.code.clone();
     let uri = credentials.info.uri();
+    let host = credentials.info.host.clone();
+    let available = !credentials.addresses.is_empty();
+    let selected = credentials
+        .addresses
+        .iter()
+        .position(|address| address.ip.to_string() == host)
+        .map(|index| index as i32)
+        .unwrap_or(-1);
+    let addresses = credentials
+        .addresses
+        .iter()
+        .map(|address| format!("{} · {}", address.interface, address.ip).into())
+        .collect::<Vec<slint::SharedString>>();
     drop(credentials);
+    server.advertise_pairing_address(&host);
     let ui = app.global::<Ui>();
+    ui.set_pairing_addresses(ModelRc::new(VecModel::from(addresses)));
+    ui.set_selected_pairing_address(selected);
+    ui.set_pairing_available(available);
+    // Never leave the previous address's image visible while encoding its replacement.
+    ui.set_qr(slint::Image::default());
+    if !available {
+        ui.set_pairing_code("".into());
+        ui.set_pairing_uri("".into());
+        return;
+    }
     ui.set_pairing_code(code.into());
     ui.set_pairing_uri(uri.clone().into());
     let weak = app.as_weak();
@@ -361,22 +385,27 @@ pub(crate) fn setup_app_with_engine(
         let state = state.clone();
         ui.on_refresh(move || {
             let Some(app) = weak.upgrade() else { return };
-            if app.global::<Ui>().get_busy() {
+            if app.global::<Ui>().get_busy() || app.global::<Ui>().get_pairing_refreshing() {
                 return;
             }
             if let Some(server) = &state.borrow().server {
+                app.global::<Ui>().set_pairing_refreshing(true);
                 let credentials = server.credentials.clone();
                 let weak = app.as_weak();
                 let state = state.clone();
                 spawn(async move {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Ok(mut credentials) = credentials.lock() {
-                            credentials.info.code = crate::remote_crypto::pairing_code();
-                            credentials.expires = Instant::now() + Duration::from_secs(120);
-                        }
+                    let result = tokio::task::spawn_blocking(move || {
+                        remote_server::refresh_pairing_network(&credentials)
                     })
-                    .await;
+                    .await
+                    .unwrap_or_else(|_| Err("网络检测失败 / Network discovery failed".into()));
                     if let Some(app) = weak.upgrade() {
+                        app.global::<Ui>().set_pairing_refreshing(false);
+                        if let Err(error) = result {
+                            feedback(&app, &error, true);
+                            return;
+                        }
+                        feedback(&app, "", false);
                         if let Some(server) = &state.borrow().server {
                             qr(&app, server);
                         }
@@ -411,6 +440,29 @@ pub(crate) fn setup_app_with_engine(
                         app.global::<Ui>().set_busy(false);
                     }
                 });
+            }
+        });
+    }
+    {
+        let weak = app.as_weak();
+        let state = state.clone();
+        ui.on_select_pairing_address(move |index| {
+            let Some(app) = weak.upgrade() else { return };
+            if app.global::<Ui>().get_busy() || app.global::<Ui>().get_pairing_refreshing() {
+                return;
+            }
+            let state = state.borrow();
+            let Some(server) = &state.server else { return };
+            let result = match server.credentials.try_lock() {
+                Ok(mut credentials) => credentials.select_address(index),
+                Err(_) => Err("配对状态正忙，请重试 / Pairing state busy; try again".into()),
+            };
+            match result {
+                Ok(()) => {
+                    qr(&app, server);
+                    feedback(&app, "", false);
+                }
+                Err(error) => feedback(&app, &error, true),
             }
         });
     }
@@ -866,6 +918,12 @@ fn render_state(app: &AppWindow, state: &mut State) {
                 "Connected"
             } else {
                 "已连接"
+            }
+        } else if !ui.get_pairing_available() {
+            if en {
+                "No network address; connect and refresh"
+            } else {
+                "未检测到网络地址，请联网后刷新"
             }
         } else if remaining == 0 {
             if en {

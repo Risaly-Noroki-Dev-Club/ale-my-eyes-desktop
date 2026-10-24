@@ -55,6 +55,10 @@ export global Ui {
     in-out property <string> pairing-status: "";
     in-out property <string> pairing-code: "";
     in-out property <string> pairing-uri: "";
+    in-out property <[string]> pairing-addresses;
+    in-out property <int> selected-pairing-address: -1;
+    in-out property <bool> pairing-available: false;
+    in-out property <bool> pairing-refreshing: false;
     in-out property <image> qr;
     in-out property <int> remaining: 0;
     in-out property <string> device-name: "";
@@ -80,6 +84,7 @@ export global Ui {
     in-out property <string> build-date: "";
     callback navigate(string);
     callback refresh();
+    callback select-pairing-address(int);
     callback select-device(int);
     callback pause();
     callback disconnect();
