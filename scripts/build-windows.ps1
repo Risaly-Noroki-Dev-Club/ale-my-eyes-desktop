@@ -167,7 +167,7 @@ function Copy-BuildRuntimes([string]$BuildLog) {
         if (-not $line) { continue }
         $message = $line | ConvertFrom-Json
         if ($message.reason -ne 'build-script-executed' -or
-            $message.package_id -notmatch '(sherpa|ort-sys)') { continue }
+            $message.package_id -notmatch 'sherpa') { continue }
         foreach ($dll in Get-ChildItem -LiteralPath $message.out_dir -Recurse -File -Filter '*.dll') {
             $hash = Get-FileHashValue $dll.FullName
             $key = $dll.Name.ToLowerInvariant()

@@ -98,7 +98,6 @@ impl ExecutionControl {
 pub struct PlatformCapabilities {
     pub image_capture: bool,
     pub automation: bool,
-    pub local_microphone: bool,
 }
 
 /// Desktop 负责屏幕捕获和执行自动化操作。

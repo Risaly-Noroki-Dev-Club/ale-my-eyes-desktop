@@ -33,6 +33,18 @@ jobs:
       - run: ./scripts/test-source-package.sh
       - run: ./scripts/smoke-linux.sh
 
+  harness-evaluation:
+    name: Offline harness evaluation
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the CLI used by the evaluation matrix
+        run: cargo build -p ale-cli --locked
+      - name: Run the 24-case offline harness matrix
+        run: python3 scripts/evaluate-harness.py
+
   build-windows:
     name: Windows package and smoke test
     needs: check

@@ -3,6 +3,14 @@
 The desktop uses `ale-core/src/model_api.rs` for remote generation and
 `ale-modeld/src/scheduler.rs` for routing. `provider` is a settings preset;
 `wire_api` selects the actual HTTP protocol, including for custom endpoints.
+One `RemoteCloudApi` implements all four protocols; there is no per-provider
+API implementation and no `retry_count` setting.
+
+Known presets map to exactly one protocol: `openai` → `openai_chat_completions`,
+`anthropic` → `anthropic_messages`, `google` → `google_generate_content`.
+`custom` (or an unknown/empty provider) must set `wire_api` explicitly; a preset
+paired with a conflicting explicit protocol is rejected by configuration
+validation instead of being silently normalized.
 
 | `wire_api` | Path appended to the base URL | Authentication |
 | --- | --- | --- |
@@ -13,8 +21,10 @@ The desktop uses `ale-core/src/model_api.rs` for remote generation and
 
 Base URLs include the provider version prefix, such as OpenAI/Anthropic `/v1`
 or Gemini `/v1beta`. HTTPS is required except for loopback testing. Credentials,
-query parameters, and fragments do not belong in base URLs. Azure-specific
-deployment URLs and native non-OpenAI TTS adapters are outside this change.
+query parameters, and fragments do not belong in base URLs. Azure deployment
+URLs are not special-cased: use a custom endpoint with the explicit `wire_api`
+it speaks. The desktop no longer performs speech synthesis; the Android client
+owns speech output.
 
 ## Requests and Output
 
@@ -49,7 +59,8 @@ demonstrates handling of that sample, not general task quality or reliability.
 has an independent base URL, key, model (default `whisper-1`), and timeout, using
 the OpenAI-compatible `/audio/transcriptions` multipart API. SenseVoice remains
 the scheduler's first attempt; authorized cloud transcription is its fallback.
-The CLI/legacy inference path also uses the independent transcription endpoint.
+The CLI `transcribe` command and the model scheduler also use the independent
+transcription endpoint when local SenseVoice is unavailable.
 
 For existing files without a `transcription` section, loading copies the legacy
 primary URL/key once, sets `whisper-1`, and enables transcription if a key exists.
@@ -103,4 +114,5 @@ SLINT_BACKEND=winit-software target/debug/examples/ui_preview --model-settings
 
 Screenshots are written under `target/ui-preview/`. These checks do not establish
 real-provider compatibility, Windows/Linux native acceptance, or real-task quality.
-The phone protocol is unchanged; the user's completed phone testing is preserved.
+Phone protocol changes (Misaka-Network v4) are validated in both independent
+core implementations; see the mobile `docs/REMOTE-PROTOCOL-V4.md`.

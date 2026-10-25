@@ -1,25 +1,12 @@
-use crate::actions::ActionPlan;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const REMOTE_PROTOCOL_VERSION: u32 = 3;
+pub const REMOTE_PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_REMOTE_PORT: u16 = 37654;
 pub const MAX_AUDIO_CHUNK_BYTES: usize = 24_576;
 pub const MAX_RECORDING_SECONDS: u64 = 60;
 pub const MIN_SAMPLE_RATE_HZ: u32 = 8_000;
 pub const MAX_SAMPLE_RATE_HZ: u32 = 96_000;
-
-pub mod error_code {
-    pub const PROTOCOL_INCOMPATIBLE: &str = "PROTOCOL_INCOMPATIBLE";
-    pub const REQUEST_TIMEOUT: &str = "REQUEST_TIMEOUT";
-    pub const CONFIRM_TIMEOUT: &str = "CONFIRM_TIMEOUT";
-    pub const AUDIO_TOO_LARGE: &str = "AUDIO_TOO_LARGE";
-    pub const INVALID_AUDIO_SEQUENCE: &str = "INVALID_AUDIO_SEQUENCE";
-    pub const AUDIO_HASH_MISMATCH: &str = "AUDIO_HASH_MISMATCH";
-    pub const CANCELLED: &str = "CANCELLED";
-    pub const CONNECTION_INTERRUPTED: &str = "CONNECTION_INTERRUPTED";
-    pub const PROTOCOL_VIOLATION: &str = "PROTOCOL_VIOLATION";
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -110,6 +97,12 @@ pub struct CommandPreview {
     pub confirmation_text: String,
     pub requires_confirmation: bool,
     pub has_plan: bool,
+    /// `legacy` or `verified`; absent on older senders.
+    #[serde(default)]
+    pub task_mode: Option<String>,
+    /// Human-readable postconditions for the mobile confirmation card.
+    #[serde(default)]
+    pub verification: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +123,9 @@ pub enum ProgressStage {
     AwaitingDecision,
     Executing,
     Verifying,
+    VerifiedStep,
+    VerifiedVerify,
+    VerifiedRecover,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +193,8 @@ pub enum ExecutionState {
     Completed,
     Failed,
     Cancelled,
+    OutcomeUnknown,
+    NeedsUser,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,7 +226,7 @@ pub struct PairingInfo {
 impl PairingInfo {
     pub fn uri(&self) -> String {
         format!(
-            "ale-my-eyes://pair?host={}&port={}&sid={}&code={}&name={}",
+            "misaka-network://pair?host={}&port={}&sid={}&code={}&name={}",
             urlencoding::encode(&self.host),
             self.port,
             urlencoding::encode(&self.session_id),
@@ -246,12 +244,12 @@ impl PairingInfo {
 
     pub fn from_uri(uri: &str) -> Result<Self, String> {
         let parsed = url::Url::parse(uri).map_err(|error| error.to_string())?;
-        if parsed.scheme() != "ale-my-eyes"
+        if parsed.scheme() != "misaka-network"
             || parsed.host_str() != Some("pair")
             || !parsed.path().is_empty()
             || parsed.fragment().is_some()
         {
-            return Err("不是 Ale, My Eyes! 配对链接".to_string());
+            return Err("不是 Misaka-Network 配对链接".to_string());
         }
 
         let mut host = None;
@@ -309,12 +307,6 @@ impl PairingInfo {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingRemotePlan {
-    pub request_id: String,
-    pub plan: ActionPlan,
-}
-
 pub fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -339,14 +331,23 @@ mod tests {
     #[test]
     fn pairing_uri_rejects_missing_or_weak_credentials() {
         assert!(PairingInfo::from_uri(
-            "ale-my-eyes://pair?host=192.168.1.2&port=37654&code=123456"
+            "misaka-network://pair?host=192.168.1.2&port=37654&code=123456"
         )
         .is_err());
         assert!(PairingInfo::from_uri(&format!(
-            "ale-my-eyes://pair?host=192.168.1.2&port=37654&sid={}&code=12345x",
+            "misaka-network://pair?host=192.168.1.2&port=37654&sid={}&code=12345x",
             Uuid::new_v4()
         ))
         .is_err());
+    }
+
+    #[test]
+    fn pairing_uri_rejects_legacy_scheme() {
+        let legacy = format!(
+            "ale-my-eyes://pair?host=192.168.1.2&port=37654&sid={}&code=123456",
+            Uuid::new_v4()
+        );
+        assert!(PairingInfo::from_uri(&legacy).is_err());
     }
 
     #[test]
@@ -362,14 +363,46 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v3_matches_golden_fixture() {
+    fn execution_states_serialize_new_v4_values() {
+        assert_eq!(
+            serde_json::to_string(&ExecutionState::OutcomeUnknown).unwrap(),
+            "\"outcome_unknown\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionState::NeedsUser).unwrap(),
+            "\"needs_user\""
+        );
+    }
+
+    #[test]
+    fn command_preview_accepts_legacy_and_v4_payloads() {
+        let legacy: CommandPreview = serde_json::from_str(
+            r#"{"request_id":"r","response_text":"x","action_steps":[],"confirmation_text":"c","requires_confirmation":false,"has_plan":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.task_mode, None);
+        assert_eq!(legacy.verification, None);
+
+        let verified: CommandPreview = serde_json::from_str(
+            r#"{"request_id":"r","response_text":"x","action_steps":["a"],"confirmation_text":"c","requires_confirmation":true,"has_plan":true,"task_mode":"verified","verification":["button is enabled"]}"#,
+        )
+        .unwrap();
+        assert_eq!(verified.task_mode.as_deref(), Some("verified"));
+        assert_eq!(
+            verified.verification.unwrap(),
+            vec!["button is enabled".to_string()]
+        );
+    }
+
+    #[test]
+    fn misaka_v4_matches_golden_fixture() {
         let messages = vec![
             RemoteMessage::ClientHello(ClientHello {
-                protocol_version: 3,
+                protocol_version: 4,
                 device_name: "Android".into(),
             }),
             RemoteMessage::ServerHello(ServerHello {
-                protocol_version: 3,
+                protocol_version: 4,
                 device_name: "Desktop".into(),
                 session_id: "session".into(),
             }),
@@ -406,6 +439,8 @@ mod tests {
                 confirmation_text: String::new(),
                 requires_confirmation: false,
                 has_plan: false,
+                task_mode: Some("legacy".into()),
+                verification: None,
             }),
             RemoteMessage::ProgressUpdate(ProgressUpdate {
                 request_id: "audio".into(),
@@ -451,7 +486,7 @@ mod tests {
             }),
         ];
         let expected: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/remote-v3.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/remote-v4.json")).unwrap();
         assert_eq!(serde_json::to_value(messages).unwrap(), expected);
     }
 }

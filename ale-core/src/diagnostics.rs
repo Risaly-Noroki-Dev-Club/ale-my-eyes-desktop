@@ -79,7 +79,7 @@ fn open_event_file(path: &Path) -> io::Result<ActiveLogFile> {
 }
 
 pub fn build_info() -> Value {
-    json!({"id":env!("ALE_BUILD_ID"),"target":env!("ALE_BUILD_TARGET"),"profile":env!("ALE_BUILD_PROFILE"),"cloud":cfg!(feature="cloud"),"local_inference":cfg!(feature="local-inference")})
+    json!({"id":env!("ALE_BUILD_ID"),"target":env!("ALE_BUILD_TARGET"),"profile":env!("ALE_BUILD_PROFILE")})
 }
 pub fn thread_id() -> u64 {
     #[cfg(windows)]

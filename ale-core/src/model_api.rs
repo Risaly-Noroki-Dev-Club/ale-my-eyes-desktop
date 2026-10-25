@@ -30,6 +30,16 @@ impl WireApi {
         Self::AnthropicMessages,
         Self::GoogleGenerateContent,
     ];
+
+    /// 稳定的 snake_case 标识，与序列化格式一致。
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::OpenaiChatCompletions => "openai_chat_completions",
+            Self::OpenaiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::GoogleGenerateContent => "google_generate_content",
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {

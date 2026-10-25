@@ -2,7 +2,7 @@ use ale_core::remote::RemoteMessage;
 use snow::{Builder, TransportState};
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
-const CHUNK_MAGIC: &[u8; 4] = b"AME2";
+const CHUNK_MAGIC: &[u8; 4] = b"MSKN";
 const CHUNK_HEADER_LEN: usize = 20;
 const MAX_NOISE_PLAINTEXT: usize = 48 * 1024;
 pub(crate) const MAX_ENCRYPTED_FRAME_BYTES: usize = MAX_NOISE_PLAINTEXT + 16;
@@ -164,7 +164,7 @@ pub fn device_name() -> String {
 fn psk_from_code(code: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"ale-my-eyes-remote-v1");
+    hasher.update(b"misaka-network-remote-v4");
     hasher.update(code.as_bytes());
     hasher.finalize().into()
 }
@@ -372,6 +372,8 @@ mod tests {
                     confirmation_text: "confirm".to_string(),
                     requires_confirmation: true,
                     has_plan: true,
+                    task_mode: None,
+                    verification: None,
                 }))
                 .unwrap()
             {
@@ -468,5 +470,19 @@ mod tests {
         };
         assert_eq!(status.state, ExecutionState::Completed);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn misaka_v4_wire_constants_are_pinned() {
+        assert_eq!(CHUNK_MAGIC, b"MSKN");
+        let psk = psk_from_code("123456");
+        assert_eq!(
+            psk,
+            [
+                0x10, 0xb8, 0x2c, 0x86, 0x6c, 0xdc, 0x0a, 0xa8, 0x54, 0x60, 0x13, 0x48, 0x3a, 0x93,
+                0xd7, 0x61, 0x7e, 0xa2, 0x9e, 0x82, 0xca, 0xc2, 0x3d, 0x41, 0xd0, 0xc5, 0x49, 0xd5,
+                0x13, 0xb1, 0xb2, 0xf6
+            ]
+        );
     }
 }

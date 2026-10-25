@@ -1,4 +1,4 @@
-use crate::cloud::{CloudApiFactory, CloudConfig};
+use crate::cloud::{CloudApi as _, CloudConfig, RemoteCloudApi};
 use crate::model_api::{self, ErrorKind, ModelCallError, ModelRequest};
 use crate::Result;
 use serde_json::json;
@@ -38,7 +38,7 @@ pub fn fixture_image() -> Vec<u8> {
     bytes.into_inner()
 }
 pub async fn run(config: &CloudConfig, probe: Probe) -> Result<()> {
-    let api = CloudApiFactory::create(config.clone());
+    let api = RemoteCloudApi::new(config.clone());
     let deadline =
         tokio::time::Instant::now() + config.timeout.min(std::time::Duration::from_secs(80));
     let expected = if matches!(probe, Probe::Image | Probe::ImageTool) {
@@ -142,31 +142,5 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn legacy_engine_transcription_uses_independent_credentials_without_primary() {
-        let (api_url, captured) = mock_http("200 OK", json!({"text":"independent"}), "").await;
-        let mut engine = crate::inference::AdaptiveInference::new(Default::default());
-        engine.configure_transcription(&crate::config::TranscriptionConfig {
-            enabled: true,
-            endpoint: crate::config::CloudApiConfig {
-                api_url,
-                api_key: "asr-only-key".into(),
-                model: "custom-transcriber".into(),
-                ..Default::default()
-            },
-        });
-        assert_eq!(
-            engine
-                .transcribe(include_bytes!("../assets/model-probe.wav"))
-                .await
-                .unwrap()
-                .data,
-            "independent"
-        );
-        let request = captured.await.unwrap();
-        assert!(request.contains("Bearer asr-only-key"));
-        assert!(request.contains("custom-transcriber"));
     }
 }

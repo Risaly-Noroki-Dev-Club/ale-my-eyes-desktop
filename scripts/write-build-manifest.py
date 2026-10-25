@@ -43,7 +43,7 @@ def copy_runtimes(log, package):
         message = json.loads(line)
         if message.get('reason') != 'build-script-executed':
             continue
-        if not any(name in message.get('package_id', '') for name in ('sherpa', 'ort-sys')):
+        if not any(name in message.get('package_id', '') for name in ('sherpa',)):
             continue
         for path in pathlib.Path(message['out_dir']).rglob('*.dll'):
             fingerprint = digest(path)

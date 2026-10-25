@@ -23,21 +23,6 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
-    /// 语音合成
-    Synthesize {
-        /// 要合成的文本
-        #[arg(short, long)]
-        text: String,
-
-        /// 输出音频文件路径
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// 语音，目前云端默认使用 alloy
-        #[arg(long)]
-        voice: Option<String>,
-    },
-
     /// 图像描述
     Describe {
         /// 图像文件路径
@@ -54,6 +39,16 @@ enum Commands {
 
     /// 显示状态
     Status,
+
+    /// 在模拟桌面运行任务闭环，输出 JSON 证据；不操作真实桌面或调用云端
+    HarnessDemo {
+        #[arg(long, default_value = "zoom")]
+        task: String,
+        #[arg(long, default_value = "normal")]
+        scenario: String,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -63,21 +58,25 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::HarnessDemo {
+            task,
+            scenario,
+            output,
+        } => {
+            let scenario = scenario.parse().map_err(anyhow::Error::msg)?;
+            let report = ale_core::harness::simulation::demo(&task, scenario)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            write_or_print(output, &serde_json::to_string_pretty(&report)?).await?;
+            if report.status != ale_core::harness::Status::Completed {
+                std::process::exit(2);
+            }
+        }
         Commands::Transcribe { audio, output } => {
             let engine = AleEngineFactory::create_default().await?;
             let audio_data = tokio::fs::read(&audio).await?;
             let text = engine.transcribe(&audio_data).await?;
             write_or_print(output, &text).await?;
-        }
-        Commands::Synthesize {
-            text,
-            output,
-            voice: _,
-        } => {
-            let engine = AleEngineFactory::create_default().await?;
-            let audio = engine.synthesize(&text).await?;
-            tokio::fs::write(&output, audio).await?;
-            println!("Audio written to {}", output.display());
         }
         Commands::Describe { image, output } => {
             let engine = AleEngineFactory::create_default().await?;
@@ -109,9 +108,8 @@ async fn main() -> anyhow::Result<()> {
             let status = engine.status().await;
             let config = engine.config();
             println!("Ale, My Eyes! CLI");
-            println!("Version: 0.1.0");
+            println!("Version: {}", env!("CARGO_PKG_VERSION"));
             println!("Cloud ready: {}", status.cloud_ready);
-            println!("TTS ready: {}", status.tts_ready);
             println!("API URL: {}", config.cloud_api.api_url);
             println!("Model: {}", config.cloud_api.model);
             println!("Language: {}", config.ui.language);

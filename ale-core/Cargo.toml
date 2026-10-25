@@ -2,51 +2,35 @@
 name = "ale-core"
 version = "0.1.0"
 edition = "2021"
-description = "Core functionality for Ale, My Eyes! - VLM, ASR, TTS integration"
+description = "Core functionality for Ale, My Eyes! - config, cloud model calls, scheduling and task harness"
 license = "MIT"
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
-tts = { version = "0.25", optional = true }
-ort = { version = "2.0.0-rc.12", features = ["load-dynamic"], optional = true }
 image = "0.25"
-whisper-rs = { version = "0.16", optional = true }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "1"
 tracing = "0.1"
-bytes = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-walkdir = "2"
-log = "0.4"
 async-trait = "0.1"
 prost = { workspace = true }
 sha2 = "0.10"
 tar = "0.4"
 bzip2 = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
-tokio-stream = "0.1"
 futures = "0.3"
-serde_urlencoded = "0.7"
 url = "2"
 dirs = "5"
 urlencoding = "2"
 keyring = "4.1"
 jsonschema = { version = "0.33", default-features = false }
-
-[features]
-default = ["cloud"]
-tts = ["dep:tts"]
-cloud = []
-local-inference = ["tts", "dep:ort", "dep:whisper-rs"]
-cloud-inference = ["cloud"]
-adaptive = ["local-inference", "cloud-inference"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

@@ -49,7 +49,7 @@ fn apply(app: &AppWindow, config: &AppConfig) {
         };
         ui.set_download_directory(directory.to_string_lossy().into_owned().into());
     }
-    ui.set_wire_api(protocol_index(config.cloud_api.wire_api));
+    ui.set_wire_api(protocol_index(config.cloud_api.effective_wire_api()));
     let backup = config.remote_routing.backup.clone().unwrap_or_default();
     ui.set_backup_enabled(config.remote_routing.backup_enabled);
     ui.set_backup_authorized(config.remote_routing.backup_pre_authorized);
@@ -69,6 +69,7 @@ fn apply(app: &AppWindow, config: &AppConfig) {
     ui.set_model(config.cloud_api.model.clone().into());
     ui.set_timeout(config.cloud_api.timeout.to_string().into());
     ui.set_max_tokens(config.cloud_api.max_tokens.to_string().into());
+    ui.set_verified_tasks(config.verified_tasks.enabled);
     ui.set_auto_speak(config.ui.auto_speak);
     ui.set_english(config.ui.language == "en");
     ui.set_high_contrast(config.ui.high_contrast);
@@ -89,7 +90,7 @@ fn positive(value: &str, label: &str) -> Result<u32, String> {
 fn draft(app: &AppWindow, base: &AppConfig) -> Result<AppConfig, String> {
     let ui = app.global::<Ui>();
     let mut config = base.clone();
-    config.cloud_api.wire_api = protocol(ui.get_wire_api());
+    config.verified_tasks.enabled = ui.get_verified_tasks();
     config.remote_routing.backup_enabled = ui.get_backup_enabled();
     config.remote_routing.backup_pre_authorized = ui.get_backup_authorized();
     if ui.get_backup_enabled() {
@@ -125,6 +126,13 @@ fn draft(app: &AppWindow, base: &AppConfig) -> Result<AppConfig, String> {
             .map_err(|e| e.to_string())?;
     }
     config.cloud_api.provider = ui.get_provider().trim().to_string();
+    // Known provider presets own their transport protocol; only `custom` uses
+    // the explicitly selected protocol. This cannot conflict in validation.
+    config.cloud_api.wire_api =
+        match ale_core::config::CloudApiConfig::preset_wire_api(&config.cloud_api.provider) {
+            Some(wire_api) => wire_api,
+            None => protocol(ui.get_wire_api()),
+        };
     config.cloud_api.api_key = ui.get_api_key().to_string();
     config.cloud_api.api_url = ui.get_api_url().trim().trim_end_matches('/').to_string();
     config.cloud_api.model = ui.get_model().trim().to_string();
@@ -254,16 +262,12 @@ pub(crate) fn setup_app_with_engine(
             }) {
                 Ok(engine) => {
                     let config = engine.config().clone();
-                    let memory_available = engine.memory_available();
                     let engine = Arc::new(Mutex::new(engine));
                     if let Some(app) = weak.upgrade() {
                         apply(&app, &config);
                         state.borrow_mut().saved = config;
                         state.borrow_mut().engine = Some(engine.clone());
                         app.global::<Ui>().set_ready(true);
-                        if !memory_available {
-                            feedback(&app, "记忆文件无法加载，已保留原文件；其他功能仍可使用。 / Memory unavailable; original file preserved.", true);
-                        }
                     } else {
                         return;
                     }
@@ -1164,6 +1168,9 @@ mod tests {
         let base = AppConfig::default();
         apply(&app, &base);
         let ui = app.global::<Ui>();
+        // Only `custom` keeps an explicitly selected protocol; known presets
+        // always map to their fixed wire API.
+        ui.set_provider("custom".into());
         ui.set_wire_api(1);
         ui.set_backup_enabled(true);
         ui.set_backup_wire_api(2);
@@ -1182,6 +1189,14 @@ mod tests {
             config.cloud_api.wire_api,
             ale_core::model_api::WireApi::OpenaiResponses
         );
+        // A preset provider wins over a stale protocol index from the UI.
+        ui.set_provider("openai".into());
+        let preset = draft(&app, &base).unwrap();
+        assert_eq!(
+            preset.cloud_api.wire_api,
+            ale_core::model_api::WireApi::OpenaiChatCompletions
+        );
+        ui.set_provider("custom".into());
         assert_eq!(
             config.remote_routing.backup.as_ref().unwrap().wire_api,
             ale_core::model_api::WireApi::AnthropicMessages

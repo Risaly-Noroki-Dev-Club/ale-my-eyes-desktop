@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::AleError;
 use crate::Result;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -7,41 +5,30 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// 云端API提供商
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CloudProvider {
-    OpenAI,
-    Anthropic,
-    Google,
-    Azure,
-    Custom(String),
-}
-
-/// 云端API配置
+/// 云端模型配置。
+///
+/// `wire_api` 是唯一决定传输协议真值的字段；`config::CloudApiConfig::provider`
+/// 只是 UI 预设名，经 `effective_wire_api()` 映射到这里的传输协议。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
     #[serde(default)]
     pub wire_api: crate::model_api::WireApi,
-    pub provider: CloudProvider,
     pub api_key: String,
     pub api_url: String,
     pub model: String,
     pub max_tokens: usize,
     pub timeout: Duration,
-    pub retry_count: u32,
 }
 
 impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             wire_api: Default::default(),
-            provider: CloudProvider::OpenAI,
             api_key: String::new(),
             api_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
             max_tokens: 1024,
             timeout: Duration::from_secs(30),
-            retry_count: 3,
         }
     }
 }
@@ -52,7 +39,6 @@ pub struct CloudResponse {
     pub content: String,
     pub tokens_used: usize,
     pub model: String,
-    pub provider: CloudProvider,
 }
 
 /// 云端API trait
@@ -78,9 +64,6 @@ pub trait CloudApi: Send + Sync {
 
     /// 语音识别
     async fn transcribe(&self, audio_data: &[u8]) -> Result<CloudResponse>;
-
-    /// 语音合成
-    async fn synthesize(&self, text: &str) -> Result<Vec<u8>>;
 
     /// 检查连接状态
     async fn health_check(&self) -> Result<bool>;
@@ -118,13 +101,13 @@ pub struct CloudMessage {
     pub content: String,
 }
 
-/// OpenAI API 实现
-pub struct OpenAIApi {
+/// 云端模型统一实现：同一个实现支持 `WireApi` 的全部 4 种传输协议。
+pub struct RemoteCloudApi {
     config: CloudConfig,
     client: reqwest::Client,
 }
 
-impl OpenAIApi {
+impl RemoteCloudApi {
     pub fn new(config: CloudConfig) -> Self {
         let client = crate::model_api::client(&config);
         Self { config, client }
@@ -136,7 +119,13 @@ impl OpenAIApi {
             .as_str()
             .filter(|content| !content.trim().is_empty())
             .map(str::to_string)
-            .ok_or_else(|| AleError::CloudApiError("Missing chat response content".to_string()))
+            .ok_or_else(|| {
+                crate::model_api::ModelCallError::new(
+                    crate::model_api::ErrorKind::InvalidOutput,
+                    "Missing chat response content",
+                )
+                .into()
+            })
     }
 
     fn transcription_text(response_body: &serde_json::Value) -> Result<String> {
@@ -181,7 +170,7 @@ impl OpenAIApi {
 }
 
 #[async_trait]
-impl CloudApi for OpenAIApi {
+impl CloudApi for RemoteCloudApi {
     async fn generate(
         &self,
         request: crate::model_api::ModelRequest,
@@ -199,7 +188,6 @@ impl CloudApi for OpenAIApi {
             content: response.content,
             tokens_used: response.tokens_used,
             model: response.model,
-            provider: self.config.provider.clone(),
         })
     }
     async fn vision(&self, image_data: &[u8], prompt: &str) -> Result<CloudResponse> {
@@ -208,7 +196,6 @@ impl CloudApi for OpenAIApi {
             content: response.content,
             tokens_used: response.tokens_used,
             model: response.model,
-            provider: self.config.provider.clone(),
         })
     }
     async fn vision_ask(
@@ -273,51 +260,13 @@ impl CloudApi for OpenAIApi {
             content: Self::transcription_text(&body)?,
             tokens_used: 0,
             model: model.into(),
-            provider: self.config.provider.clone(),
         })
-    }
-    async fn synthesize(&self, text: &str) -> Result<Vec<u8>> {
-        if !matches!(
-            self.config.wire_api,
-            crate::model_api::WireApi::OpenaiChatCompletions
-                | crate::model_api::WireApi::OpenaiResponses
-        ) {
-            return Err(crate::model_api::ModelCallError::new(
-                crate::model_api::ErrorKind::Unsupported,
-                "Speech synthesis requires an OpenAI-compatible endpoint",
-            )
-            .into());
-        }
-        let response = self.client.post(format!("{}/audio/speech",self.config.api_url.trim_end_matches('/')))
-            .bearer_auth(&self.config.api_key).json(&serde_json::json!({"model":"tts-1","input":text,"voice":"alloy","response_format":"wav"}))
-            .send().await.map_err(crate::model_api::network_error)?;
-        Ok(crate::model_api::checked(response)
-            .await?
-            .bytes()
-            .await
-            .map_err(crate::model_api::network_error)?
-            .to_vec())
     }
     async fn health_check(&self) -> Result<bool> {
         let response = self
             .generate(crate::model_api::ModelRequest::text("Reply with OK."))
             .await?;
         Ok(!response.content.trim().is_empty())
-    }
-}
-
-/// 云端API工厂
-pub struct CloudApiFactory;
-
-impl CloudApiFactory {
-    pub fn create(config: CloudConfig) -> Box<dyn CloudApi> {
-        match config.provider {
-            CloudProvider::OpenAI => Box::new(OpenAIApi::new(config)),
-            _ => {
-                // 其他提供商的实现
-                Box::new(OpenAIApi::new(config))
-            }
-        }
     }
 }
 
@@ -347,12 +296,11 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn mock_api(api_url: String, timeout: Duration) -> OpenAIApi {
-        OpenAIApi::new(CloudConfig {
+    fn mock_api(api_url: String, timeout: Duration) -> RemoteCloudApi {
+        RemoteCloudApi::new(CloudConfig {
             api_key: "test".to_string(),
             api_url,
             timeout,
-            retry_count: 0,
             ..Default::default()
         })
     }
@@ -364,63 +312,39 @@ mod tests {
         assert_eq!(config.model, "gpt-4o");
         assert_eq!(config.max_tokens, 1024);
         assert_eq!(config.timeout, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn test_cloud_provider_serialization() {
-        let provider = CloudProvider::OpenAI;
-        let json = serde_json::to_string(&provider).unwrap();
-        let restored: CloudProvider = serde_json::from_str(&json).unwrap();
-        assert!(matches!(restored, CloudProvider::OpenAI));
-    }
-
-    #[test]
-    fn test_cloud_api_factory_creates_openai() {
-        let config = CloudConfig {
-            provider: CloudProvider::OpenAI,
-            api_key: "test".to_string(),
-            ..Default::default()
-        };
-        let _api = CloudApiFactory::create(config);
-    }
-
-    #[test]
-    fn test_cloud_api_factory_custom_provider() {
-        let config = CloudConfig {
-            provider: CloudProvider::Custom("test".to_string()),
-            api_key: "test".to_string(),
-            ..Default::default()
-        };
-        let _api = CloudApiFactory::create(config);
+        assert_eq!(
+            config.wire_api,
+            crate::model_api::WireApi::OpenaiChatCompletions
+        );
     }
 
     #[test]
     fn test_chat_content_rejects_missing_content() {
         let response = serde_json::json!({"choices": [{"message": {}}]});
-        assert!(OpenAIApi::chat_content(&response).is_err());
+        assert!(RemoteCloudApi::chat_content(&response).is_err());
     }
 
     #[test]
     fn test_chat_content_rejects_empty_content() {
         let response = serde_json::json!({"choices": [{"message": {"content": "  "}}]});
-        assert!(OpenAIApi::chat_content(&response).is_err());
+        assert!(RemoteCloudApi::chat_content(&response).is_err());
     }
 
     #[test]
     fn test_chat_content_accepts_content() {
         let response = serde_json::json!({"choices": [{"message": {"content": "hello"}}]});
-        assert_eq!(OpenAIApi::chat_content(&response).unwrap(), "hello");
+        assert_eq!(RemoteCloudApi::chat_content(&response).unwrap(), "hello");
     }
 
     #[test]
     fn test_transcription_text_rejects_missing_text() {
         let response = serde_json::json!({});
-        assert!(OpenAIApi::transcription_text(&response).is_err());
+        assert!(RemoteCloudApi::transcription_text(&response).is_err());
     }
 
     #[test]
     fn vision_description_uses_configured_model() {
-        let api = OpenAIApi::new(CloudConfig {
+        let api = RemoteCloudApi::new(CloudConfig {
             model: "custom-vision-model".to_string(),
             ..Default::default()
         });

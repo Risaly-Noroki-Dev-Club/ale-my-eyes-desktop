@@ -40,6 +40,15 @@ export component SettingsPage inherits Rectangle {
                     Panel {
                         VerticalLayout {
                             alignment: start;
+                            padding: 24px; spacing: 16px;
+                            SectionTitle { text: Ui.tr("自动化", "Automation"); padding: 0px; }
+                            Switch { text: Ui.tr("已验证任务（实验）", "Verified tasks (experimental)"); checked <=> Ui.verified-tasks; enabled: !Ui.saving && !Ui.busy && !Ui.leave-prompt && !Ui.test-prompt; toggled => { Ui.edited(); } }
+                            Text { text: Ui.tr("Windows 无障碍接口可用时启用逐步验证：每一步执行后读取界面属性核对，无法确认时交还人工。其它平台自动使用原有路径。", "When Windows accessibility is available, verify each step against observed properties and hand back when it cannot be confirmed. Other platforms keep the legacy path."); color: AppTheme.muted; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    Panel {
+                        VerticalLayout {
+                            alignment: start;
                             padding: 24px; spacing: 20px;
                             SectionTitle { text: Ui.tr("API 配置", "API configuration"); icon: @image-url("assets/language.svg"); padding: 0px; }
                             Field {
@@ -58,7 +67,8 @@ export component SettingsPage inherits Rectangle {
                             }
                             Field {
                                 label: Ui.tr("接口协议", "API protocol");
-                                ComboBox { accessible-label: Ui.tr("接口协议", "API protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.wire-api; enabled: !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                                ComboBox { accessible-label: Ui.tr("接口协议", "API protocol"); model: ["OpenAI Chat Completions", "OpenAI Responses", "Anthropic Messages", "Google Gemini"]; current-index <=> Ui.wire-api; enabled: Ui.provider == "custom" && !Ui.saving && !Ui.busy && !Ui.test-prompt && !Ui.leave-prompt; selected(value) => { Ui.edited(); } }
+                                Text { text: Ui.provider == "custom" ? Ui.tr("自定义服务商需要选择接口协议。", "A custom provider requires an explicit protocol.") : Ui.tr("已知服务商固定使用对应协议；切换到“其他”后可手动选择。", "Known providers use a fixed protocol; choose Other to select one."); color: AppTheme.muted; font-size: 12px; wrap: word-wrap; }
                             }
                             Field {
                                 label: "API Key";

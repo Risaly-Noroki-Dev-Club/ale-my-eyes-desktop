@@ -3,9 +3,6 @@ name = "ale-gui"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["rlib", "cdylib"]
-
 [dependencies]
 ale-core = { path = "../ale-core" }
 tokio = { version = "1", features = ["full"] }
@@ -25,8 +22,6 @@ tokio-tungstenite = "0.24"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 slint = "1.16"
-cpal = "0.15"
-rodio = "0.19"
 rfd = "0.15"
 xcap = "0.9"
 enigo = "0.6"

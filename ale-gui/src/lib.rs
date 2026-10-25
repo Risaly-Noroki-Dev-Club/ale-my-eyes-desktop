@@ -1,11 +1,9 @@
 mod acceptance;
-pub mod audio;
 mod audit;
 pub mod automation;
 mod conversation;
 mod desktop_ui;
 pub mod diagnostics;
-pub mod file_picker;
 mod model_download_ui;
 mod modeld;
 mod platform;
@@ -13,9 +11,12 @@ mod remote_crypto;
 mod remote_server;
 pub mod screen_capture;
 mod settings_service;
-pub mod tts_player;
 mod ui_state;
 mod ui_text;
+pub mod uia_environment;
+pub mod verified_authorizer;
+pub mod verified_planner;
+pub mod verified_task;
 
 slint::include_modules!();
 pub use acceptance::setup as setup_acceptance;

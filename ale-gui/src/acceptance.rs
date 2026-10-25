@@ -72,7 +72,6 @@ fn prepare_profile(profile: &Path) -> ale_core::Result<PathBuf> {
     let mut config = ale_core::config::AppConfig::default();
     config.models.models_dir = models.to_string_lossy().into_owned();
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)?;
-    ale_core::memory::MemoryStore::load_or_create(profile.join("memory.json"))?;
     Ok(config_path)
 }
 
@@ -300,7 +299,6 @@ mod tests {
             PathBuf::from(config.models.models_dir),
             profile.join("models")
         );
-        assert!(profile.join("memory.json").is_file());
         assert!(config.cloud_api.api_key.is_empty());
         std::fs::write(profile.join("keep.txt"), b"existing data").unwrap();
         assert!(prepare_profile(&profile).is_err());

@@ -4,7 +4,19 @@ use crate::modeld::SupervisedModeldClient;
 use crate::platform::{self, ExecutionControl, PlatformService};
 use crate::remote_crypto;
 use crate::ui_state::{Control, Session, SessionGuard, UiHub, OBSERVER};
-use ale_core::actions::{parse_action_plan_arguments, Action, ActionPlan};
+use crate::uia_environment::{self, UiaEnvironment};
+use crate::verified_authorizer::ConfirmedTaskAuthorizer;
+use crate::verified_planner::ScriptedPlanner;
+use crate::verified_task::{
+    self, build_preview, build_task, parse_verified_task_arguments, propose_verified_task_tool,
+    terminal_status, VerifiedProposal, VerifiedRisk,
+};
+use ale_core::actions::{parse_action_plan_arguments, Action, ActionPlan, RiskLevel};
+use ale_core::cloud::ToolCall;
+use ale_core::harness::{
+    self, ActionRequest, Approval, Authorizer, Decision, Environment, Observation, Planner,
+    PlannerContext, Receipt, Status as HarnessStatus, Task,
+};
 use ale_core::model_scheduler::{
     validate_semantic_plan, BoundingBox, GroundingJob, ModelCapability, SemanticPlan,
     StateVerificationJob, LOCAL_MEDIUM_RISK_THRESHOLD,
@@ -24,8 +36,10 @@ use local_ip_address::list_afinet_netifas;
 use qrcode::QrCode;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -341,11 +355,17 @@ struct RemoteExecution {
     request_id: String,
     control: ExecutionControl,
     task: JoinHandle<()>,
+    /// Present for verified runs: signals the runner's `watch` cancellation
+    /// before the task is aborted.
+    verified_cancel: Option<watch::Sender<bool>>,
 }
 
 impl Drop for RemoteExecution {
     fn drop(&mut self) {
         self.control.cancel();
+        if let Some(cancel) = self.verified_cancel.take() {
+            let _ = cancel.send(true);
+        }
         self.task.abort();
     }
 }
@@ -359,6 +379,8 @@ enum RemoteExecutionEventKind {
     Complete(RemoteExecutionOutcome),
     TimedOut,
     FinishedAfterTimeout,
+    /// Throttled progress from the verified runner.
+    Progress(ProgressStage, String),
 }
 
 enum RemoteExecutionOutcome {
@@ -372,12 +394,61 @@ enum ConfirmAction {
         request_id: String,
         plan: ActionPlan,
     },
+    ExecuteVerified {
+        request_id: String,
+        plan: Box<VerifiedPlan>,
+    },
 }
 
 enum ProcessingOutcome {
     Progress(ProgressStage, String),
-    Complete(CommandPreview, Option<ActionPlan>),
+    Complete(CommandPreview, Option<PreparedPlan>),
     Error { code: &'static str, message: String },
+}
+
+/// A plan awaiting user confirmation. Legacy plans are coordinate action plans;
+/// verified plans are host-built harness tasks with structured postconditions.
+enum PreparedPlan {
+    Legacy(ActionPlan),
+    Verified(Box<VerifiedPlan>),
+}
+
+/// Verified task awaiting confirmation; built from the first UIA observation.
+#[derive(Debug)]
+struct VerifiedPlan {
+    task: Task,
+    proposal: VerifiedProposal,
+}
+
+impl PreparedPlan {
+    fn risk_level(&self) -> Option<RiskLevel> {
+        match self {
+            Self::Legacy(plan) => Some(plan.risk_level),
+            Self::Verified(_) => None,
+        }
+    }
+
+    fn created_detail(&self) -> Option<String> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Verified(plan) => Some(format!(
+                "verified steps={} risk={}",
+                plan.proposal.steps.len(),
+                plan.proposal.risk.as_str()
+            )),
+        }
+    }
+
+    /// Audit metadata keeps only event/status/counts; control labels and values
+    /// are never written to the audit log.
+    fn audit(&self, event: &str, detail: Option<&str>) {
+        match self {
+            Self::Legacy(plan) => audit::record(event, "remote", plan, detail),
+            Self::Verified(plan) => {
+                audit::record(event, "remote", &verified_audit_plan(plan), detail)
+            }
+        }
+    }
 }
 
 impl Drop for RemoteServerHandle {
@@ -432,7 +503,6 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     tracing::debug!(
         capture = capabilities.image_capture,
         automation = capabilities.automation,
-        microphone = capabilities.local_microphone,
         automation_ready = platform.is_automation_ready(),
         "Desktop capabilities"
     );
@@ -805,6 +875,20 @@ async fn handle_connection(
                     .is_some_and(|request| request.request_id == result.request_id)
                 {
                     match result.kind {
+                        RemoteExecutionEventKind::Progress(stage, message) => {
+                            // Step explanations originate from model output.
+                            let message = sanitize_speech_text(&message);
+                            send_secure(
+                                &mut socket,
+                                &mut secure,
+                                &RemoteMessage::ProgressUpdate(ProgressUpdate {
+                                    request_id: result.request_id,
+                                    stage,
+                                    message,
+                                }),
+                            )
+                            .await?;
+                        }
                         RemoteExecutionEventKind::Complete(outcome) => {
                             execution.take();
                             publish_execution_outcome(
@@ -1258,7 +1342,7 @@ async fn handle_connection(
                     deferred.take();
                 }
                 if let Some(plan) = pending.take(&request_id, Instant::now()) {
-                    audit::record("cancelled", "remote", &plan, None);
+                    plan.audit("cancelled", None);
                 }
                 if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
                     if session
@@ -1320,6 +1404,23 @@ async fn handle_connection(
                                 plan,
                                 platform.clone(),
                                 modeld.clone(),
+                                execution_tx.clone(),
+                            ));
+                        }
+                        ConfirmAction::ExecuteVerified { request_id, plan } => {
+                            send_secure(
+                                &mut socket,
+                                &mut secure,
+                                &RemoteMessage::ProgressUpdate(ProgressUpdate {
+                                    request_id: request_id.clone(),
+                                    stage: ProgressStage::VerifiedStep,
+                                    message: "开始执行已验证任务".to_string(),
+                                }),
+                            )
+                            .await?;
+                            execution = Some(start_verified_execution(
+                                request_id,
+                                *plan,
                                 execution_tx.clone(),
                             ));
                         }
@@ -1663,13 +1764,17 @@ async fn publish_processing_result(
             .await
         }
         ProcessingOutcome::Complete(mut preview, plan) => {
-            let risk = plan.as_ref().map(|plan| match plan.risk_level {
-                ale_core::actions::RiskLevel::Low => "LowRiskPlan",
-                ale_core::actions::RiskLevel::Medium => "MediumRiskPlan",
-                ale_core::actions::RiskLevel::High => "HighRiskPlan",
-            });
+            let risk = plan
+                .as_ref()
+                .and_then(PreparedPlan::risk_level)
+                .map(|risk| match risk {
+                    RiskLevel::Low => "LowRiskPlan",
+                    RiskLevel::Medium => "MediumRiskPlan",
+                    RiskLevel::High => "HighRiskPlan",
+                });
             if let Some(plan) = plan {
-                audit::record("created", "remote", &plan, None);
+                let detail = plan.created_detail();
+                plan.audit("created", detail.as_deref());
                 if pending
                     .insert(result.request_id.clone(), plan, Instant::now())
                     .is_err()
@@ -1699,6 +1804,13 @@ async fn publish_processing_result(
                     sanitized
                 })
                 .collect();
+            if let Some(verification) = preview.verification.as_mut() {
+                for entry in verification.iter_mut() {
+                    let sanitized = sanitize_speech_text(entry);
+                    sensitive |= sanitized != *entry;
+                    *entry = sanitized;
+                }
+            }
             let speech_source = if preview.confirmation_text.is_empty() {
                 preview.response_text.clone()
             } else {
@@ -1772,7 +1884,7 @@ async fn handle_command(
     platform: Arc<dyn PlatformService>,
     request_id: &str,
     input: &CommandInput,
-) -> Result<(CommandPreview, Option<ActionPlan>), String> {
+) -> Result<(CommandPreview, Option<PreparedPlan>), String> {
     let payload = match input {
         CommandInput::Text { text } => RequestPayload::Text(text.clone()),
     };
@@ -1797,7 +1909,7 @@ async fn handle_request(
     request_id: &str,
     input: RequestPayload,
     inference: RequestInference<'_>,
-) -> Result<(CommandPreview, Option<ActionPlan>), String> {
+) -> Result<(CommandPreview, Option<PreparedPlan>), String> {
     let RequestInference {
         progress,
         modeld,
@@ -1805,6 +1917,32 @@ async fn handle_request(
         local: local_inference,
     } = inference;
     let request_id = request_id.to_string();
+    // Verified mode is opt-in per configuration and only available when the
+    // platform exposes UI Automation and this request may disclose the screen
+    // to the cloud. Everything else transparently uses the legacy path.
+    let verified_configured = if local_inference {
+        false
+    } else {
+        let engine = engine.lock().await;
+        engine.config().verified_tasks.enabled
+    };
+    let verified_available = verified_configured
+        && modeld.is_some()
+        && allow_full_screenshot
+        && uia_environment::uia_available();
+    // Stable diagnostic reasons: 2 = no UI Automation (non-Windows or runtime
+    // unavailable), 3 = cloud screen disclosure not authorized for this request,
+    // 9 = no cloud planning scheduler. Later stages add 4/5/6/7/8.
+    if verified_configured && !verified_available {
+        let reason = if !uia_environment::uia_available() {
+            2
+        } else if !allow_full_screenshot {
+            3
+        } else {
+            9
+        };
+        ale_core::diagnostics::record("verified_task_unavailable", &[("reason", reason)]);
+    }
     let question = match input {
         RequestPayload::Text(text) => text,
         RequestPayload::AudioWav(audio) => {
@@ -1957,25 +2095,71 @@ async fn handle_request(
                 confirmation_text,
                 requires_confirmation: executable_plan.is_some(),
                 has_plan: executable_plan.is_some(),
+                task_mode: None,
+                verification: None,
             },
-            executable_plan,
+            executable_plan.map(PreparedPlan::Legacy),
         ));
     }
     let mut response = if let Some(client) = modeld {
+        let mut tools = semantic_automation_tools();
+        let mut cloud_question = question.clone();
+        let mut verified_observation: Option<Observation> = None;
+        // Screenshot capture may have failed; the cloud request then carries no
+        // tools, so verified mode cannot be attempted either.
+        if verified_available && image.is_some() {
+            report_progress(
+                progress,
+                &request_id,
+                ProgressStage::CapturingState,
+                "正在读取界面结构",
+            );
+            match observe_verified_window().await {
+                Ok(observation) => {
+                    cloud_question = verified_question(&question, &observation);
+                    tools.push(propose_verified_task_tool());
+                    verified_observation = Some(observation);
+                }
+                Err(reason) => {
+                    ale_core::diagnostics::record(
+                        "verified_task_unavailable",
+                        &[("reason", reason)],
+                    );
+                }
+            }
+        }
         let prepared_question = {
             let engine = engine.lock().await;
-            engine.prepare_vision_question(&question)
+            engine.prepare_vision_question(&cloud_question)
         };
         let mut result = client
             .remote_plan(
                 &request_id,
                 prepared_question,
                 image.as_ref().map(|image| image.jpeg_data.as_slice()),
-                image.as_ref().map(|_| semantic_automation_tools()),
+                image.as_ref().map(|_| tools),
             )
             .await?;
         if let Some(notice) = result.failover_notice.take() {
             result.response.content = format!("{notice}。{}", result.response.content);
+        }
+        if let Some(observation) = verified_observation.as_ref() {
+            match parse_verified_plan(
+                result.response.tool_calls.as_deref(),
+                &question,
+                observation,
+                &request_id,
+            ) {
+                Ok((preview, plan)) => {
+                    return Ok((preview, Some(PreparedPlan::Verified(Box::new(plan)))));
+                }
+                Err(reason) => {
+                    ale_core::diagnostics::record(
+                        "verified_task_unavailable",
+                        &[("reason", reason)],
+                    );
+                }
+            }
         }
         result.response
     } else if let Some(ref image) = image {
@@ -1998,8 +2182,10 @@ async fn handle_request(
                 confirmation_text: String::new(),
                 requires_confirmation: false,
                 has_plan: false,
+                task_mode: None,
+                verification: None,
             },
-            None,
+            None::<PreparedPlan>,
         ));
     } else {
         unreachable!("modeld branch handled above")
@@ -2060,8 +2246,10 @@ async fn handle_request(
             confirmation_text,
             requires_confirmation,
             has_plan,
+            task_mode: None,
+            verification: None,
         },
-        plan,
+        plan.map(PreparedPlan::Legacy),
     ))
 }
 
@@ -2162,7 +2350,7 @@ fn semantic_automation_tools() -> Vec<serde_json::Value> {
 fn prepare_confirm(confirm: ConfirmExecution, pending: &mut PendingPlans) -> ConfirmAction {
     if !confirm.approved {
         if let Some(plan) = pending.take(&confirm.request_id, Instant::now()) {
-            audit::record("cancelled", "remote", &plan, None);
+            plan.audit("cancelled", None);
         }
         return ConfirmAction::Immediate(ExecutionStatus {
             request_id: confirm.request_id,
@@ -2181,10 +2369,27 @@ fn prepare_confirm(confirm: ConfirmExecution, pending: &mut PendingPlans) -> Con
         });
     };
 
-    audit::record("approved", "remote", &plan, None);
-    ConfirmAction::Execute {
-        request_id: confirm.request_id,
-        plan,
+    match plan {
+        PreparedPlan::Legacy(plan) => {
+            audit::record("approved", "remote", &plan, None);
+            ConfirmAction::Execute {
+                request_id: confirm.request_id,
+                plan,
+            }
+        }
+        PreparedPlan::Verified(plan) => {
+            let detail = format!("verified steps={}", plan.proposal.steps.len());
+            audit::record(
+                "approved",
+                "remote",
+                &verified_audit_plan(&plan),
+                Some(&detail),
+            );
+            ConfirmAction::ExecuteVerified {
+                request_id: confirm.request_id,
+                plan,
+            }
+        }
     }
 }
 
@@ -2307,6 +2512,7 @@ fn start_remote_execution(
         request_id,
         control,
         task,
+        verified_cancel: None,
     }
 }
 
@@ -2359,6 +2565,361 @@ async fn publish_execution_outcome(
             .await?;
             send_remote_error(socket, secure, Some(request_id), code, &message).await
         }
+    }
+}
+
+/// Deadline visible to the phone after it confirms a verified task. The harness
+/// owns its own budget, but the remote protocol promises a terminal status soon
+/// after confirmation; past this deadline the outcome is unknown because input
+/// may already have happened.
+const VERIFIED_TERMINAL_DEADLINE: Duration = Duration::from_secs(28);
+/// Minimum interval between verified runner progress messages.
+const VERIFIED_PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
+/// Upper bound on accessibility text added to one cloud planning request.
+const VERIFIED_QUESTION_BYTES: usize = 24 * 1024;
+const VERIFIED_QUESTION_NODES: usize = 200;
+
+/// Synthetic audit metadata for a verified plan: counts and risk only, never
+/// control labels or values.
+fn verified_audit_plan(plan: &VerifiedPlan) -> ActionPlan {
+    ActionPlan {
+        actions: Vec::new(),
+        risk_level: match plan.proposal.risk {
+            VerifiedRisk::Low => RiskLevel::Low,
+            VerifiedRisk::Medium => RiskLevel::Medium,
+            VerifiedRisk::High => RiskLevel::High,
+        },
+        explanation: "verified-task".to_string(),
+        requires_confirmation: true,
+    }
+}
+
+/// Structured foreground state for the cloud planner. Control labels/values are
+/// user-approved disclosure for this request; tree ids stay host-side.
+fn verified_question(question: &str, observation: &Observation) -> String {
+    let mut text = String::with_capacity(2048);
+    text.push_str(question.trim());
+    text.push_str(
+        "\n\n下面是宿主读取到的当前前台窗口无障碍结构，仅用于本次规划。用 role + label 精确指定控件；每步给出可从 UIA 属性读回的后置条件（property 只能是 value/enabled/toggle/selected）；只能使用 invoke 或 set_value；只调用 propose_verified_task。\n",
+    );
+    for node in observation.nodes.iter().take(VERIFIED_QUESTION_NODES) {
+        if text.len() > VERIFIED_QUESTION_BYTES {
+            text.push_str("- …（省略其余节点）\n");
+            break;
+        }
+        text.push_str("- role=");
+        text.push_str(&node.role);
+        text.push_str(" | label=");
+        text.push_str(&node.label.chars().take(120).collect::<String>());
+        text.push_str(" | enabled=");
+        text.push_str(if node.enabled { "true" } else { "false" });
+        if let Some(value) = node.properties.get("value") {
+            text.push_str(" | value=");
+            text.push_str(&value.chars().take(120).collect::<String>());
+        }
+        if let Some(toggle) = node.properties.get("toggle") {
+            text.push_str(" | toggle=");
+            text.push_str(toggle);
+        }
+        if let Some(selected) = node.properties.get("selected") {
+            text.push_str(" | selected=");
+            text.push_str(selected);
+        }
+        text.push('\n');
+    }
+    text
+}
+
+/// First observation used to bind the task to the foreground window. Error
+/// values are stable diagnostics reasons: 2 = no UI Automation bridge,
+/// 4 = the adapter failed to read the foreground window.
+async fn observe_verified_window() -> Result<Observation, u64> {
+    let Some(mut environment) = uia_environment::create_platform_environment() else {
+        return Err(2);
+    };
+    environment.observe_once().await.map_err(|_| 4)
+}
+
+/// Parse exactly one `propose_verified_task` call and rebuild the host task.
+/// Error values are stable diagnostics reasons, never model text: 5 = the model
+/// proposed no verified task, 6 = the proposal failed host validation,
+/// 7 = the task contract could not be built, 8 = more than one verified call.
+fn parse_verified_plan(
+    tool_calls: Option<&[ToolCall]>,
+    user_goal: &str,
+    observation: &Observation,
+    request_id: &str,
+) -> Result<(CommandPreview, VerifiedPlan), u64> {
+    let calls = tool_calls.unwrap_or(&[]);
+    let verified: Vec<&ToolCall> = calls
+        .iter()
+        .filter(|call| verified_task::is_verified_task_tool(&call.function.name))
+        .collect();
+    if verified.is_empty() {
+        return Err(5);
+    }
+    if verified.len() != 1 {
+        return Err(8);
+    }
+    let proposal =
+        parse_verified_task_arguments(&verified[0].function.arguments).map_err(|_| 6u64)?;
+    let task = build_task(&proposal, user_goal, &observation.window, true).map_err(|_| 7u64)?;
+    let preview = build_preview(&proposal).into_command_preview(request_id);
+    Ok((preview, VerifiedPlan { task, proposal }))
+}
+
+/// Progress sink with monotonic throttling for the verified runner.
+#[derive(Clone)]
+struct VerifiedProgress {
+    request_id: String,
+    results: mpsc::UnboundedSender<RemoteExecutionEvent>,
+    last: Arc<std::sync::Mutex<Instant>>,
+}
+
+impl VerifiedProgress {
+    fn new(request_id: &str, results: mpsc::UnboundedSender<RemoteExecutionEvent>) -> Self {
+        let now = Instant::now();
+        Self {
+            request_id: request_id.to_string(),
+            results,
+            last: Arc::new(std::sync::Mutex::new(
+                now.checked_sub(VERIFIED_PROGRESS_INTERVAL).unwrap_or(now),
+            )),
+        }
+    }
+
+    fn send(&self, stage: ProgressStage, message: String) {
+        let now = Instant::now();
+        {
+            let mut last = self
+                .last
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if now.saturating_duration_since(*last) < VERIFIED_PROGRESS_INTERVAL {
+                return;
+            }
+            *last = now;
+        }
+        let _ = self.results.send(RemoteExecutionEvent {
+            request_id: self.request_id.clone(),
+            kind: RemoteExecutionEventKind::Progress(stage, message),
+        });
+    }
+}
+
+struct ReportingPlanner {
+    inner: ScriptedPlanner,
+    progress: VerifiedProgress,
+}
+
+impl Planner for ReportingPlanner {
+    fn decide<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        context: PlannerContext<'life1>,
+    ) -> Pin<Box<dyn Future<Output = Result<Decision, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let decision = self.inner.decide(context).await?;
+            match &decision {
+                Decision::Act { step } => self.progress.send(
+                    ProgressStage::VerifiedStep,
+                    format!("正在执行：{}", step.explanation),
+                ),
+                Decision::NeedHelp { reason } => self.progress.send(
+                    ProgressStage::AwaitingDecision,
+                    format!("任务需要你确认：{reason}"),
+                ),
+                Decision::Finish => {}
+            }
+            Ok(decision)
+        })
+    }
+}
+
+struct ReportingAuthorizer {
+    inner: ConfirmedTaskAuthorizer,
+    progress: VerifiedProgress,
+}
+
+impl Authorizer for ReportingAuthorizer {
+    fn authorize<'life0, 'life1, 'life2, 'async_trait>(
+        &'life0 mut self,
+        task: &'life1 Task,
+        request: &'life2 ActionRequest,
+    ) -> Pin<Box<dyn Future<Output = Approval> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        'life2: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let approval = self.inner.authorize(task, request).await;
+            if matches!(approval, Approval::NeedsUser) {
+                self.progress.send(
+                    ProgressStage::AwaitingDecision,
+                    "这一步需要你确认".to_string(),
+                );
+            }
+            approval
+        })
+    }
+}
+
+struct ReportingEnvironment {
+    inner: UiaEnvironment,
+    progress: VerifiedProgress,
+}
+
+impl Environment for ReportingEnvironment {
+    fn observe<'life0, 'async_trait>(
+        &'life0 mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Observation, String>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            let result = self.inner.observe().await;
+            if result.is_ok() {
+                self.progress.send(
+                    ProgressStage::VerifiedVerify,
+                    "正在读取界面状态".to_string(),
+                );
+            }
+            result
+        })
+    }
+
+    fn execute<'life0, 'life1, 'async_trait>(
+        &'life0 mut self,
+        request: &'life1 ActionRequest,
+    ) -> Pin<Box<dyn Future<Output = Receipt> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        'life1: 'async_trait,
+        Self: 'async_trait,
+    {
+        Box::pin(async move {
+            self.progress.send(
+                ProgressStage::VerifiedStep,
+                format!("正在执行：{}", request.step.explanation),
+            );
+            let receipt = self.inner.execute(request).await;
+            let (stage, message) = match &receipt {
+                Receipt::Dispatched => (ProgressStage::VerifiedVerify, "操作已发出，正在验证结果"),
+                Receipt::NotApplied(_) => {
+                    (ProgressStage::VerifiedRecover, "操作未发出，正在重新观察")
+                }
+                Receipt::Uncertain(_) => {
+                    (ProgressStage::VerifiedVerify, "操作结果不确定，正在复核")
+                }
+            };
+            self.progress.send(stage, message.to_string());
+            receipt
+        })
+    }
+}
+
+/// Run one confirmed verified task in an independent task. Cancellation uses a
+/// `watch` channel; progress is throttled; the terminal report maps to the
+/// protocol states Completed/Failed/Cancelled/OutcomeUnknown/NeedsUser.
+fn start_verified_execution(
+    request_id: String,
+    plan: VerifiedPlan,
+    results: mpsc::UnboundedSender<RemoteExecutionEvent>,
+) -> RemoteExecution {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let task_request_id = request_id.clone();
+    let task = tokio::spawn(async move {
+        let Some(environment) = uia_environment::create_platform_environment() else {
+            let _ = results.send(RemoteExecutionEvent {
+                request_id: task_request_id.clone(),
+                kind: RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(
+                    ExecutionStatus {
+                        request_id: task_request_id,
+                        state: ExecutionState::Failed,
+                        message: "当前平台不可用，无法执行已验证任务".to_string(),
+                        actions_executed: 0,
+                    },
+                )),
+            });
+            return;
+        };
+        let audit_plan = verified_audit_plan(&plan);
+        let task_contract = plan.task.clone();
+        let mut planner = ReportingPlanner {
+            inner: ScriptedPlanner::new(plan.proposal.steps.clone()),
+            progress: VerifiedProgress::new(&task_request_id, results.clone()),
+        };
+        let mut authorizer = ReportingAuthorizer {
+            inner: ConfirmedTaskAuthorizer::new(task_contract.window.clone(), &plan.proposal),
+            progress: VerifiedProgress::new(&task_request_id, results.clone()),
+        };
+        let mut environment = ReportingEnvironment {
+            inner: environment,
+            progress: VerifiedProgress::new(&task_request_id, results.clone()),
+        };
+        let run = harness::run(
+            &task_contract,
+            &mut planner,
+            &mut environment,
+            &mut authorizer,
+            cancel_rx,
+        );
+        let report = match tokio::time::timeout(VERIFIED_TERMINAL_DEADLINE, run).await {
+            Ok(report) => report,
+            Err(_) => {
+                audit::record(
+                    "failed",
+                    "remote",
+                    &audit_plan,
+                    Some("verified timeout; outcome unknown"),
+                );
+                let _ = results.send(RemoteExecutionEvent {
+                    request_id: task_request_id.clone(),
+                    kind: RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(
+                        ExecutionStatus {
+                            request_id: task_request_id,
+                            state: ExecutionState::OutcomeUnknown,
+                            message: format!(
+                                "任务在 {} 秒内未完成，操作可能已发生；请勿自动重试。",
+                                VERIFIED_TERMINAL_DEADLINE.as_secs()
+                            ),
+                            actions_executed: 0,
+                        },
+                    )),
+                });
+                return;
+            }
+        };
+        let event = if matches!(report.status, HarnessStatus::Completed) {
+            "completed"
+        } else {
+            "failed"
+        };
+        let detail = format!(
+            "verified steps={} status={:?} actions={}",
+            plan.proposal.steps.len(),
+            report.status,
+            report.actions
+        );
+        audit::record(event, "remote", &audit_plan, Some(&detail));
+        let status = terminal_status(&task_request_id, &report);
+        let _ = results.send(RemoteExecutionEvent {
+            request_id: task_request_id,
+            kind: RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(status)),
+        });
+    });
+    RemoteExecution {
+        request_id,
+        control: ExecutionControl::new(Instant::now() + VERIFIED_TERMINAL_DEADLINE),
+        task,
+        verified_cancel: Some(cancel_tx),
     }
 }
 
@@ -2537,7 +3098,7 @@ fn validate_command_request(request: &CommandRequest) -> Result<(), (&'static st
 }
 
 struct PendingPlan {
-    plan: ActionPlan,
+    plan: PreparedPlan,
     expires_at: Instant,
 }
 
@@ -2556,7 +3117,7 @@ impl PendingPlans {
         }
     }
 
-    fn insert(&mut self, request_id: String, plan: ActionPlan, now: Instant) -> Result<(), ()> {
+    fn insert(&mut self, request_id: String, plan: PreparedPlan, now: Instant) -> Result<(), ()> {
         self.purge_expired(now);
         if !self.plans.contains_key(&request_id) && self.plans.len() >= self.max_entries {
             return Err(());
@@ -2571,7 +3132,7 @@ impl PendingPlans {
         Ok(())
     }
 
-    fn take(&mut self, request_id: &str, now: Instant) -> Option<ActionPlan> {
+    fn take(&mut self, request_id: &str, now: Instant) -> Option<PreparedPlan> {
         self.purge_expired(now);
         self.plans.remove(request_id).map(|pending| pending.plan)
     }
@@ -2835,7 +3396,7 @@ fn advertise_mdns(pairing: &PairingInfo) -> Option<MdnsRegistration> {
         ("name", pairing.name.as_str()),
     ];
     let info = match mdns_sd::ServiceInfo::new(
-        "_ale-my-eyes._tcp.local.",
+        "_misaka-network._tcp.local.",
         &pairing.name,
         &format!("{}.local.", pairing.name.replace(' ', "-")),
         &pairing.host,
@@ -2861,6 +3422,7 @@ mod tests {
     use super::*;
     use ale_core::actions::{Action, MouseButton};
     use ale_core::config::AppConfig;
+    use ale_core::harness::WindowIdentity;
     use ale_core::secret_store::SecretStore;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::Path;
@@ -3057,7 +3619,6 @@ mod tests {
             crate::platform::PlatformCapabilities {
                 image_capture: true,
                 automation: true,
-                local_microphone: false,
             }
         }
     }
@@ -3562,7 +4123,7 @@ mod tests {
         let mut session_a = PendingPlans::new(2, Duration::from_secs(2));
         let mut session_b = PendingPlans::new(2, Duration::from_secs(2));
         session_a
-            .insert("request".to_string(), plan(), now)
+            .insert("request".to_string(), PreparedPlan::Legacy(plan()), now)
             .unwrap();
 
         assert!(session_b.take("request", now).is_none());
@@ -3613,9 +4174,15 @@ mod tests {
     fn pending_plan_count_is_bounded() {
         let now = Instant::now();
         let mut pending = PendingPlans::new(2, Duration::from_secs(60));
-        pending.insert("one".to_string(), plan(), now).unwrap();
-        pending.insert("two".to_string(), plan(), now).unwrap();
-        assert!(pending.insert("three".to_string(), plan(), now).is_err());
+        pending
+            .insert("one".to_string(), PreparedPlan::Legacy(plan()), now)
+            .unwrap();
+        pending
+            .insert("two".to_string(), PreparedPlan::Legacy(plan()), now)
+            .unwrap();
+        assert!(pending
+            .insert("three".to_string(), PreparedPlan::Legacy(plan()), now)
+            .is_err());
     }
 
     #[test]
@@ -3815,7 +4382,11 @@ mod tests {
 
         let mut pending = PendingPlans::new(2, Duration::from_secs(60));
         pending
-            .insert("request".to_string(), mapped, Instant::now())
+            .insert(
+                "request".to_string(),
+                PreparedPlan::Legacy(mapped),
+                Instant::now(),
+            )
             .unwrap();
         let platform = Arc::new(MockPlatform {
             executed: AtomicUsize::new(0),
@@ -3878,7 +4449,6 @@ mod tests {
             crate::platform::PlatformCapabilities {
                 image_capture: false,
                 automation: true,
-                local_microphone: false,
             }
         }
     }
@@ -3951,5 +4521,231 @@ mod tests {
         assert_eq!(status.actions_executed, 0);
         assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
         drop(request);
+    }
+    // ---- verified-task wiring -------------------------------------------------
+
+    fn verified_tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call-1".to_string(),
+            function: ale_core::cloud::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn verified_arguments() -> serde_json::Value {
+        serde_json::json!({
+            "goal": "保存缩放",
+            "explanation": "点击保存并核对状态。",
+            "risk_level": "low",
+            "steps": [{
+                "operation": "invoke",
+                "target": {"role": "ControlType.Button", "label": "保存"},
+                "expected": {"role": "ControlType.Text", "label": "状态", "property": "value", "equals": "已保存"},
+                "summary": "点击保存"
+            }]
+        })
+    }
+
+    fn verified_observation() -> Observation {
+        use ale_core::harness::Node;
+        Observation {
+            sequence: 1,
+            window: WindowIdentity {
+                process_id: 42,
+                window_id: "5001".to_string(),
+            },
+            nodes: vec![
+                Node {
+                    id: "0/1".to_string(),
+                    role: "ControlType.Button".to_string(),
+                    label: "保存".to_string(),
+                    enabled: true,
+                    properties: Default::default(),
+                },
+                Node {
+                    id: "0/2".to_string(),
+                    role: "ControlType.Text".to_string(),
+                    label: "状态".to_string(),
+                    enabled: true,
+                    properties: [("value".to_string(), "未保存".to_string())].into(),
+                },
+            ],
+        }
+    }
+
+    fn verified_plan() -> VerifiedPlan {
+        let proposal =
+            crate::verified_task::parse_verified_task_arguments(&verified_arguments().to_string())
+                .expect("valid proposal");
+        let observation = verified_observation();
+        let task =
+            crate::verified_task::build_task(&proposal, "保存缩放", &observation.window, true)
+                .expect("task");
+        VerifiedPlan { task, proposal }
+    }
+
+    #[test]
+    fn verified_tool_call_builds_host_task_and_preview() {
+        let calls = vec![verified_tool_call(
+            "propose_verified_task",
+            verified_arguments(),
+        )];
+        let observation = verified_observation();
+        let (preview, plan) =
+            parse_verified_plan(Some(&calls), "用户说：保存缩放", &observation, "req-v")
+                .expect("verified plan");
+        assert_eq!(preview.request_id, "req-v");
+        assert_eq!(preview.task_mode.as_deref(), Some("verified"));
+        assert_eq!(preview.verification.as_ref().map(Vec::len), Some(1));
+        assert!(preview.has_plan && preview.requires_confirmation);
+        assert_eq!(plan.task.goal, "用户说：保存缩放");
+        assert_eq!(plan.task.window, observation.window);
+        assert_eq!(plan.task.success[0].equals, "已保存");
+        assert_eq!(plan.proposal.steps.len(), 1);
+    }
+
+    #[test]
+    fn verified_tool_call_parser_requires_one_valid_call() {
+        let observation = verified_observation();
+        assert_eq!(
+            parse_verified_plan(None, "目标", &observation, "r").unwrap_err(),
+            5
+        );
+        let legacy = vec![verified_tool_call(
+            "execute_action_plan",
+            serde_json::json!({"actions": []}),
+        )];
+        assert_eq!(
+            parse_verified_plan(Some(&legacy), "目标", &observation, "r").unwrap_err(),
+            5
+        );
+        let duplicated = vec![
+            verified_tool_call("propose_verified_task", verified_arguments()),
+            verified_tool_call("propose_verified_task", verified_arguments()),
+        ];
+        assert_eq!(
+            parse_verified_plan(Some(&duplicated), "目标", &observation, "r").unwrap_err(),
+            8
+        );
+        let malformed = vec![verified_tool_call(
+            "propose_verified_task",
+            serde_json::json!({"goal": "g", "explanation": "e", "risk_level": "low", "steps": []}),
+        )];
+        assert_eq!(
+            parse_verified_plan(Some(&malformed), "目标", &observation, "r").unwrap_err(),
+            6
+        );
+    }
+
+    #[test]
+    fn verified_confirmation_starts_verified_execution() {
+        let now = Instant::now();
+        let mut pending = PendingPlans::new(2, Duration::from_secs(60));
+        let plan = verified_plan();
+        let task_id = plan.task.id.clone();
+        pending
+            .insert("v".to_string(), PreparedPlan::Verified(Box::new(plan)), now)
+            .unwrap();
+        match prepare_confirm(
+            ConfirmExecution {
+                request_id: "v".to_string(),
+                approved: true,
+            },
+            &mut pending,
+        ) {
+            ConfirmAction::ExecuteVerified { request_id, plan } => {
+                assert_eq!(request_id, "v");
+                assert_eq!(plan.task.id, task_id);
+            }
+            _ => panic!("expected verified execution"),
+        }
+        assert!(pending.take("v", now).is_none());
+
+        let mut pending = PendingPlans::new(2, Duration::from_secs(60));
+        pending
+            .insert(
+                "v".to_string(),
+                PreparedPlan::Verified(Box::new(verified_plan())),
+                now,
+            )
+            .unwrap();
+        match prepare_confirm(
+            ConfirmExecution {
+                request_id: "v".to_string(),
+                approved: false,
+            },
+            &mut pending,
+        ) {
+            ConfirmAction::Immediate(status) => {
+                assert_eq!(status.state, ExecutionState::Cancelled)
+            }
+            _ => panic!("expected cancellation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verified_execution_fails_cleanly_when_platform_is_unavailable() {
+        if crate::uia_environment::uia_available() {
+            return; // Real Windows bridge is verified separately on a device.
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let execution = start_verified_execution("v".to_string(), verified_plan(), sender);
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("terminal event")
+            .expect("event");
+        let RemoteExecutionEventKind::Complete(RemoteExecutionOutcome::Status(status)) = event.kind
+        else {
+            panic!("expected terminal status");
+        };
+        assert_eq!(status.state, ExecutionState::Failed);
+        assert_eq!(status.actions_executed, 0);
+        drop(execution);
+    }
+
+    #[tokio::test]
+    async fn verified_progress_is_throttled() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let progress = VerifiedProgress::new("v", sender);
+        progress.send(ProgressStage::VerifiedStep, "one".to_string());
+        progress.send(ProgressStage::VerifiedStep, "two".to_string());
+        let first = receiver.recv().await.expect("first");
+        assert!(matches!(
+            first.kind,
+            RemoteExecutionEventKind::Progress(ProgressStage::VerifiedStep, _)
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "rapid updates must be throttled"
+        );
+        tokio::time::sleep(VERIFIED_PROGRESS_INTERVAL + Duration::from_millis(50)).await;
+        progress.send(ProgressStage::VerifiedVerify, "three".to_string());
+        let third = receiver.recv().await.expect("third");
+        assert!(matches!(
+            third.kind,
+            RemoteExecutionEventKind::Progress(ProgressStage::VerifiedVerify, _)
+        ));
+    }
+
+    #[test]
+    fn verified_question_discloses_tree_without_host_ids() {
+        let observation = verified_observation();
+        let text = verified_question("把设置保存", &observation);
+        assert!(text.contains("ControlType.Button"));
+        assert!(text.contains("保存"));
+        assert!(text.contains("未保存"));
+        assert!(!text.contains("0/1"));
+        assert!(text.contains("propose_verified_task"));
+    }
+
+    #[test]
+    fn verified_audit_detail_keeps_counts_only() {
+        let detail = PreparedPlan::Verified(Box::new(verified_plan()))
+            .created_detail()
+            .expect("verified detail");
+        assert!(detail.contains("steps=1"));
+        assert!(!detail.contains("保存"));
     }
 }

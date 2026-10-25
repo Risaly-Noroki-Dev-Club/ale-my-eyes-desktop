@@ -9,9 +9,9 @@ The default window is 1032 by 800 logical pixels, with a 440 by 640 minimum.
 
 - Pairing displays a real QR code, code, expiry, and connection state. Refresh
   rotates the credentials for new connections without restarting authenticated
-  sessions. Only a valid encrypted protocol-v3 ClientHello unlocks Work.
-- The phone supplies voice input. The desktop has no conversation input and
-  does not automatically start its microphone.
+  sessions. Only a valid encrypted Misaka-Network v4 ClientHello unlocks Work.
+- The phone supplies voice input. The desktop exposes no microphone capture,
+  local audio playback, or conversation input.
 - Work shows authenticated devices, measured WebSocket round-trip latency,
   current task, full confirmation text, action risk, model health, and bounded
   activity history. Unavailable latency and model state remain explicitly unknown.
@@ -36,8 +36,8 @@ The default window is 1032 by 800 logical pixels, with a 440 by 640 minimum.
 `src/desktop_ui.rs` owns UI callbacks and rendering, `src/ui_state.rs` receives
 remote session events, and `src/ui_text.rs` localizes runtime status labels.
 `ui/state.slint` is the UI contract. Model health adds an optional
-`sensevoice_state` field to the local scheduler IPC response; phone protocol
-messages are unchanged. Builds without `ALE_BUILD_DATE` display an unknown build
+`sensevoice_state` field to the local scheduler IPC response; it is not exposed
+on the phone protocol. Builds without `ALE_BUILD_DATE` display an unknown build
 date instead of a fixture date.
 
 ## Local Verification
@@ -51,7 +51,7 @@ cargo build -p ale-gui -p ale-modeld --locked
 cargo run -p ale-gui
 ```
 
-For deterministic visual inspection without microphone access, user settings,
+For deterministic visual inspection without engine access, user settings,
 credentials, or network services:
 
 ```sh

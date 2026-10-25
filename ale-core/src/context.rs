@@ -1,8 +1,6 @@
 use crate::cloud::CloudMessage;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
-use uuid::Uuid;
+use std::collections::VecDeque;
 
 /// 上下文条目角色
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,65 +19,10 @@ pub struct ContextEntry {
     pub token_count: usize,
 }
 
-/// 帧摘要（存储 AI 生成的描述，而非原始图像）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrameSummary {
-    pub description: String,
-    pub key_elements: Vec<String>,
-    pub source: FrameSource,
-}
-
-/// 帧来源
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FrameSource {
-    Camera,
-    Screen,
-}
-
-/// 长期记忆条目
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    #[serde(default = "MemoryEntry::new_id")]
-    pub id: String,
-    pub content: String,
-    pub importance: f32,
-    pub source: String,
-    #[serde(default = "Utc::now")]
-    pub created_at: DateTime<Utc>,
-    #[serde(default)]
-    pub last_used_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
-impl MemoryEntry {
-    pub fn new(content: String, importance: f32, source: String) -> Self {
-        Self {
-            id: Self::new_id(),
-            content,
-            importance,
-            source,
-            created_at: Utc::now(),
-            last_used_at: None,
-            tags: Vec::new(),
-        }
-    }
-
-    fn new_id() -> String {
-        Uuid::new_v4().to_string()
-    }
-}
-
-/// 上下文管理器
+/// 上下文管理器：对话历史 + token 预算 + 旧对话压缩。
 pub struct ContextManager {
     /// 对话历史
     conversation: VecDeque<ContextEntry>,
-    /// 视觉记忆（最近帧的摘要）
-    visual_memory: VecDeque<FrameSummary>,
-    /// 最大视觉记忆条目数
-    max_visual: usize,
-    /// 长期记忆
-    long_term_memory: Vec<MemoryEntry>,
     /// 对话摘要（压缩后的旧对话）
     conversation_summary: Option<String>,
     /// 当前 token 估算
@@ -96,9 +39,6 @@ impl ContextManager {
     pub fn new(max_tokens: usize) -> Self {
         Self {
             conversation: VecDeque::new(),
-            visual_memory: VecDeque::new(),
-            max_visual: 5,
-            long_term_memory: Vec::new(),
             conversation_summary: None,
             current_tokens: 0,
             max_tokens,
@@ -155,133 +95,17 @@ impl ContextManager {
         self.maybe_compact();
     }
 
-    /// 添加视觉帧摘要
-    pub fn add_frame_summary(&mut self, summary: FrameSummary) {
-        // 检查是否与最近帧重复
-        if let Some(last) = self.visual_memory.back() {
-            if last.description == summary.description {
-                return;
-            }
-        }
-
-        self.visual_memory.push_back(summary);
-        if self.visual_memory.len() > self.max_visual {
-            self.visual_memory.pop_front();
-        }
-    }
-
-    /// 添加长期记忆
-    pub fn add_memory(&mut self, entry: MemoryEntry) {
-        // 检查是否已存在
-        if self
-            .long_term_memory
-            .iter()
-            .any(|m| m.content == entry.content)
-        {
-            return;
-        }
-        self.long_term_memory.push(entry);
-    }
-
-    /// 批量替换长期记忆，通常用于加载持久化记忆。
-    pub fn replace_memories(&mut self, memories: Vec<MemoryEntry>) {
-        self.long_term_memory = memories;
-    }
-
-    /// 获取所有长期记忆。
-    pub fn memories(&self) -> &[MemoryEntry] {
-        &self.long_term_memory
-    }
-
-    /// 基于当前问题选择最相关的长期记忆，避免无差别注入过多上下文。
-    pub fn relevant_memories(&self, query: &str, limit: usize) -> Vec<&MemoryEntry> {
-        let query_terms = extract_terms(query);
-        let mut scored = self
-            .long_term_memory
-            .iter()
-            .map(|memory| {
-                let content_lower = memory.content.to_lowercase();
-                let tag_lower = memory.tags.join(" ").to_lowercase();
-                let source_lower = memory.source.to_lowercase();
-
-                let term_score = query_terms
-                    .iter()
-                    .filter(|term| {
-                        content_lower.contains(term.as_str())
-                            || tag_lower.contains(term.as_str())
-                            || source_lower.contains(term.as_str())
-                    })
-                    .count() as f32;
-                let tag_score = memory.tags.len().min(5) as f32 * 0.05;
-                let used_score = if memory.last_used_at.is_some() {
-                    0.1
-                } else {
-                    0.0
-                };
-
-                (
-                    memory,
-                    term_score * 2.0 + memory.importance + tag_score + used_score,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored
-            .into_iter()
-            .filter(|(_, score)| *score > 0.0)
-            .take(limit)
-            .map(|(memory, _)| memory)
-            .collect()
-    }
-
     /// 构建发送给 AI 的消息列表
-    pub fn build_messages(
-        &self,
-        current_image_description: Option<&str>,
-        current_question: &str,
-    ) -> Vec<CloudMessage> {
+    pub fn build_messages(&self, current_question: &str) -> Vec<CloudMessage> {
         let mut messages = Vec::new();
 
-        // 1. 系统提示（含长期记忆）
-        let mut system = self.system_prompt.clone();
-        let memories = self.relevant_memories(current_question, 8);
-        if !memories.is_empty() {
-            system.push_str("\n\n用户相关记忆：\n");
-            for mem in memories {
-                system.push_str(&format!("- {}\n", mem.content));
-            }
-        }
+        // 1. 系统提示
         messages.push(CloudMessage {
             role: "system".to_string(),
-            content: system,
+            content: self.system_prompt.clone(),
         });
 
-        // 2. 视觉上下文（最近帧摘要）
-        if !self.visual_memory.is_empty() {
-            let mut visual_context = String::from("最近的画面变化：\n");
-            for (i, frame) in self.visual_memory.iter().rev().take(2).enumerate() {
-                visual_context.push_str(&format!(
-                    "{}. [{}] {}\n",
-                    i + 1,
-                    match frame.source {
-                        FrameSource::Camera => "相机",
-                        FrameSource::Screen => "屏幕",
-                    },
-                    frame.description
-                ));
-                if !frame.key_elements.is_empty() {
-                    visual_context
-                        .push_str(&format!("   关键元素: {}\n", frame.key_elements.join(", ")));
-                }
-            }
-            messages.push(CloudMessage {
-                role: "system".to_string(),
-                content: visual_context,
-            });
-        }
-
-        // 3. 对话摘要
+        // 2. 对话摘要
         if let Some(ref summary) = self.conversation_summary {
             messages.push(CloudMessage {
                 role: "system".to_string(),
@@ -289,7 +113,7 @@ impl ContextManager {
             });
         }
 
-        // 4. 最近对话
+        // 3. 最近对话
         for entry in self.conversation.iter().rev().take(10).rev() {
             let role = match entry.role {
                 Role::User => "user",
@@ -302,26 +126,13 @@ impl ContextManager {
             });
         }
 
-        // 5. 当前问题 + 当前图像描述
-        let mut user_content = current_question.to_string();
-        if let Some(img_desc) = current_image_description {
-            user_content = format!("[当前画面：{}]\n\n{}", img_desc, current_question);
-        }
+        // 4. 当前问题
         messages.push(CloudMessage {
             role: "user".to_string(),
-            content: user_content,
+            content: current_question.to_string(),
         });
 
         messages
-    }
-
-    /// 格式化视觉记忆（用于调试）
-    pub fn format_visual_memory(&self) -> String {
-        self.visual_memory
-            .iter()
-            .map(|f| format!("[{:?}] {}", f.source, f.description))
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 
     /// 压缩对话（当 token 接近上限时）
@@ -404,7 +215,6 @@ impl ContextManager {
     /// 清空上下文
     pub fn clear(&mut self) {
         self.conversation.clear();
-        self.visual_memory.clear();
         self.conversation_summary = None;
         self.current_tokens = 0;
         self.session_tokens_used = 0;
@@ -419,28 +229,6 @@ impl ContextManager {
     pub fn estimated_tokens(&self) -> usize {
         self.current_tokens
     }
-}
-
-fn extract_terms(text: &str) -> HashSet<String> {
-    let mut terms = text
-        .split(|c: char| !c.is_alphanumeric() && !is_cjk(c))
-        .map(|term| term.trim().to_lowercase())
-        .filter(|term| term.chars().count() >= 2)
-        .collect::<HashSet<_>>();
-
-    let cjk_chars = text.chars().filter(|c| is_cjk(*c)).collect::<Vec<_>>();
-    for window in cjk_chars.windows(2) {
-        terms.insert(window.iter().collect());
-    }
-
-    terms
-}
-
-fn is_cjk(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
-    )
 }
 
 #[cfg(test)]
@@ -463,29 +251,9 @@ mod tests {
         ctx.add_user_message("这是什么？".to_string());
         ctx.add_assistant_message("这是一只猫。".to_string());
 
-        let messages = ctx.build_messages(Some("一只橘色的猫"), "它在做什么？");
+        let messages = ctx.build_messages("它在做什么？");
         assert!(messages.len() >= 3); // system + history + current
-        assert!(messages.last().unwrap().content.contains("橘色的猫"));
-    }
-
-    #[test]
-    fn test_visual_memory() {
-        let mut ctx = ContextManager::new(4000);
-        ctx.add_frame_summary(FrameSummary {
-            description: "桌面环境".to_string(),
-            key_elements: vec!["任务栏".to_string(), "浏览器窗口".to_string()],
-            source: FrameSource::Screen,
-        });
-
-        assert_eq!(ctx.visual_memory.len(), 1);
-
-        // 重复帧不添加
-        ctx.add_frame_summary(FrameSummary {
-            description: "桌面环境".to_string(),
-            key_elements: vec!["任务栏".to_string()],
-            source: FrameSource::Screen,
-        });
-        assert_eq!(ctx.visual_memory.len(), 1);
+        assert!(messages.last().unwrap().content.contains("它在做什么？"));
     }
 
     #[test]
@@ -511,43 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn test_memory() {
-        let mut ctx = ContextManager::new(4000);
-        ctx.add_memory(MemoryEntry {
-            id: "memory-1".to_string(),
-            content: "用户喜欢简洁的回答".to_string(),
-            importance: 0.8,
-            source: "对话".to_string(),
-            created_at: Utc::now(),
-            last_used_at: None,
-            tags: vec!["偏好".to_string()],
-        });
-
-        // 重复记忆不添加
-        ctx.add_memory(MemoryEntry {
-            id: "memory-2".to_string(),
-            content: "用户喜欢简洁的回答".to_string(),
-            importance: 0.9,
-            source: "对话".to_string(),
-            created_at: Utc::now(),
-            last_used_at: None,
-            tags: vec![],
-        });
-        assert_eq!(ctx.long_term_memory.len(), 1);
-    }
-
-    #[test]
     fn test_clear() {
         let mut ctx = ContextManager::new(4000);
         ctx.add_user_message("test".to_string());
-        ctx.add_frame_summary(FrameSummary {
-            description: "test".to_string(),
-            key_elements: vec![],
-            source: FrameSource::Camera,
-        });
 
         ctx.clear();
         assert_eq!(ctx.conversation_turns(), 0);
-        assert_eq!(ctx.visual_memory.len(), 0);
+        assert_eq!(ctx.estimated_tokens(), 0);
     }
 }

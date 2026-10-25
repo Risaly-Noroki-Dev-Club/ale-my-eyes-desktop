@@ -693,27 +693,24 @@ impl ModelScheduler {
     }
 }
 
+/// provider 只是预设名；已知预设决定传输协议。
+fn remote_wire_api(endpoint: &RemoteEndpointConfig) -> ale_core::model_api::WireApi {
+    ale_core::config::CloudApiConfig::preset_wire_api(&endpoint.provider)
+        .unwrap_or(endpoint.wire_api)
+}
+
 async fn call_remote(
     endpoint: &RemoteEndpointConfig,
     job: &RemotePlanningJob,
 ) -> ale_core::Result<ale_core::cloud::VisionResponse> {
-    use ale_core::cloud::{CloudApiFactory, CloudConfig, CloudProvider, VisionResponse};
-    let provider = match endpoint.provider.to_ascii_lowercase().as_str() {
-        "openai" => CloudProvider::OpenAI,
-        "anthropic" => CloudProvider::Anthropic,
-        "google" => CloudProvider::Google,
-        "azure" => CloudProvider::Azure,
-        other => CloudProvider::Custom(other.to_string()),
-    };
-    let api = CloudApiFactory::create(CloudConfig {
-        wire_api: endpoint.wire_api,
-        provider,
+    use ale_core::cloud::{CloudApi as _, CloudConfig, RemoteCloudApi, VisionResponse};
+    let api = RemoteCloudApi::new(CloudConfig {
+        wire_api: remote_wire_api(endpoint),
         api_key: endpoint.api_key.clone(),
         api_url: endpoint.api_url.clone(),
         model: endpoint.model.clone(),
         max_tokens: endpoint.max_tokens,
         timeout: Duration::from_secs(endpoint.timeout_seconds.max(1) as u64),
-        retry_count: 0,
     });
     let image = job
         .image_base64
@@ -745,28 +742,20 @@ async fn call_remote_transcribe(
     endpoint: &RemoteEndpointConfig,
     wav: &[u8],
 ) -> ale_core::Result<String> {
+    use ale_core::cloud::CloudApi as _;
     let api = remote_api(endpoint);
     api.transcribe(wav).await.map(|response| response.content)
 }
 
-fn remote_api(endpoint: &RemoteEndpointConfig) -> Box<dyn ale_core::cloud::CloudApi> {
-    use ale_core::cloud::{CloudApiFactory, CloudConfig, CloudProvider};
-    let provider = match endpoint.provider.to_ascii_lowercase().as_str() {
-        "openai" => CloudProvider::OpenAI,
-        "anthropic" => CloudProvider::Anthropic,
-        "google" => CloudProvider::Google,
-        "azure" => CloudProvider::Azure,
-        other => CloudProvider::Custom(other.to_string()),
-    };
-    CloudApiFactory::create(CloudConfig {
-        wire_api: endpoint.wire_api,
-        provider,
+fn remote_api(endpoint: &RemoteEndpointConfig) -> ale_core::cloud::RemoteCloudApi {
+    use ale_core::cloud::{CloudConfig, RemoteCloudApi};
+    RemoteCloudApi::new(CloudConfig {
+        wire_api: remote_wire_api(endpoint),
         api_key: endpoint.api_key.clone(),
         api_url: endpoint.api_url.clone(),
         model: endpoint.model.clone(),
         max_tokens: endpoint.max_tokens,
         timeout: Duration::from_secs(endpoint.timeout_seconds.max(1) as u64),
-        retry_count: 0,
     })
 }
 
@@ -1051,6 +1040,8 @@ mod tests {
                     revision: 0,
                     primary: endpoint(primary),
                     backup: Some(RemoteEndpointConfig {
+                        // 非默认协议需要显式 custom provider，预设 openai 只会用 chat completions。
+                        provider: "custom".to_string(),
                         wire_api: ale_core::model_api::WireApi::OpenaiResponses,
                         ..endpoint(backup)
                     }),

@@ -1,6 +1,6 @@
 # Desktop Design Assets
 
-The SVG icons and their PNG exports come from the user-provided Figma file
+The SVG icons come from the user-provided Figma file
 `cxaBufUY2jTxJt1E50MUUj`, frames `1:2`, `12:53`, and `12:259`.
 Slint renders the SVG files so icons remain sharp at different display scales.
 

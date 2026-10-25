@@ -227,12 +227,6 @@ impl ScreenCapture {
             .cloned()
     }
 
-    /// 获取最新帧的 JPEG 数据（用于发送给 API）
-    pub fn latest_frame_jpeg(&self) -> Option<Vec<u8>> {
-        let frame = self.latest_frame()?;
-        frame_to_jpeg(&frame, self.config.jpeg_quality).ok()
-    }
-
     pub fn latest_capture(&self) -> Option<CapturedScreen> {
         let frame = self.latest_frame()?;
         Some(CapturedScreen {

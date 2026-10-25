@@ -13,14 +13,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_pairing_code("JVVDPV".into());
     ui.set_remaining(119);
     ui.set_pairing_status("等待手机连接".into());
-    ui.set_pairing_uri("ale-my-eyes://pair?host=192.168.1.42&port=37654&code=JVVDPV".into());
+    ui.set_pairing_uri("misaka-network://pair?host=192.168.1.42&port=37654&code=JVVDPV".into());
     ui.set_pairing_available(true);
     ui.set_selected_pairing_address(0);
     ui.set_pairing_addresses(ModelRc::new(VecModel::from(vec![
         "en0 · 192.168.1.42".into(),
         "utun4 · 10.8.0.2".into(),
     ])));
-    let code = qrcode::QrCode::new(b"ale-my-eyes://preview-only")?;
+    let code = qrcode::QrCode::new(b"misaka-network://preview-only")?;
     let qr = code
         .render::<image::Rgba<u8>>()
         .min_dimensions(192, 192)

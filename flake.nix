@@ -44,8 +44,6 @@
                   "target"
                   "dist"
                   "release"
-                  "Ale, My Eyes!.app"
-                  "AleMyEyes.dmg"
                   "ale-my-eyes-linux"
                   "ale-my-eyes-windows"
                 ];
@@ -58,8 +56,11 @@
           nativeBuildInputs = with pkgs; [ clang makeWrapper pkg-config ];
           buildInputs = runtimeLibraries;
           LIBCLANG_PATH = "${lib.getLib pkgs.llvmPackages.libclang}/lib";
-          # sherpa-rs downloads native archives during its build script, which is
-          # incompatible with the Nix sandbox until those archives are packaged.
+          # ale-modeld's optional `sensevoice` feature (sherpa-rs) downloads
+          # native archives during its build script, which is incompatible with
+          # the Nix sandbox until those archives are packaged. Building without
+          # default features keeps the Nix package ASR-free but fully usable.
+
           cargoBuildFlags = [ "--workspace" "--no-default-features" ];
           cargoTestFlags = [ "--workspace" "--no-default-features" ];
           preCheck = ''

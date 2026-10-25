@@ -415,10 +415,9 @@ pub(crate) mod keys {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     #[test]
     fn helper_output_is_drained_with_a_fixed_limit() {
         let control = ExecutionControl::new(Instant::now() + Duration::from_secs(5));
@@ -428,7 +427,6 @@ mod tests {
         );
         assert_eq!(output.unwrap_err().to_string(), "HELPER_OUTPUT_LIMIT");
     }
-    #[cfg(unix)]
     #[test]
     fn helper_hang_is_terminated_and_reaped() {
         let control = ExecutionControl::new(Instant::now() + Duration::from_millis(100));

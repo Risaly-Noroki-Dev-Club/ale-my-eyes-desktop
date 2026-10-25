@@ -1,37 +1,52 @@
 # AGENTS.md
 
 ## Repository Shape
-- Rust workspace members are only `ale-core`, `ale-cli`, and `ale-gui`; make source changes there, not in generated package/release snapshots.
-- `ale-core/src/lib.rs` exposes `AleEngine`; default features enable `cloud` only, while `local-inference` pulls in Whisper/ORT/local TTS-heavy deps.
-- `ale-gui` is both the desktop binary (`src/main.rs`) and mobile library entry (`src/android.rs`, plus iOS-gated modules); Slint UI source is in `ale-gui/ui/`.
-- Android Java/resources under `ale-gui/android/` are real source inputs for mobile automation/services; `ale-gui/build.rs` only watches them for Android builds.
-- The root `Cargo.toml` patches `i-slint-backend-winit` to `vendor/i-slint-backend-winit-1.16.1`; do not remove or bypass that patch casually.
-- `ale-server` is not in this workspace. Treat `docs/API.md` and server references in generated/readme content as historical unless the task is explicitly about those docs.
-- Ignore build/runtime artifacts: `target/`, `dist/`, `release/`, `Ale, My Eyes!.app/`, `*.dmg`, `*.apk`, `ale-my-eyes-*` package dirs/archives, model files, `ale-gui/android/build/`, and `config/config.json`.
+- Rust workspace members: `ale-core`, `ale-cli`, `ale-gui`, and `ale-modeld` (see root `Cargo.toml`). Make source changes in these crates, not in generated `release/`, `dist/`, or package snapshots.
+- `ale-core` owns configuration, remote cloud model calls (`cloud.rs`/`model_api.rs`), scheduling and IPC types, the Misaka-Network v4 protocol (`remote.rs`), and the task harness (`harness/`). It contains **no local inference**: no ASR/VLM/LLM/TTS/VAD modules, and `asr.rs`/`vlm.rs`/`llm.rs`/`tts.rs`/`vad.rs`/`memory.rs`/`inference.rs` were removed.
+- `ale-gui` is the desktop binary and Slint UI (`ui/`). It also hosts the phone remote server, screen capture/automation, the Windows UI Automation adapter used by verified tasks, and the `ale-modeld` supervisor. This repository has no Android/iOS target; the mobile client is a separate checkout.
+- `ale-cli` exposes `transcribe`, `describe`, `test-connection`, `status`, and `harness-demo` (`cargo run -p ale-cli -- --help`).
+- `ale-modeld` runs local inference out of process: a GPU-only `llama-server` worker for Qwen2.5-VL/ShowUI plus an optional SenseVoice ASR feature (default `sensevoice`; excluded on `windows-gnu`). It is launched by `ale-gui` with a bootstrap token over a Unix socket or Windows named pipe.
+- The root `Cargo.toml` patches `i-slint-backend-winit` to `vendor/i-slint-backend-winit-1.16.1`; that vendor patch adds the macOS CADisplayLink frame throttle. Do not remove or bypass it casually.
+- Protocol source of truth: `ale-core/src/remote.rs` (Misaka-Network v4, `REMOTE_PROTOCOL_VERSION = 4`, QR scheme `misaka-network://`, mDNS `_misaka-network._tcp`, chunk magic `MSKN`, PSK label `misaka-network-remote-v4`). Golden fixture: `ale-core/tests/fixtures/remote-v4.json`. The mobile repository has an independent implementation and must be validated in lockstep.
+- Ignore build/runtime artifacts: `target/`, `dist/`, `release/`, `Ale, My Eyes!.app/`, `*.dmg`, `*.apk` (not produced here), `ale-my-eyes-*` package dirs/archives, model files, and `config/config.json`.
 
 ## Verification Commands
-- No `.github/workflows/` are present in this checkout; verify locally instead of citing CI.
-- Format check: `cargo fmt --all -- --check`.
-- Whole workspace check: `cargo check --workspace`. If native GUI/audio/capture deps are missing, focus with `cargo check -p ale-core`, `cargo check -p ale-cli`, or `cargo check -p ale-gui`.
-- Tests are plain Cargo tests: `cargo test`, `cargo test -p ale-core`, or `cargo test -p ale-core <test_name>` for a focused test.
-- Optional lint: `cargo clippy --workspace --all-targets`.
-- Run apps with `cargo run -p ale-gui` or `cargo run -p ale-cli -- <transcribe|synthesize|describe|test-connection|status>`; CLI flags include `transcribe --audio input.wav`, `synthesize --text ... --output out.wav`, and `describe --image image.png`.
+- CI is real: `.github/workflows/build.yml` (jobs: `check`, `harness-evaluation`, `build-windows`, `build-linux`, `nix`, `source-package`, `release`). Cite it; do not claim there is no workflow.
+- Format: `cargo fmt --all -- --check`.
+- Whole workspace: `cargo check --workspace --locked`; tests: `cargo test --workspace --locked`; lint: `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+- Focused: `cargo test -p ale-core`, `cargo test -p ale-core <test_name>`, `cargo check -p ale-gui`, `cargo check -p ale-modeld`.
+- Task harness (device-independent, no desktop session or cloud key needed):
+  ```sh
+  cargo run -p ale-cli --locked -- harness-demo --task zoom --scenario normal
+  cargo build -p ale-cli --locked
+  python3 scripts/evaluate-harness.py   # 24 cases: 3 tasks x 8 scenarios
+  ```
+- Static regression checks: `bash scripts/verify-pc-issues.sh` (UI/platform/protocol-v4/harness/packaging assertions plus removed-local-inference guards).
+- Linux workspace checks need the native packages installed by CI (see the apt line in `.github/workflows/build.yml`).
 
 ## Build Notes
 - `ale-gui` uses Slint `1.16`; `ale-gui/build.rs` compiles `ale-gui/ui/app.slint`, which imports the other `.slint` files.
-- Linux `cargo check --workspace` needs native GUI/audio/capture deps installed: `libspeechd-dev libasound2-dev libfontconfig-dev libpipewire-0.3-dev libwayland-dev libxrandr-dev libdbus-1-dev libegl-dev libgbm-dev libxcb-shape0-dev libxcb-xfixes0-dev`.
-- Desktop GUI uses `cpal`/`rodio` audio, `xcap` screen capture, and `enigo` automation; Android uses `oboe`, JNI Camera2, AccessibilityService Java, a foreground service, and Slint's Android backend.
-- Android packaging is `./scripts/package-android.sh`; it requires SDK + `keytool`, resolves NDK from `ANDROID_NDK_ROOT`/`ANDROID_NDK_VERSION` or SDK `ndk/27.3.13750724` with newest fallback, installs `cargo-apk` if missing, runs `scripts/build-android-java.sh`, then builds arm64 and armv7 APKs by default.
-- `scripts/build-android-java.sh` needs `ANDROID_HOME` or `ANDROID_SDK_ROOT` and prefers SDK platform `android-34`; it writes classes/dex under `ale-gui/android/build/`.
-- macOS packaging is `./scripts/package-macos.sh`; it builds the full workspace, creates `Ale, My Eyes!.app`, ad-hoc signs it, then prompts interactively before creating a DMG.
+- Desktop capture/automation uses `xcap` and `enigo`; the phone supplies audio. The desktop no longer captures a microphone or plays local TTS.
+- Windows is the only platform with the verified-task UIA adapter (`ale-gui/src/uia_environment.rs`, PowerShell bridge). Non-Windows builds compile but report UIA unavailable.
+- Full Windows packages require MSVC (`msvc` target; PDBs and Sherpa DLLs are collected into the ZIP). `windows-gnu` builds are validation-only and have no local SenseVoice ASR.
+
+## Task Harness and Verified Tasks
+- Runtime: `ale-core/src/harness/`; simulation/CLI reference: `harness-demo`; production wiring: `ale-gui/src/{verified_task,verified_planner,verified_authorizer,uia_environment}.rs` and `remote_server.rs`.
+- Verified mode is opt-in via `verified_tasks.enabled` (default `true`) and only activates when the request may disclose the screen to the cloud and the platform exposes UI Automation (Windows). Otherwise the legacy plan-then-execute path is used and `verified_task_unavailable` is recorded in diagnostics.
+- The model may only propose semantic steps with verifiable postconditions (`propose_verified_task`); the host builds the `Task`, owns success criteria/budgets, and the runner requires user confirmation, re-observation, authorization, and post-action verification. Terminal states include `completed`, `needs_user`, `outcome_unknown`, `cancelled`, `failed`.
+- Windows UIA real-device acceptance is **not done**; offline tests use mock bridges. Do not claim production success rates, UIA reliability, or real-task quality from the 24-case offline matrix.
 
 ## Architecture Notes
-- Long-lived app config is created under the user config directory at `ale-my-eyes/config.json`; `AleEngine` stores `memory.json` next to that config, and tests use `/tmp/ale-my-eyes-test/config.json` or per-test `/tmp` paths.
-- `ale-core/src/cloud.rs` is OpenAI-compatible by default (`gpt-4o`, `whisper-1`, `tts-1`) and also has Anthropic/Google/Azure/custom provider mapping; never commit real API keys.
-- `ale-gui/src/lib.rs` owns the main app wiring: engine setup, continuous listening, VAD timer, screen/camera capture, settings save, and TTS playback.
-- Automation actions are defined in `ale-core/src/actions.rs`; desktop execution is in `ale-gui/src/automation.rs`, Android execution is in `ale-gui/src/android_automation.rs` plus Java bridge/service code.
+- Long-lived app config is created under the user config directory at `ale-my-eyes/config.json`; API keys use the system credential store. Model scheduler runtime config points at `models/.runtime` (llama-server + GGUF files and the calibrated `runtime-capabilities.json`).
+- `ale-core/src/cloud.rs` has one `RemoteCloudApi` implementing four wire protocols. `provider` is only a UI preset (`openai`, `anthropic`, `google`, custom); `wire_api` is the transport truth, and preset/protocol conflicts are rejected by config validation. Custom providers must set an explicit `wire_api`. There is no `retry_count` field and no desktop TTS.
+- `ale-modeld` protocol: protobuf-framed IPC (`ale-core/src/model_ipc.rs`, version 2, 32 MiB frame cap) over a Unix socket/named pipe. GUI spawns it, pins configuration snapshots per request, enforces health/restart backoff, and falls back to cloud paths when local capabilities are unavailable.
+- Screen/automation: `ale-core/src/actions.rs` defines actions; desktop execution lives in `ale-gui/src/automation.rs` and `platform/`. Verified-task execution goes through the UIA adapter instead of the legacy automation path.
 
 ## Packaging
-- `./scripts/package-linux.sh`, `./scripts/package-windows.sh`, and `./scripts/package-android.sh` delete/recreate repo-root package dirs and archives; run them only when packaging is the task.
-- `./scripts/create-release.sh` deletes and recreates `release/` with generated source/docs/quickstart tarballs; use it only when intentionally regenerating release snapshots/docs.
-- `./scripts/build-release.sh` writes `dist/` and tolerates a failed release build with `|| echo`; do not treat it as a verification substitute for `cargo check`/`cargo test`.
+- `./scripts/package-linux.sh` (Linux only), `./scripts/package-windows.sh` (Windows/MSVC or explicit `WINDOWS_TARGET`; GNU needs `ALLOW_LIMITED_WINDOWS=1`), and `./scripts/build-windows.ps1`/`build-windows.cmd` build runnable packages. They delete/recreate repo-root package dirs; run only for packaging.
+- `./scripts/create-release.sh` deletes/recreates `release/` (source tarball now includes `HARNESS.md` and `MODEL-CALLING.md`). Do not use it as a verification substitute.
+- No macOS or Android packaging exists in this repository; `scripts/package-macos.sh` and `package-android.sh` are intentionally absent.
+
+## Commit Discipline
+- Do not run `git commit`, `git reset`, `git checkout`, or `git stash` unless the user explicitly asks. Preserve unrelated working-tree changes.
+- Never commit API keys, credentials, model weights, generated packages, or logs/dumps. Review `git status` before handing work back.

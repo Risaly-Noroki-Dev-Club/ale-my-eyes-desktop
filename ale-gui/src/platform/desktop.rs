@@ -177,7 +177,6 @@ impl super::PlatformService for DesktopPlatform {
         PlatformCapabilities {
             image_capture: self.screen_capture.is_some(),
             automation: self.is_automation_ready(),
-            local_microphone: true,
         }
     }
 }

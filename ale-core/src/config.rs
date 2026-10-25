@@ -41,7 +41,10 @@ pub(crate) fn atomic_config_write(path: &Path, content: &[u8]) -> Result<()> {
     result
 }
 
-/// 云端API配置
+/// 云端API配置。
+///
+/// `provider` 只是 UI 预设名：已知预设会通过 [`CloudApiConfig::effective_wire_api`]
+/// 映射到唯一的传输协议；`custom`（及其它/空字符串）使用显式 `wire_api`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CloudApiConfig {
@@ -53,6 +56,26 @@ pub struct CloudApiConfig {
     pub model: String,
     pub max_tokens: usize,
     pub timeout: u32,
+}
+
+impl CloudApiConfig {
+    /// 已知 provider 预设对应的传输协议。
+    pub fn preset_wire_api(provider: &str) -> Option<crate::model_api::WireApi> {
+        match provider.trim().to_ascii_lowercase().as_str() {
+            "openai" => Some(crate::model_api::WireApi::OpenaiChatCompletions),
+            "anthropic" => Some(crate::model_api::WireApi::AnthropicMessages),
+            "google" => Some(crate::model_api::WireApi::GoogleGenerateContent),
+            _ => None,
+        }
+    }
+
+    /// 真正用于网络传输的协议。
+    ///
+    /// 预设 provider 始终映射到固定协议；`custom`/其它/空 provider 使用显式
+    /// `wire_api` 字段（默认 OpenAI Chat Completions）。
+    pub fn effective_wire_api(&self) -> crate::model_api::WireApi {
+        Self::preset_wire_api(&self.provider).unwrap_or(self.wire_api)
+    }
 }
 
 impl Default for CloudApiConfig {
@@ -123,100 +146,32 @@ impl Default for ModelSchedulerConfig {
     }
 }
 
-/// 模型配置
+/// 模型配置（本地模型只由 `ale-modeld` 管理，这里只保留模型目录）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
-    pub auto_download: bool,
-    pub max_download_size: u64,
-    pub preferred_quality: String,
-    pub offline_mode: bool,
     pub models_dir: String,
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            auto_download: false,
-            max_download_size: 500 * 1024 * 1024, // 500MB
-            preferred_quality: "balanced".to_string(),
-            offline_mode: false,
             models_dir: "models".to_string(),
         }
     }
 }
 
-/// 推理配置
+/// 推理配置（本地推理由 `ale-modeld` 提供，这里只保留模式）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InferenceConfig {
     pub mode: String, // "local", "cloud", "adaptive"
-    pub prefer_cloud: bool,
-    pub timeout: u32,
-    pub fallback_to_local: bool,
 }
 
 impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             mode: "adaptive".to_string(),
-            prefer_cloud: false,
-            timeout: 30,
-            fallback_to_local: false,
-        }
-    }
-}
-
-/// 音频配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AudioConfig {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub buffer_size: u32,
-    pub voice: String,
-    pub speed: f32,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: 16000,
-            channels: 1,
-            buffer_size: 4096,
-            voice: "default".to_string(),
-            speed: 1.0,
-        }
-    }
-}
-
-/// ASR 语音识别配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AsrConfig {
-    /// Whisper 采样策略: "greedy" 或 "beam"
-    pub sampling_strategy: String,
-    /// Beam search 宽度 (仅 beam 模式生效)
-    pub beam_size: u32,
-    /// 初始提示词，帮助模型理解上下文
-    pub initial_prompt: String,
-    /// 解码温度 (0.0 = 确定性, 越高越随机)
-    pub temperature: f32,
-    /// 强制语言 (空字符串 = auto)
-    pub language: String,
-    /// 弱语音模式：降低 VAD 阈值、延长静默等待
-    pub weak_voice_mode: bool,
-}
-
-impl Default for AsrConfig {
-    fn default() -> Self {
-        Self {
-            sampling_strategy: "greedy".to_string(),
-            beam_size: 3,
-            initial_prompt: String::new(),
-            temperature: 0.0,
-            language: String::new(),
-            weak_voice_mode: false,
         }
     }
 }
@@ -265,6 +220,19 @@ impl Default for TranscriptionConfig {
     }
 }
 
+/// 已验证任务（harness）配置：默认开启，但只在平台无障碍接口可用时生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerifiedTasksConfig {
+    pub enabled: bool,
+}
+
+impl Default for VerifiedTasksConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -274,8 +242,7 @@ pub struct AppConfig {
     pub model_scheduler: ModelSchedulerConfig,
     pub models: ModelsConfig,
     pub inference: InferenceConfig,
-    pub audio: AudioConfig,
-    pub asr: AsrConfig,
+    pub verified_tasks: VerifiedTasksConfig,
     pub ui: UiConfig,
 }
 
@@ -310,16 +277,9 @@ impl ConfigManager {
         }
 
         let content = std::fs::read_to_string(&self.config_path)?;
-        let legacy_transcription = serde_json::from_str::<serde_json::Value>(&content)?
-            .get("transcription")
-            .is_none();
+        let raw: serde_json::Value = serde_json::from_str(&content)?;
+        let legacy_transcription = raw.get("transcription").is_none();
         let mut config: AppConfig = serde_json::from_str(&content)?;
-        #[cfg(not(feature = "local-inference"))]
-        if !config.model_scheduler.enabled && config.inference.mode != "cloud" {
-            config.inference.mode = "cloud".to_string();
-            config.inference.prefer_cloud = true;
-            config.inference.fallback_to_local = false;
-        }
         if config.cloud_api.api_key.trim().is_empty() {
             config.cloud_api.api_key = self.secret_store.get_api_key()?.unwrap_or_default();
         }
@@ -333,6 +293,7 @@ impl ConfigManager {
                 enabled: !config.cloud_api.api_key.is_empty(),
                 endpoint: CloudApiConfig {
                     model: "whisper-1".into(),
+                    provider: "openai".into(),
                     wire_api: Default::default(),
                     ..config.cloud_api.clone()
                 },
@@ -343,7 +304,34 @@ impl ConfigManager {
                 .get_transcription_api_key()?
                 .unwrap_or_default();
         }
+        Self::normalize_legacy_wire_api(&mut config, &raw);
         self.update_config(config)
+    }
+
+    /// 旧配置没有显式 `wire_api` 时，用 provider 预设的协议补齐。
+    fn normalize_legacy_wire_api(config: &mut AppConfig, raw: &serde_json::Value) {
+        fn missing(endpoint: Option<&serde_json::Value>) -> bool {
+            endpoint.and_then(|value| value.get("wire_api")).is_none()
+        }
+
+        if missing(raw.get("cloud_api")) {
+            config.cloud_api.wire_api = config.cloud_api.effective_wire_api();
+        }
+        if missing(
+            raw.get("remote_routing")
+                .and_then(|value| value.get("backup")),
+        ) {
+            if let Some(backup) = config.remote_routing.backup.as_mut() {
+                backup.wire_api = backup.effective_wire_api();
+            }
+        }
+        if missing(
+            raw.get("transcription")
+                .and_then(|value| value.get("endpoint")),
+        ) {
+            config.transcription.endpoint.wire_api =
+                config.transcription.endpoint.effective_wire_api();
+        }
     }
 
     /// 保存配置
@@ -427,64 +415,6 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// 更新云端API配置
-    pub fn update_cloud_api(&mut self, config: CloudApiConfig) {
-        self.config.cloud_api = config;
-    }
-
-    /// 更新模型配置
-    pub fn update_models(&mut self, config: ModelsConfig) {
-        self.config.models = config;
-    }
-
-    /// 更新推理配置
-    pub fn update_inference(&mut self, config: InferenceConfig) {
-        self.config.inference = config;
-    }
-
-    /// 更新音频配置
-    pub fn update_audio(&mut self, config: AudioConfig) {
-        self.config.audio = config;
-    }
-
-    /// 更新界面配置
-    pub fn update_ui(&mut self, config: UiConfig) {
-        self.config.ui = config;
-    }
-
-    /// 更新 ASR 配置
-    pub fn update_asr(&mut self, config: AsrConfig) {
-        self.config.asr = config;
-    }
-
-    /// 重置为默认配置
-    pub fn reset_to_default(&mut self) {
-        self.config = AppConfig::default();
-    }
-
-    /// 验证配置
-    pub fn validate(&self) -> Result<()> {
-        // 验证云端API配置
-        if self.config.cloud_api.api_key.is_empty() {
-            return Err(AleError::ConfigError("API key is required".to_string()));
-        }
-
-        // 验证模型配置
-        if self.config.models.max_download_size == 0 {
-            return Err(AleError::ConfigError(
-                "Max download size must be greater than 0".to_string(),
-            ));
-        }
-
-        // 验证推理配置
-        ConfigValidator::validate_inference(&self.config.inference)?;
-
-        // 验证 ASR 配置
-        ConfigValidator::validate_asr(&self.config.asr)?;
-
-        Ok(())
-    }
-
     /// 获取配置文件路径
     pub fn config_path(&self) -> &Path {
         &self.config_path
@@ -504,85 +434,6 @@ impl ConfigFactory {
         let config_path = config_dir.join("config.json");
         ConfigManager::new(&config_path)
     }
-
-    /// 创建指定路径的配置管理器
-    pub fn create_with_path(config_path: &Path) -> ConfigManager {
-        ConfigManager::new(config_path)
-    }
-
-    /// 创建测试配置
-    pub fn create_test() -> ConfigManager {
-        let config_path = PathBuf::from("/tmp/ale-my-eyes-test/config.json");
-        ConfigManager::new(&config_path)
-    }
-}
-
-/// 配置迁移器
-pub struct ConfigMigrator;
-
-impl ConfigMigrator {
-    /// 迁移旧版本配置
-    pub fn migrate(config_path: &Path) -> Result<()> {
-        if !config_path.exists() {
-            return Ok(());
-        }
-
-        let content = std::fs::read_to_string(config_path)?;
-        let old_config: serde_json::Value = serde_json::from_str(&content)?;
-
-        // 检查版本
-        let version = old_config
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("1.0");
-
-        match version {
-            "1.0" => {
-                // 从 1.0 迁移到 2.0
-                Self::migrate_v1_to_v2(config_path, &old_config)?;
-            }
-            "2.0" => {
-                // 已经是最新版本
-            }
-            _ => {
-                return Err(AleError::ConfigError(format!(
-                    "Unknown config version: {}",
-                    version
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// 从 v1.0 迁移到 v2.0
-    fn migrate_v1_to_v2(config_path: &Path, old_config: &serde_json::Value) -> Result<()> {
-        // 创建新的配置结构
-        let mut new_config = AppConfig::default();
-
-        // 迁移云端API配置
-        if let Some(cloud_api) = old_config.get("cloud_api") {
-            if let Some(provider) = cloud_api.get("provider").and_then(|v| v.as_str()) {
-                new_config.cloud_api.provider = provider.to_string();
-            }
-            if let Some(api_key) = cloud_api.get("api_key").and_then(|v| v.as_str()) {
-                new_config.cloud_api.api_key = api_key.to_string();
-            }
-        }
-
-        // 迁移模型配置
-        if let Some(models) = old_config.get("models") {
-            if let Some(auto_download) = models.get("auto_download").and_then(|v| v.as_bool()) {
-                new_config.models.auto_download = auto_download;
-            }
-        }
-
-        // 保存新配置
-        let content = serde_json::to_string_pretty(&new_config)?;
-        std::fs::write(config_path, content)?;
-
-        Ok(())
-    }
 }
 
 /// 配置验证器
@@ -595,6 +446,7 @@ impl ConfigValidator {
             .chain(std::iter::once(&config.transcription.endpoint))
         {
             Self::validate_cloud_api_transport(&endpoint.api_url)?;
+            Self::validate_cloud_api_preset(endpoint)?;
             if endpoint.timeout == 0 || endpoint.timeout > 80 || endpoint.max_tokens == 0 {
                 return Err(AleError::ConfigError(
                     "Timeout must be 1-80 seconds and token limit must be positive".into(),
@@ -621,13 +473,28 @@ impl ConfigValidator {
         if config.transcription.enabled {
             Self::validate_cloud_api(&config.transcription.endpoint)?;
             if !matches!(
-                config.transcription.endpoint.wire_api,
+                config.transcription.endpoint.effective_wire_api(),
                 crate::model_api::WireApi::OpenaiChatCompletions
                     | crate::model_api::WireApi::OpenaiResponses
             ) {
                 return Err(AleError::ConfigError(
                     "Transcription requires an OpenAI-compatible endpoint".into(),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 已知 provider 预设必须使用其固定协议；要自定义协议请把 provider 设为 `custom`。
+    pub fn validate_cloud_api_preset(config: &CloudApiConfig) -> Result<()> {
+        if let Some(expected) = CloudApiConfig::preset_wire_api(&config.provider) {
+            if config.wire_api != expected {
+                return Err(AleError::ConfigError(format!(
+                    "Provider preset '{}' requires wire_api '{}' (got '{}'); choose provider 'custom' to use a different protocol",
+                    config.provider.trim(),
+                    expected.id(),
+                    config.wire_api.id()
+                )));
             }
         }
         Ok(())
@@ -694,105 +561,6 @@ impl ConfigValidator {
 
         Ok(())
     }
-
-    /// 验证模型配置
-    pub fn validate_models(config: &ModelsConfig) -> Result<()> {
-        if config.max_download_size == 0 {
-            return Err(AleError::ConfigError(
-                "Max download size must be greater than 0".to_string(),
-            ));
-        }
-
-        let valid_qualities = ["low", "balanced", "high"];
-        if !valid_qualities.contains(&config.preferred_quality.as_str()) {
-            return Err(AleError::ConfigError(format!(
-                "Invalid preferred quality: {}. Must be one of: {:?}",
-                config.preferred_quality, valid_qualities
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// 验证推理配置
-    pub fn validate_inference(config: &InferenceConfig) -> Result<()> {
-        let valid_modes = ["local", "cloud", "adaptive"];
-        if !valid_modes.contains(&config.mode.as_str()) {
-            return Err(AleError::ConfigError(format!(
-                "Invalid inference mode: {}. Must be one of: {:?}",
-                config.mode, valid_modes
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// 验证 ASR 配置
-    pub fn validate_asr(config: &AsrConfig) -> Result<()> {
-        let valid_strategies = ["greedy", "beam"];
-        if !valid_strategies.contains(&config.sampling_strategy.as_str()) {
-            return Err(AleError::ConfigError(format!(
-                "Invalid sampling strategy: '{}'. Must be one of: {:?}",
-                config.sampling_strategy, valid_strategies
-            )));
-        }
-
-        if config.beam_size == 0 {
-            return Err(AleError::ConfigError(
-                "Beam size must be greater than 0".to_string(),
-            ));
-        }
-
-        if config.beam_size > 10 {
-            return Err(AleError::ConfigError(format!(
-                "Beam size {} is too large (max 10)",
-                config.beam_size
-            )));
-        }
-
-        if !config.temperature.is_finite() || config.temperature < 0.0 || config.temperature > 2.0 {
-            return Err(AleError::ConfigError(format!(
-                "Temperature must be a finite number in [0.0, 2.0], got {}",
-                config.temperature
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// 验证完整配置
-    pub fn validate_all(config: &AppConfig) -> Result<()> {
-        Self::validate_cloud_api(&config.cloud_api)?;
-        Self::validate_models(&config.models)?;
-        Self::validate_inference(&config.inference)?;
-        Self::validate_asr(&config.asr)?;
-        if config.remote_routing.backup_enabled {
-            let backup = config.remote_routing.backup.as_ref().ok_or_else(|| {
-                AleError::ConfigError(
-                    "Backup cloud endpoint is enabled but not configured".to_string(),
-                )
-            })?;
-            Self::validate_cloud_api(backup)?;
-            if !config.remote_routing.backup_pre_authorized {
-                return Err(AleError::ConfigError(
-                    "Backup cloud endpoint requires explicit pre-authorization".to_string(),
-                ));
-            }
-        }
-        if config.model_scheduler.idle_ttl_seconds == 0 {
-            return Err(AleError::ConfigError(
-                "Model scheduler idle TTL must be greater than zero".to_string(),
-            ));
-        }
-
-        if config.ui.font_size == 0 {
-            return Err(AleError::ConfigError(
-                "Font size must be greater than 0".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -845,6 +613,10 @@ mod tests {
         }
     }
 
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ale-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
     #[test]
     fn test_default_config() {
         let config = AppConfig::default();
@@ -856,11 +628,13 @@ mod tests {
         assert_eq!(config.ui.language, "zh-CN");
         assert_eq!(config.ui.font_size, 16);
         assert!(!config.ui.high_contrast);
+        assert!(config.verified_tasks.enabled);
+        assert_eq!(config.models.models_dir, "models");
     }
 
     #[test]
     fn transcription_migrates_once_and_credentials_remain_independent() {
-        let dir = std::env::temp_dir().join(format!("ale-migration-{}", uuid::Uuid::new_v4()));
+        let dir = temp_dir("migration");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
         std::fs::write(&path, r#"{"cloud_api":{"api_key":"legacy-key","api_url":"https://example.test/v1","model":"vision"}}"#).unwrap();
@@ -869,6 +643,7 @@ mod tests {
         manager.load().unwrap();
         assert!(manager.config().transcription.enabled);
         assert_eq!(manager.config().transcription.endpoint.model, "whisper-1");
+        assert_eq!(manager.config().transcription.endpoint.provider, "openai");
         assert_eq!(
             store.get_transcription_api_key().unwrap().as_deref(),
             Some("legacy-key")
@@ -876,9 +651,12 @@ mod tests {
         let mut updated = manager.config().clone();
         updated.cloud_api.api_key = "primary-secret-unique".into();
         updated.cloud_api.api_url = "https://new-primary.test/v1".into();
+        updated.cloud_api.provider = "anthropic".into();
         updated.cloud_api.wire_api = crate::model_api::WireApi::AnthropicMessages;
         updated.remote_routing.backup = Some(CloudApiConfig {
             api_key: "backup-key".into(),
+            provider: "custom".into(),
+            wire_api: crate::model_api::WireApi::OpenaiResponses,
             ..Default::default()
         });
         manager.update_config(updated).unwrap();
@@ -911,8 +689,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_atomic_save_rolls_back_all_credentials_and_memory() {
-        let dir = std::env::temp_dir().join(format!("ale-rollback-{}", uuid::Uuid::new_v4()));
+    fn failed_atomic_save_rolls_back_all_credentials() {
+        let dir = temp_dir("rollback");
         let path = dir.join("config.json");
         let store = Arc::new(TestSecretStore::default());
         let mut manager = ConfigManager::with_secret_store(&path, store.clone());
@@ -977,6 +755,125 @@ mod tests {
         assert_eq!(restored.cloud_api.provider, config.cloud_api.provider);
         assert_eq!(restored.cloud_api.api_url, config.cloud_api.api_url);
         assert_eq!(restored.ui.language, config.ui.language);
+        assert_eq!(
+            restored.verified_tasks.enabled,
+            config.verified_tasks.enabled
+        );
+    }
+
+    #[test]
+    fn verified_tasks_default_to_enabled_for_old_configs() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"cloud_api":{"api_key":"sk-test"}}"#).unwrap();
+        assert!(config.verified_tasks.enabled);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"verified_tasks\""));
+        assert!(json.contains("\"enabled\":true"));
+
+        let disabled: AppConfig =
+            serde_json::from_str(r#"{"verified_tasks":{"enabled":false}}"#).unwrap();
+        assert!(!disabled.verified_tasks.enabled);
+        let restored: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.verified_tasks.enabled);
+    }
+
+    #[test]
+    fn provider_presets_map_to_effective_wire_api() {
+        for (provider, expected) in [
+            ("openai", crate::model_api::WireApi::OpenaiChatCompletions),
+            ("Anthropic", crate::model_api::WireApi::AnthropicMessages),
+            (" google ", crate::model_api::WireApi::GoogleGenerateContent),
+        ] {
+            let config = CloudApiConfig {
+                provider: provider.into(),
+                wire_api: crate::model_api::WireApi::OpenaiResponses,
+                ..Default::default()
+            };
+            assert_eq!(config.effective_wire_api(), expected);
+        }
+    }
+
+    #[test]
+    fn custom_provider_keeps_explicit_wire_api() {
+        for provider in ["custom", "azure", "", "my-provider"] {
+            let config = CloudApiConfig {
+                provider: provider.into(),
+                wire_api: crate::model_api::WireApi::GoogleGenerateContent,
+                ..Default::default()
+            };
+            assert_eq!(
+                config.effective_wire_api(),
+                crate::model_api::WireApi::GoogleGenerateContent
+            );
+        }
+    }
+
+    #[test]
+    fn preset_wire_api_conflict_is_rejected() {
+        let mut config = AppConfig::default();
+        config.cloud_api.provider = "anthropic".into();
+        config.cloud_api.wire_api = crate::model_api::WireApi::OpenaiChatCompletions;
+        let error = ConfigValidator::validate_model_endpoints(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("anthropic_messages"), "{error}");
+
+        config.cloud_api.provider = "custom".into();
+        assert!(ConfigValidator::validate_model_endpoints(&config).is_ok());
+    }
+
+    #[test]
+    fn backup_endpoint_preset_conflict_is_rejected() {
+        let mut config = AppConfig::default();
+        config.remote_routing.backup = Some(CloudApiConfig {
+            provider: "google".into(),
+            wire_api: crate::model_api::WireApi::OpenaiChatCompletions,
+            ..Default::default()
+        });
+        assert!(ConfigValidator::validate_model_endpoints(&config).is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_wire_api_is_normalized_from_provider() {
+        let dir = temp_dir("normalize");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "cloud_api": {"provider": "anthropic", "api_key": "sk-test", "api_url": "https://api.anthropic.test/v1", "model": "claude", "max_tokens": 1024, "timeout": 30},
+  "inference": {"mode": "adaptive"},
+  "ui": {"language": "zh-CN"}
+}"#,
+        )
+        .unwrap();
+        let mut manager =
+            ConfigManager::with_secret_store(&path, Arc::new(TestSecretStore::default()));
+        manager.load().unwrap();
+        assert_eq!(
+            manager.config().cloud_api.wire_api,
+            crate::model_api::WireApi::AnthropicMessages
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_conflicting_wire_api_is_not_silently_normalized() {
+        let dir = temp_dir("explicit-conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "cloud_api": {"provider": "anthropic", "wire_api": "openai_chat_completions", "api_key": "sk-test", "api_url": "https://api.anthropic.test/v1", "model": "claude", "max_tokens": 1024, "timeout": 30}
+}"#,
+        )
+        .unwrap();
+        let mut manager =
+            ConfigManager::with_secret_store(&path, Arc::new(TestSecretStore::default()));
+        assert!(manager.load().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1042,34 +939,14 @@ mod tests {
 
     #[test]
     fn config_save_rejects_public_http_after_direct_section_update() {
-        let dir = std::env::temp_dir().join(format!("ale-config-http-{}", uuid::Uuid::new_v4()));
+        let dir = temp_dir("config-http");
         let path = dir.join("config.json");
         let mut manager =
             ConfigManager::with_secret_store(&path, Arc::new(TestSecretStore::default()));
-        manager.update_cloud_api(CloudApiConfig {
-            api_url: "http://example.com/v1".to_string(),
-            ..Default::default()
-        });
+        manager.config.cloud_api.api_url = "http://example.com/v1".to_string();
 
         assert!(manager.save().is_err());
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn test_validate_inference_invalid_mode() {
-        let config = InferenceConfig {
-            mode: "invalid".to_string(),
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_inference(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_all_valid() {
-        let config = AppConfig::default();
-        let mut config = config;
-        config.cloud_api.api_key = "sk-test".to_string();
-        assert!(ConfigValidator::validate_all(&config).is_ok());
     }
 
     #[test]
@@ -1079,6 +956,7 @@ mod tests {
         let mut manager = ConfigManager::new(&path);
         manager.load().unwrap();
         assert_eq!(manager.config().cloud_api.provider, "openai");
+        assert!(manager.config().verified_tasks.enabled);
         assert!(path.exists());
         let _ = std::fs::remove_file(&path);
     }
@@ -1136,6 +1014,8 @@ mod tests {
         manager.load().unwrap();
 
         assert!(manager.config().ui.auto_speak);
+        assert_eq!(manager.config().models.models_dir, "models");
+        assert_eq!(manager.config().inference.mode, "adaptive");
         assert_eq!(
             secret_store.get_api_key().unwrap().as_deref(),
             Some("sk-test")
@@ -1154,74 +1034,13 @@ mod tests {
         assert_eq!(config.cloud_api.api_key, "sk-test");
         assert_eq!(config.cloud_api.provider, "openai");
         assert_eq!(config.inference.mode, "adaptive");
-        assert_eq!(config.audio.sample_rate, 16000);
         assert!(config.ui.auto_speak);
-    }
-
-    #[test]
-    fn test_validate_asr_valid_defaults() {
-        let config = AsrConfig::default();
-        assert!(ConfigValidator::validate_asr(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_asr_rejects_bad_strategy() {
-        let config = AsrConfig {
-            sampling_strategy: "top_k".to_string(),
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_asr(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_asr_rejects_zero_beam_size() {
-        let config = AsrConfig {
-            sampling_strategy: "beam".to_string(),
-            beam_size: 0,
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_asr(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_asr_rejects_nan_temperature() {
-        let config = AsrConfig {
-            temperature: f32::NAN,
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_asr(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_asr_rejects_excessive_temperature() {
-        let config = AsrConfig {
-            temperature: 5.0,
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_asr(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_asr_rejects_large_beam_size() {
-        let config = AsrConfig {
-            sampling_strategy: "beam".to_string(),
-            beam_size: 20,
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate_asr(&config).is_err());
-    }
-
-    #[test]
-    fn test_validate_all_includes_asr() {
-        let mut config = AppConfig::default();
-        config.cloud_api.api_key = "sk-test".to_string();
-        config.asr.temperature = f32::INFINITY;
-        assert!(ConfigValidator::validate_all(&config).is_err());
+        assert!(config.verified_tasks.enabled);
     }
 
     #[test]
     fn config_file_io_stress_preserves_latest_value_and_redacts_secret() {
-        let dir = std::env::temp_dir().join(format!("ale-config-stress-{}", uuid::Uuid::new_v4()));
+        let dir = temp_dir("config-stress");
         let path = dir.join("config.json");
         let secret_store = Arc::new(TestSecretStore::default());
         let mut manager = ConfigManager::with_secret_store(&path, secret_store.clone());
