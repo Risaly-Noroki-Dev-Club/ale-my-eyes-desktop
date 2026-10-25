@@ -126,6 +126,8 @@ impl Operation {
 pub struct Step {
     pub target_id: String,
     pub operation: Operation,
+    /// Exact postconditions, or empty for a host-enabled observe/replan Invoke.
+    /// An observed UI change permits another decision, never task completion.
     pub expected: Vec<Predicate>,
     pub explanation: String,
 }
@@ -173,6 +175,11 @@ pub struct Task {
     pub allowed_operations: Vec<OperationKind>,
     /// Explicit permission to disclose the structured observations to a cloud planner.
     pub allow_cloud: bool,
+    /// Host-owned opt-in for Invoke steps whose effects are not known in advance.
+    /// Authorization still applies to each target and action. Legacy tasks remain
+    /// strict when this field is absent from persisted reports.
+    #[serde(default)]
+    pub allow_observation_steps: bool,
     pub limits: Limits,
 }
 
@@ -199,6 +206,10 @@ pub struct Attempt {
     pub step: Step,
     pub receipt: Receipt,
     pub verdict: Verdict,
+    /// The UI changed after a confirmed dispatch, independently of any predicted
+    /// postcondition. This is progress evidence, not verified task success.
+    #[serde(default)]
+    pub observation_changed: bool,
 }
 
 #[derive(Serialize)]
@@ -282,6 +293,11 @@ pub enum Event {
         action_id: String,
         sequence: u64,
         verdict: Verdict,
+    },
+    ObservationChecked {
+        action_id: String,
+        sequence: u64,
+        changed: bool,
     },
     Stopped {
         status: Status,
@@ -436,6 +452,28 @@ fn valid_conditions(conditions: &[Predicate]) -> bool {
         })
 }
 
+/// Acquisition sequences, transient node IDs and enumeration order do not prove
+/// UI progress. Compare the semantic state the planner actually observed.
+fn same_ui_state(left: &Observation, right: &Observation) -> bool {
+    fn nodes(observation: &Observation) -> Vec<(&str, &str, bool, &BTreeMap<String, String>)> {
+        let mut nodes: Vec<_> = observation
+            .nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.role.as_str(),
+                    node.label.as_str(),
+                    node.enabled,
+                    &node.properties,
+                )
+            })
+            .collect();
+        nodes.sort_unstable();
+        nodes
+    }
+    left.window == right.window && nodes(left) == nodes(right)
+}
+
 /// Run one explicitly scoped task. No retries or resume occur outside this call.
 pub async fn run(
     task: &Task,
@@ -490,6 +528,9 @@ pub async fn run(
         );
     }
     let mut failures = 0;
+    // Never replay an exploratory Invoke after returning to the same semantic
+    // state, even if an adapter reassigned node IDs or reordered its tree.
+    let mut observed_invocations: Vec<(Observation, String, String)> = Vec::new();
     loop {
         let observation = match run.observe(environment).await {
             Ok(observation) => observation,
@@ -541,7 +582,10 @@ pub async fn run(
         if !task.allowed_operations.contains(&step.operation.kind()) {
             return run.finish(Status::NeedsUser, "Operation is outside the task grant");
         }
-        if !valid_conditions(&step.expected)
+        let observation_step = task.allow_observation_steps
+            && step.expected.is_empty()
+            && matches!(step.operation, Operation::Invoke);
+        if (!observation_step && !valid_conditions(&step.expected))
             || step.explanation.trim().is_empty()
             || matches!(&step.operation, Operation::SetValue { value } if value.len() > 4096)
             || !observation
@@ -553,6 +597,23 @@ pub async fn run(
                 Status::NeedsUser,
                 "Invalid step, disabled target or missing target",
             );
+        }
+        if matches!(step.operation, Operation::Invoke) {
+            let target = observation
+                .nodes
+                .iter()
+                .find(|node| node.id == step.target_id)
+                .unwrap();
+            if observed_invocations.iter().any(|(before, role, label)| {
+                same_ui_state(before, &observation)
+                    && role == &target.role
+                    && label == &target.label
+            }) {
+                return run.finish(
+                    Status::NeedsUser,
+                    "Exploratory invocation would repeat in an already visited state",
+                );
+            }
         }
         if verify(&observation, &step.expected) == Verdict::Satisfied {
             return run.finish(
@@ -611,6 +672,7 @@ pub async fn run(
         let effect_possible = !matches!(receipt, Receipt::NotApplied(_));
         let mut verdict = Verdict::Unknown;
         let mut goal_met = false;
+        let mut observation_changed = false;
         for read in 0..limits.verification_reads {
             if read > 0 {
                 if let Err(error) = run
@@ -625,22 +687,53 @@ pub async fn run(
                 Err(stop) => return run.stopped(stop, effect_possible),
             };
             verdict = verify(&after, &request.step.expected);
-            run.report.events.push(Event::StepChecked {
-                action_id: request.id.clone(),
-                sequence: after.sequence,
-                verdict: verdict.clone(),
-            });
+            if !observation_step {
+                run.report.events.push(Event::StepChecked {
+                    action_id: request.id.clone(),
+                    sequence: after.sequence,
+                    verdict: verdict.clone(),
+                });
+            }
             goal_met = run.goal(&after) == Verdict::Satisfied;
-            if goal_met || verdict == Verdict::Satisfied {
+            // Only a confirmed dispatch may use this evidence to replan. A
+            // changed UI cannot resolve an Uncertain receipt or widen a grant.
+            observation_changed = !same_ui_state(&request.observation, &after);
+            if observation_step {
+                run.report.events.push(Event::ObservationChecked {
+                    action_id: request.id.clone(),
+                    sequence: after.sequence,
+                    changed: observation_changed,
+                });
+            }
+            if goal_met
+                || verdict == Verdict::Satisfied
+                || (observation_step
+                    && matches!(receipt, Receipt::Dispatched)
+                    && observation_changed)
+            {
                 break;
             }
         }
         let repeat_safe = request.step.operation.repeat_safe();
+        if observation_step && matches!(receipt, Receipt::Dispatched) {
+            let target = request
+                .observation
+                .nodes
+                .iter()
+                .find(|node| node.id == request.step.target_id)
+                .unwrap();
+            observed_invocations.push((
+                request.observation.clone(),
+                target.role.clone(),
+                target.label.clone(),
+            ));
+        }
         run.report.attempts.push(Attempt {
             action_id: request.id,
             step: request.step,
             receipt: receipt.clone(),
             verdict: verdict.clone(),
+            observation_changed,
         });
         if goal_met {
             return run.finish(Status::Completed, "Task goal verified after action");
@@ -652,7 +745,9 @@ pub async fn run(
                 "Input outcome uncertain; task goal not verified; do not replay",
             );
         }
-        if verdict == Verdict::Satisfied {
+        if verdict == Verdict::Satisfied
+            || (observation_step && matches!(receipt, Receipt::Dispatched) && observation_changed)
+        {
             failures = 0;
         } else {
             failures += 1;
@@ -674,3 +769,6 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod observation_tests;

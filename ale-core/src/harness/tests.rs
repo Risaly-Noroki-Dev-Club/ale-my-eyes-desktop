@@ -1,7 +1,7 @@
 use super::*;
 use simulation::{predicate, task, Desktop, Scenario, SettingsGrant, SettingsPlanner};
 
-async fn run_with(
+pub(super) async fn run_with(
     task: &Task,
     planner: &mut dyn Planner,
     desktop: &mut dyn Environment,
@@ -131,7 +131,7 @@ async fn foreground_change_after_input_is_an_unknown_outcome() {
     assert_eq!(desktop.dispatches, 1);
 }
 
-struct FixedPlanner(Decision);
+pub(super) struct FixedPlanner(pub(super) Decision);
 #[async_trait]
 impl Planner for FixedPlanner {
     async fn decide(&mut self, _: PlannerContext<'_>) -> Result<Decision, String> {
@@ -139,7 +139,7 @@ impl Planner for FixedPlanner {
     }
 }
 
-struct FixedAuth(Approval);
+pub(super) struct FixedAuth(pub(super) Approval);
 #[async_trait]
 impl Authorizer for FixedAuth {
     async fn authorize(&mut self, _: &Task, _: &ActionRequest) -> Approval {
@@ -147,7 +147,7 @@ impl Authorizer for FixedAuth {
     }
 }
 
-fn first_step() -> Step {
+pub(super) fn first_step() -> Step {
     Step {
         target_id: "menu".into(),
         operation: Operation::Invoke,
@@ -623,7 +623,7 @@ async fn cloud_disclosure_requires_explicit_task_permission() {
     assert_eq!(desktop.observations, 0);
 }
 
-fn cloud_response(arguments: serde_json::Value) -> serde_json::Value {
+pub(super) fn cloud_response(arguments: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"decision","type":"function","function":{"name":"next_task_step","arguments":arguments.to_string()}}]}}]})
 }
 

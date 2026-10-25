@@ -262,6 +262,7 @@ mod tests {
             step: step.to_harness_step("0/1"),
             receipt,
             verdict,
+            observation_changed: false,
         }
     }
 

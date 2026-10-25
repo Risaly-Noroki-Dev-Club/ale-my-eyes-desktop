@@ -538,6 +538,7 @@ pub fn build_task(
         success: vec![last.expected.clone()],
         allowed_operations,
         allow_cloud,
+        allow_observation_steps: false,
         limits: Limits::default(),
     })
 }
@@ -736,6 +737,15 @@ pub fn event_progress(event: &Event) -> Option<(ProgressStage, String)> {
                 "界面暂未反映变化，正在继续读取".to_string(),
             )
         }),
+        Event::ObservationChecked { changed, .. } => Some((
+            ProgressStage::VerifiedVerify,
+            if *changed {
+                "界面已变化，正在根据新观察重新判断"
+            } else {
+                "尚未观察到界面变化，正在继续读取"
+            }
+            .to_string(),
+        )),
         Event::Stopped { .. } => None,
     }
 }

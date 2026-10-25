@@ -57,6 +57,7 @@ pub fn task(name: &str) -> Result<Task, String> {
         success: vec![predicate(label, "value", value)],
         allowed_operations: vec![OperationKind::Invoke, OperationKind::SetValue],
         allow_cloud: false,
+        allow_observation_steps: false,
         limits: Limits {
             settle_ms: 1,
             ..Default::default()
