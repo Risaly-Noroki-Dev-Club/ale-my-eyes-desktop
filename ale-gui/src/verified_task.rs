@@ -488,9 +488,9 @@ fn validated_text(
 /// Length check for a value that is written literally (set_value). Leading and
 /// trailing whitespace is meaningful here and is never stripped.
 fn validated_exact_value(field: &str, value: String) -> Result<String, VerifiedTaskError> {
-    if value.is_empty() {
-        return Err(invalid("EMPTY_FIELD", field, "must not be empty"));
-    }
+    // An exact replacement with an empty string is a legitimate clear; the
+    // value is otherwise preserved byte-for-byte (no trimming) so it matches
+    // the untrimmed `expected.equals` readback.
     if value.chars().count() > MAX_VALUE_CHARS {
         return Err(invalid(
             "FIELD_TOO_LONG",
