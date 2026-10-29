@@ -1,4 +1,4 @@
-use ale_core::remote::RemoteMessage;
+use ale_core::remote::{RemoteMessage, PAIRING_CODE_ALPHABET, PAIRING_CODE_CHARS};
 use snow::{Builder, TransportState};
 
 const NOISE_PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
@@ -147,8 +147,21 @@ impl SecureChannel {
     }
 }
 
+/// Generate an eight-character Crockford Base32 pairing code.
+///
+/// The code carries 40 bits from `rand`'s OS-seeded CSPRNG and is emitted in
+/// upper case; the ambiguous characters `I`, `L`, `O` and `U` are never
+/// produced. Android accepts the code case-insensitively and normalizes it
+/// before deriving the Noise PSK (`ale-core/src/remote.rs`).
 pub fn pairing_code() -> String {
-    format!("{:06}", rand::random::<u32>() % 1_000_000)
+    let mut bits = rand::random::<u64>();
+    (0..PAIRING_CODE_CHARS)
+        .map(|_| {
+            let index = (bits & 0x1f) as usize;
+            bits >>= 5;
+            char::from(PAIRING_CODE_ALPHABET[index])
+        })
+        .collect()
 }
 
 pub fn session_id() -> String {
@@ -289,7 +302,7 @@ mod tests {
 
     #[test]
     fn roundtrips_fragmented_encrypted_message() {
-        let (mut sender, mut receiver) = secure_channel_pair("123456");
+        let (mut sender, mut receiver) = secure_channel_pair("7Q2M9X4B");
         let message = RemoteMessage::Error(RemoteError {
             request_id: Some("stress".to_string()),
             code: "STRESS".to_string(),
@@ -316,7 +329,7 @@ mod tests {
 
     #[test]
     fn rejects_reassembled_message_over_limit_before_json_parse() {
-        let (mut sender, mut receiver) = secure_channel_pair("123456");
+        let (mut sender, mut receiver) = secure_channel_pair("7Q2M9X4B");
         let message = RemoteMessage::Error(ale_core::remote::RemoteError {
             request_id: None,
             code: "TEST".to_string(),
@@ -335,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_noise_preview_confirm_status_integration() {
-        let code = "654321";
+        let code = "M4SKN7Q2";
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -475,14 +488,46 @@ mod tests {
     #[test]
     fn misaka_v4_wire_constants_are_pinned() {
         assert_eq!(CHUNK_MAGIC, b"MSKN");
-        let psk = psk_from_code("123456");
+        let psk = psk_from_code("7Q2M9X4B");
         assert_eq!(
             psk,
             [
-                0x10, 0xb8, 0x2c, 0x86, 0x6c, 0xdc, 0x0a, 0xa8, 0x54, 0x60, 0x13, 0x48, 0x3a, 0x93,
-                0xd7, 0x61, 0x7e, 0xa2, 0x9e, 0x82, 0xca, 0xc2, 0x3d, 0x41, 0xd0, 0xc5, 0x49, 0xd5,
-                0x13, 0xb1, 0xb2, 0xf6
+                0x4a, 0xcd, 0xbc, 0x52, 0x7b, 0x69, 0xb9, 0x40, 0x7c, 0x5c, 0x9f, 0x36, 0xc7, 0xb2,
+                0x27, 0x1f, 0xb1, 0xfc, 0x49, 0xf1, 0x8b, 0xf1, 0x97, 0x54, 0x6a, 0x09, 0xe1, 0xf9,
+                0xf7, 0x31, 0x84, 0x33
             ]
         );
+    }
+
+    #[test]
+    fn pairing_codes_are_eight_crockford_characters() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let code = pairing_code();
+            assert_eq!(code.len(), PAIRING_CODE_CHARS);
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+                "pairing code {code:?} must be upper-case ASCII"
+            );
+            assert!(
+                code.bytes()
+                    .all(|byte| PAIRING_CODE_ALPHABET.contains(&byte)),
+                "pairing code {code:?} must stay inside the Crockford alphabet"
+            );
+            assert!(
+                !code
+                    .bytes()
+                    .any(|byte| matches!(byte, b'I' | b'L' | b'O' | b'U')),
+                "ambiguous character in pairing code {code:?}"
+            );
+            assert_eq!(
+                ale_core::remote::normalize_pairing_code(&code).as_deref(),
+                Some(code.as_str()),
+                "generated pairing code must pass the shared validator"
+            );
+            seen.insert(code);
+        }
+        assert!(seen.len() > 32, "pairing codes must not repeat trivially");
     }
 }

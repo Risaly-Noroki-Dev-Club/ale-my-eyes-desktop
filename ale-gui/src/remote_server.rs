@@ -55,6 +55,11 @@ const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_TEXT_BYTES: usize = 8 * 1024;
 const MAX_PENDING_PLANS: usize = 16;
 const PENDING_PLAN_TTL: Duration = Duration::from_secs(120);
+/// `CommandPreview.task_mode` for the legacy plan-then-execute path.
+const TASK_MODE_LEGACY: &str = "legacy";
+/// How long a cancelled execution may take to report its terminal result before
+/// the host reports `outcome_unknown` (input may already have been issued).
+const CANCEL_SETTLE_WINDOW: Duration = Duration::from_secs(3);
 const MAX_REQUESTS_PER_MINUTE: usize = 30;
 const MAX_TRACKED_REQUEST_CLIENTS: usize = 256;
 const MAX_PAIRING_FAILURES_PER_MINUTE: usize = 5;
@@ -305,7 +310,10 @@ impl RemoteServerHandle {
 
     #[cfg(test)]
     pub fn refresh_pairing(&self) {
-        let mut credentials = self.credentials.lock().unwrap();
+        let mut credentials = self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         credentials.info.code = remote_crypto::pairing_code();
         credentials.expires = Instant::now() + Duration::from_secs(120);
     }
@@ -338,6 +346,9 @@ struct DeferredRequest {
 struct ProcessingRequest {
     request_id: String,
     task: JoinHandle<()>,
+    /// Original payload, kept so a `DecisionRequired` reply from modeld can be
+    /// retried after the user approves the remote fallback.
+    retry_payload: Option<RequestPayload>,
 }
 
 impl Drop for ProcessingRequest {
@@ -354,7 +365,7 @@ struct ProcessingResult {
 struct RemoteExecution {
     request_id: String,
     control: ExecutionControl,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
     /// Present for verified runs: signals the runner's `watch` cancellation
     /// before the task is aborted.
     verified_cancel: Option<watch::Sender<bool>>,
@@ -366,7 +377,17 @@ impl Drop for RemoteExecution {
         if let Some(cancel) = self.verified_cancel.take() {
             let _ = cancel.send(true);
         }
-        self.task.abort();
+        // Cooperative cancel first, abort later: aborting immediately can hide an
+        // action that was already dispatched and would otherwise be reported as
+        // not applied. The runner gets a short window to publish its terminal
+        // status; cancellation checkpoints in the adapter make that window
+        // effective without blocking the connection loop.
+        if let Some(task) = self.task.take() {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                task.abort();
+            });
+        }
     }
 }
 
@@ -464,6 +485,24 @@ impl Drop for RemoteServerHandle {
         // Dropping the join handle detaches the task so it can unregister mDNS
         // and exit after receiving the shutdown signal.
         self.task.take();
+        // The GUI owns modeld's lifecycle. Ask it to shut down (which stops its
+        // llama-server workers) instead of relying on the SIGKILL fallback that
+        // `ModeldProcess::drop` performs; a dedicated thread bridges the sync
+        // Drop into the async shutdown with a bounded wait.
+        if let Some(modeld) = self.modeld.take() {
+            std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let _ = runtime.block_on(tokio::time::timeout(
+                    Duration::from_secs(4),
+                    modeld.shutdown(),
+                ));
+            });
+        }
     }
 }
 
@@ -518,22 +557,36 @@ pub async fn start(engine: Arc<Mutex<AleEngine>>) -> Result<RemoteServerHandle, 
     } else {
         None
     };
+    // modeld's first capability probe runs asynchronously after configure, so a
+    // single immediate health read can observe empty capabilities. Poll with a
+    // bounded deadline instead of freezing "local unavailable" for the session.
     let local_planning_available = if let Some(client) = &modeld {
-        client
-            .health()
-            .await
-            .map(|health| {
-                health
-                    .available_capabilities
-                    .contains(&ModelCapability::LocalPlanning)
-                    && health
+        let probe = async {
+            loop {
+                if let Ok(health) = client.health_fresh().await {
+                    if health
                         .available_capabilities
-                        .contains(&ModelCapability::ElementGrounding)
-            })
+                        .contains(&ModelCapability::LocalPlanning)
+                        && health
+                            .available_capabilities
+                            .contains(&ModelCapability::ElementGrounding)
+                    {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(3), probe)
+            .await
             .unwrap_or(false)
     } else {
         false
     };
+    ale_core::diagnostics::record(
+        "local_planning_capability",
+        &[("available", u64::from(local_planning_available))],
+    );
     let server_pairing = pairing.clone();
     let credentials = Arc::new(std::sync::Mutex::new(PairingCredentials {
         info: pairing.clone(),
@@ -748,7 +801,9 @@ async fn handle_connection(
         return Err("INVALID_HANDSHAKE".to_string());
     }
     let credential_code = {
-        let credentials = credentials.lock().unwrap();
+        let credentials = credentials
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if credentials.expires <= Instant::now() {
             return Err("PAIRING_EXPIRED".into());
         }
@@ -855,6 +910,43 @@ async fn handle_connection(
                     .as_ref()
                     .is_some_and(|request| request.request_id == result.request_id)
                 {
+                    if matches!(
+                        &result.outcome,
+                        ProcessingOutcome::Error { code, .. } if *code == "DECISION_REQUIRED"
+                    ) {
+                        // modeld needs the user to choose the cloud fallback. The
+                        // retry keeps the original payload so the decision moves
+                        // the request forward instead of failing with an internal
+                        // scheduler error.
+                        if let Some(mut request) = processing.take() {
+                            // `ProcessingRequest` implements `Drop`, so its fields
+                            // must be taken out instead of moved.
+                            let retry_payload = request.retry_payload.take();
+                            if let Some(payload) = retry_payload {
+                                let request_id = request.request_id.clone();
+                                let prompt = match &payload {
+                                    RequestPayload::AudioWav(_) => {
+                                        "本地语音转写不可用。是否允许将本次录音上传到远端转写，并改用远端大模型？"
+                                    }
+                                    RequestPayload::Text(_) => {
+                                        "本地模型不可用。是否改用远端大模型？"
+                                    }
+                                };
+                                deferred = Some(
+                                    send_decision_request(
+                                        &mut socket,
+                                        &mut secure,
+                                        request_id,
+                                        payload,
+                                        DecisionKind::UseRemoteModel,
+                                        prompt,
+                                    )
+                                    .await?,
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     if !matches!(&result.outcome, ProcessingOutcome::Progress(_, _)) {
                         processing.take();
                     }
@@ -946,18 +1038,39 @@ async fn handle_connection(
                 }
                 cancelled.sort();
                 cancelled.dedup();
+                let execution_id = execution.as_ref().map(|request| request.request_id.clone());
                 active_audio = None;
                 processing.take();
-                execution.take();
                 deferred.take();
                 pending = PendingPlans::new(MAX_PENDING_PLANS, PENDING_PLAN_TTL);
-                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                if let Some(session) = hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions
+                    .get_mut(&connection_id)
+                {
                     session.paused = value;
                     session.task = if value { "Paused" } else { "Ready" }.into();
                     session.decision = None;
                 }
                 hub.log(&connection_id, if value { "Paused" } else { "Ready" });
+                // A running execution is cancelled cooperatively so it can report
+                // its real terminal state (Cancelled/OutcomeUnknown) instead of a
+                // blanket error that hides a possibly-dispatched action.
+                if execution.is_some() {
+                    cancel_execution_cooperatively(
+                        &mut execution,
+                        &mut execution_rx,
+                        &mut socket,
+                        &mut secure,
+                    )
+                    .await?;
+                }
                 for request_id in cancelled {
+                    if execution_id.as_deref() == Some(request_id.as_str()) {
+                        continue;
+                    }
                     send_remote_error(
                         &mut socket,
                         &mut secure,
@@ -975,8 +1088,12 @@ async fn handle_connection(
                 if let Message::Pong(payload) = &frame {
                     if let Some((nonce, sent)) = &ping {
                         if payload == nonce {
-                            if let Some(session) =
-                                hub.0.lock().unwrap().sessions.get_mut(&connection_id)
+                            if let Some(session) = hub
+                                .0
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .sessions
+                                .get_mut(&connection_id)
                             {
                                 session.latency =
                                     Some((sent.elapsed().as_millis() as u64, Instant::now()));
@@ -1049,26 +1166,32 @@ async fn handle_connection(
                 }
                 if !authenticated {
                     {
-                        let current = credentials.lock().unwrap();
+                        let current = credentials
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner());
                         if current.expires <= Instant::now() || current.info.code != credential_code
                         {
                             return Err("PAIRING_EXPIRED".into());
                         }
                     }
                     authenticated = true;
-                    hub.0.lock().unwrap().sessions.insert(
-                        connection_id.clone(),
-                        Session {
-                            name: device_name.chars().take(100).collect(),
-                            address: addr.ip().to_string(),
-                            paused: false,
-                            task: "Ready".into(),
-                            output: String::new(),
-                            latency: None,
-                            decision: None,
-                            controls: controls_tx.clone(),
-                        },
-                    );
+                    hub.0
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .sessions
+                        .insert(
+                            connection_id.clone(),
+                            Session {
+                                name: device_name.chars().take(100).collect(),
+                                address: addr.ip().to_string(),
+                                paused: false,
+                                task: "Ready".into(),
+                                output: String::new(),
+                                latency: None,
+                                decision: None,
+                                controls: controls_tx.clone(),
+                            },
+                        );
                     hub.log(&connection_id, "Connected");
                 }
                 true
@@ -1089,13 +1212,19 @@ async fn handle_connection(
                     send_remote_error(&mut socket, &mut secure, Some(request_id), code, message)
                         .await?;
                     true
-                } else if deferred.is_some() || processing.is_some() || execution.is_some() {
+                } else if deferred.is_some()
+                    || processing.is_some()
+                    || execution.is_some()
+                    || !pending.plans.is_empty()
+                {
+                    // One plan/task per session: a pending confirmation, a
+                    // running planning stage and an execution must not overlap.
                     send_remote_error(
                         &mut socket,
                         &mut secure,
                         Some(request_id),
                         "SERVER_BUSY",
-                        "当前连接正在处理另一请求",
+                        "当前连接已有待确认计划或正在处理另一请求",
                     )
                     .await?;
                     true
@@ -1122,6 +1251,8 @@ async fn handle_connection(
                         )
                         .await?;
                     } else if local_planning_available && !explicit_cloud_mode {
+                        let allow_remote_transcription =
+                            engine.lock().await.config().transcription.enabled;
                         match start_remote_request(
                             engine.clone(),
                             platform.clone(),
@@ -1132,6 +1263,7 @@ async fn handle_connection(
                             processing_tx.clone(),
                             false,
                             false,
+                            allow_remote_transcription,
                             true,
                         ) {
                             Ok(request) => processing = Some(request),
@@ -1189,6 +1321,7 @@ async fn handle_connection(
                     || deferred.is_some()
                     || processing.is_some()
                     || execution.is_some()
+                    || !pending.plans.is_empty()
                 {
                     send_remote_error(
                         &mut socket,
@@ -1227,16 +1360,25 @@ async fn handle_connection(
             }
             RemoteMessage::AudioEnd(end) => {
                 let request_id = end.request_id.clone();
-                let result = active_audio
-                    .take()
-                    .ok_or_else(|| {
-                        remote_error(
-                            Some(request_id.clone()),
-                            "UNKNOWN_AUDIO_REQUEST",
-                            "音频请求不存在",
-                        )
-                    })
-                    .and_then(|upload| upload.finish(&end));
+                // Validate the request id before discarding the recording: the
+                // old order dropped a valid upload when a frame arrived with a
+                // stale id.
+                let result = match active_audio.as_ref() {
+                    Some(upload) if upload.request_id == request_id => active_audio
+                        .take()
+                        .expect("audio upload checked")
+                        .finish(&end),
+                    Some(_) => Err(remote_error(
+                        Some(request_id.clone()),
+                        "AUDIO_REQUEST_MISMATCH",
+                        "音频请求与当前录音不匹配",
+                    )),
+                    None => Err(remote_error(
+                        Some(request_id.clone()),
+                        "UNKNOWN_AUDIO_REQUEST",
+                        "音频请求不存在",
+                    )),
+                };
                 match result {
                     Ok(wav) => {
                         let payload = RequestPayload::AudioWav(wav);
@@ -1260,6 +1402,12 @@ async fn handle_connection(
                                 )
                                 .await?;
                             } else if local_planning_available && !explicit_cloud_mode {
+                                let allow_remote_transcription =
+                                    engine.lock().await.config().transcription.enabled;
+                                let connection_busy = processing.is_some()
+                                    || execution.is_some()
+                                    || deferred.is_some()
+                                    || !pending.plans.is_empty();
                                 match start_remote_request(
                                     engine.clone(),
                                     platform.clone(),
@@ -1268,8 +1416,9 @@ async fn handle_connection(
                                     request_id.clone(),
                                     payload,
                                     processing_tx.clone(),
+                                    connection_busy,
                                     false,
-                                    false,
+                                    allow_remote_transcription,
                                     true,
                                 ) {
                                     Ok(request) => processing = Some(request),
@@ -1333,7 +1482,13 @@ async fn handle_connection(
                     .as_ref()
                     .is_some_and(|request| request.request_id == request_id)
                 {
-                    execution.take();
+                    cancel_execution_cooperatively(
+                        &mut execution,
+                        &mut execution_rx,
+                        &mut socket,
+                        &mut secure,
+                    )
+                    .await?;
                 }
                 if deferred
                     .as_ref()
@@ -1344,7 +1499,13 @@ async fn handle_connection(
                 if let Some(plan) = pending.take(&request_id, Instant::now()) {
                     plan.audit("cancelled", None);
                 }
-                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                if let Some(session) = hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions
+                    .get_mut(&connection_id)
+                {
                     if session
                         .decision
                         .as_ref()
@@ -1358,7 +1519,13 @@ async fn handle_connection(
                 true
             }
             RemoteMessage::ConfirmExecution(confirm) => {
-                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                if let Some(session) = hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions
+                    .get_mut(&connection_id)
+                {
                     if session
                         .decision
                         .as_ref()
@@ -1367,13 +1534,13 @@ async fn handle_connection(
                         session.decision = None;
                     }
                 }
-                if execution.is_some() {
+                if execution.is_some() || processing.is_some() {
                     send_remote_error(
                         &mut socket,
                         &mut secure,
                         Some(confirm.request_id),
                         "SERVER_BUSY",
-                        "当前连接正在执行另一计划",
+                        "当前连接正在执行或规划另一请求",
                     )
                     .await?;
                 } else {
@@ -1429,7 +1596,13 @@ async fn handle_connection(
                 true
             }
             RemoteMessage::DecisionResponse(response) => {
-                if let Some(session) = hub.0.lock().unwrap().sessions.get_mut(&connection_id) {
+                if let Some(session) = hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions
+                    .get_mut(&connection_id)
+                {
                     if session.decision.as_ref().is_some_and(|d| {
                         d.id.as_deref() == Some(response.decision_id.as_str())
                             && d.request == response.request_id
@@ -1494,7 +1667,7 @@ fn initial_model_decision(
     if explicit_cloud_mode {
         return (
             DecisionKind::UploadFullScreenshot,
-            "当前配置使用远端模型。是否允许本次上传完整桌面截图？",
+            "当前配置使用远端模型。是否允许本次上传完整桌面截图与无障碍控件树（含控件文本）？",
         );
     }
     if !local_planning_available {
@@ -1613,7 +1786,7 @@ async fn handle_decision_response(
                     waiting.request_id,
                     waiting.payload,
                     DecisionKind::UploadFullScreenshot,
-                    "是否允许本次向远端模型上传完整桌面截图？拒绝后只发送文字信息。",
+                    "是否允许本次向远端模型上传完整桌面截图与无障碍控件树（含控件文本）？拒绝后只发送文字信息。",
                 )
                 .await?,
             );
@@ -1652,6 +1825,7 @@ async fn handle_decision_response(
                 results,
                 processing.is_some() || execution_busy,
                 allow_full_screenshot,
+                true,
                 false,
             ) {
                 Ok(request) => *processing = Some(request),
@@ -1665,6 +1839,7 @@ async fn handle_decision_response(
     Ok(true)
 }
 
+#[derive(Clone)]
 enum RequestPayload {
     Text(String),
     AudioWav(Vec<u8>),
@@ -1674,6 +1849,9 @@ struct RequestInference<'a> {
     progress: Option<&'a mpsc::UnboundedSender<ProcessingResult>>,
     modeld: Option<&'a SupervisedModeldClient>,
     allow_full_screenshot: bool,
+    /// The user enabled cloud transcription (or approved audio upload for this
+    /// request), so a local ASR failure may fail over to the remote endpoint.
+    allow_remote_transcription: bool,
     local: bool,
 }
 
@@ -1688,6 +1866,7 @@ fn start_remote_request(
     results: mpsc::UnboundedSender<ProcessingResult>,
     connection_busy: bool,
     allow_full_screenshot: bool,
+    allow_remote_transcription: bool,
     local_inference: bool,
 ) -> Result<ProcessingRequest, (&'static str, &'static str)> {
     if connection_busy {
@@ -1696,6 +1875,7 @@ fn start_remote_request(
     let Ok(request_permit) = request_slots.try_acquire_owned() else {
         return Err(("SERVER_BUSY", "服务器正忙"));
     };
+    let retry_payload = Some(payload.clone());
     let task_request_id = request_id.clone();
     let task = tokio::spawn(async move {
         let _request_permit = request_permit;
@@ -1711,6 +1891,7 @@ fn start_remote_request(
                     progress: Some(&progress),
                     modeld: modeld.as_ref(),
                     allow_full_screenshot,
+                    allow_remote_transcription,
                     local: local_inference,
                 },
             );
@@ -1731,6 +1912,12 @@ fn start_remote_request(
                 message: "远程请求超时".to_string(),
             },
             Ok(Ok((preview, plan))) => ProcessingOutcome::Complete(preview, plan),
+            Ok(Err(message)) if crate::modeld::is_decision_required(&message) => {
+                ProcessingOutcome::Error {
+                    code: "DECISION_REQUIRED",
+                    message,
+                }
+            }
             Ok(Err(message)) => ProcessingOutcome::Error {
                 code: "COMMAND_FAILED",
                 message,
@@ -1741,7 +1928,11 @@ fn start_remote_request(
             outcome,
         });
     });
-    Ok(ProcessingRequest { request_id, task })
+    Ok(ProcessingRequest {
+        request_id,
+        task,
+        retry_payload,
+    })
 }
 
 async fn publish_processing_result(
@@ -1897,6 +2088,7 @@ async fn handle_command(
             progress: None,
             modeld: None,
             allow_full_screenshot: true,
+            allow_remote_transcription: false,
             local: false,
         },
     )
@@ -1914,6 +2106,7 @@ async fn handle_request(
         progress,
         modeld,
         allow_full_screenshot,
+        allow_remote_transcription,
         local: local_inference,
     } = inference;
     let request_id = request_id.to_string();
@@ -1932,7 +2125,7 @@ async fn handle_request(
         && uia_environment::uia_available();
     // Stable diagnostic reasons: 2 = no UI Automation (non-Windows or runtime
     // unavailable), 3 = cloud screen disclosure not authorized for this request,
-    // 9 = no cloud planning scheduler. Later stages add 4/5/6/7/8.
+    // 9 = no cloud planning scheduler. Later stages add 4/5/6/7/8/10.
     if verified_configured && !verified_available {
         let reason = if !uia_environment::uia_available() {
             2
@@ -1943,6 +2136,10 @@ async fn handle_request(
         };
         ale_core::diagnostics::record("verified_task_unavailable", &[("reason", reason)]);
     }
+    // Audio may only leave the host when the user enabled cloud transcription
+    // (or already approved the remote-model decision for this request). A local
+    // ASR failure then becomes a user decision instead of a silent upload.
+    let mut remote_transcription_notice: Option<&'static str> = None;
     let question = match input {
         RequestPayload::Text(text) => text,
         RequestPayload::AudioWav(audio) => {
@@ -1953,7 +2150,13 @@ async fn handle_request(
                 "正在识别语音",
             );
             if let Some(client) = modeld {
-                client.transcribe_wav(&request_id, &audio, true).await?.text
+                let result = client
+                    .transcribe_wav(&request_id, &audio, allow_remote_transcription)
+                    .await?;
+                if result.used_remote {
+                    remote_transcription_notice = Some("已使用云端转写");
+                }
+                result.text
             } else {
                 let engine = engine.lock().await;
                 engine
@@ -1962,6 +2165,12 @@ async fn handle_request(
                     .map_err(|error| error.to_string())?
             }
         }
+    };
+    let annotate = |mut text: String| -> String {
+        if let Some(notice) = remote_transcription_notice {
+            text.push_str(&format!("\n（{notice}）"));
+        }
+        text
     };
 
     report_progress(
@@ -2090,7 +2299,7 @@ async fn handle_request(
         return Ok((
             CommandPreview {
                 request_id,
-                response_text,
+                response_text: annotate(response_text),
                 action_steps: plan.describe_steps(),
                 confirmation_text,
                 requires_confirmation: executable_plan.is_some(),
@@ -2102,7 +2311,18 @@ async fn handle_request(
         ));
     }
     let mut response = if let Some(client) = modeld {
-        let mut tools = semantic_automation_tools();
+        // Verified mode additionally offers `propose_verified_task`. When it is
+        // unavailable (non-Windows, no UIA, disclosure refused) the phone keeps
+        // the documented legacy "plan -> confirm -> execute" path: the cloud
+        // planner may propose a coordinate plan that the host turns into an
+        // executable `ActionPlan` for confirmation.
+        let mut tools = if image.is_some() && !verified_available {
+            let mut tools = automation_tools();
+            tools.extend(semantic_automation_tools());
+            tools
+        } else {
+            semantic_automation_tools()
+        };
         let mut cloud_question = question.clone();
         let mut verified_observation: Option<Observation> = None;
         // Screenshot capture may have failed; the cloud request then carries no
@@ -2150,7 +2370,8 @@ async fn handle_request(
                 observation,
                 &request_id,
             ) {
-                Ok((preview, plan)) => {
+                Ok((mut preview, plan)) => {
+                    preview.response_text = annotate(preview.response_text);
                     return Ok((preview, Some(PreparedPlan::Verified(Box::new(plan)))));
                 }
                 Err(reason) => {
@@ -2193,22 +2414,10 @@ async fn handle_request(
 
     let mut action_steps = Vec::new();
     let mut plan = None;
-    if modeld.is_some() {
-        if let Some(calls) = response.tool_calls.as_ref() {
-            let semantic = calls
-                .iter()
-                .filter(|call| call.function.name == "propose_semantic_plan")
-                .collect::<Vec<_>>();
-            if semantic.len() == 1 {
-                if let Ok(parsed) = parse_semantic_plan_arguments(&semantic[0].function.arguments) {
-                    action_steps = parsed.describe_steps();
-                    response.content.push_str(
-                        "\n\n已生成语义计划；本地 ShowUI 未返回可信定位，未创建可执行坐标。",
-                    );
-                }
-            }
-        }
-    } else if let Some(calls) = response.tool_calls {
+    if let Some(calls) = response.tool_calls.as_ref() {
+        // Legacy executable path: build an `ActionPlan` from the model's
+        // coordinates so the request can use the normal confirmation,
+        // execution and audit pipeline instead of a dry-run description.
         let executable = calls
             .iter()
             .filter(|call| call.function.name == "execute_action_plan")
@@ -2226,6 +2435,22 @@ async fn handle_request(
                 plan = Some(parsed);
             }
         }
+        if plan.is_none() {
+            // Semantic dry-run remains the fallback when no executable plan was
+            // produced (e.g. the local grounding did not trust its own result).
+            let semantic = calls
+                .iter()
+                .filter(|call| call.function.name == "propose_semantic_plan")
+                .collect::<Vec<_>>();
+            if semantic.len() == 1 {
+                if let Ok(parsed) = parse_semantic_plan_arguments(&semantic[0].function.arguments) {
+                    action_steps = parsed.describe_steps();
+                    response
+                        .content
+                        .push_str("\n\n已生成语义计划；未创建可执行坐标。");
+                }
+            }
+        }
     }
 
     let confirmation_text = plan
@@ -2241,12 +2466,12 @@ async fn handle_request(
     Ok((
         CommandPreview {
             request_id,
-            response_text: response.content,
+            response_text: annotate(response.content),
             action_steps,
             confirmation_text,
             requires_confirmation,
             has_plan,
-            task_mode: None,
+            task_mode: plan.is_some().then(|| TASK_MODE_LEGACY.to_string()),
             verification: None,
         },
         plan.map(PreparedPlan::Legacy),
@@ -2511,9 +2736,73 @@ fn start_remote_execution(
     RemoteExecution {
         request_id,
         control,
-        task,
+        task: Some(task),
         verified_cancel: None,
     }
+}
+
+/// Cancel a running execution cooperatively and publish a real terminal state.
+///
+/// The runner/adapter decides whether the outcome is `Cancelled` (no input was
+/// issued) or `OutcomeUnknown` (input may already have been issued); this
+/// function never reports a bare "CANCELLED" error for a started execution.
+/// When no terminal event arrives within [`CANCEL_SETTLE_WINDOW`], the outcome is
+/// reported as unknown and the caller must not offer a silent retry.
+async fn cancel_execution_cooperatively(
+    execution: &mut Option<RemoteExecution>,
+    execution_rx: &mut mpsc::UnboundedReceiver<RemoteExecutionEvent>,
+    socket: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+    secure: &mut remote_crypto::SecureChannel,
+) -> Result<(), String> {
+    let Some(request) = execution.as_ref() else {
+        return Ok(());
+    };
+    let request_id = request.request_id.clone();
+    request.control.cancel();
+    if let Some(cancel) = request.verified_cancel.as_ref() {
+        let _ = cancel.send(true);
+    }
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE_WINDOW;
+    let outcome = loop {
+        match tokio::time::timeout_at(deadline, execution_rx.recv()).await {
+            Ok(Some(event)) => {
+                if event.request_id != request_id {
+                    continue;
+                }
+                match event.kind {
+                    RemoteExecutionEventKind::Complete(outcome) => break Some(outcome),
+                    RemoteExecutionEventKind::Progress(stage, message) => {
+                        let message = sanitize_speech_text(&message);
+                        send_secure(
+                            socket,
+                            secure,
+                            &RemoteMessage::ProgressUpdate(ProgressUpdate {
+                                request_id: request_id.clone(),
+                                stage,
+                                message,
+                            }),
+                        )
+                        .await?;
+                    }
+                    RemoteExecutionEventKind::TimedOut => {}
+                    RemoteExecutionEventKind::FinishedAfterTimeout => break None,
+                }
+            }
+            Ok(None) => break None,
+            Err(_) => break None,
+        }
+    };
+    execution.take();
+    let outcome = outcome.unwrap_or_else(|| {
+        RemoteExecutionOutcome::Status(ExecutionStatus {
+            request_id: request_id.clone(),
+            state: ExecutionState::OutcomeUnknown,
+            message: "取消请求已发送，但执行未在时限内结束；操作可能已经发生，请勿自动重试。"
+                .to_string(),
+            actions_executed: 0,
+        })
+    });
+    publish_execution_outcome(socket, secure, request_id, outcome).await
 }
 
 async fn publish_execution_outcome(
@@ -2594,8 +2883,11 @@ fn verified_audit_plan(plan: &VerifiedPlan) -> ActionPlan {
     }
 }
 
-/// Structured foreground state for the cloud planner. Control labels/values are
-/// user-approved disclosure for this request; tree ids stay host-side.
+/// Structured foreground state for the cloud planner. Control labels are
+/// user-approved disclosure for this request; tree ids stay host-side. Text
+/// property values are filtered before they leave the host: password-like
+/// fields are omitted and every value is bounded in length, because the user
+/// consented to the accessibility tree rather than to arbitrary input content.
 fn verified_question(question: &str, observation: &Observation) -> String {
     let mut text = String::with_capacity(2048);
     text.push_str(question.trim());
@@ -2613,9 +2905,13 @@ fn verified_question(question: &str, observation: &Observation) -> String {
         text.push_str(&node.label.chars().take(120).collect::<String>());
         text.push_str(" | enabled=");
         text.push_str(if node.enabled { "true" } else { "false" });
-        if let Some(value) = node.properties.get("value") {
+        if let Some(value) = node
+            .properties
+            .get("value")
+            .and_then(|value| disclosable_value(&node.label, value))
+        {
             text.push_str(" | value=");
-            text.push_str(&value.chars().take(120).collect::<String>());
+            text.push_str(&value);
         }
         if let Some(toggle) = node.properties.get("toggle") {
             text.push_str(" | toggle=");
@@ -2628,6 +2924,50 @@ fn verified_question(question: &str, observation: &Observation) -> String {
         text.push('\n');
     }
     text
+}
+
+/// Value text that may be sent to the cloud planner: password-like controls and
+/// values that look like credentials are omitted entirely, and every remaining
+/// value is truncated to a bounded disclosure length.
+fn disclosable_value(label: &str, value: &str) -> Option<String> {
+    const MAX_DISCLOSED_VALUE_CHARS: usize = 120;
+    const SENSITIVE_LABELS: [&str; 9] = [
+        "password",
+        "passwd",
+        "passcode",
+        "secret",
+        "token",
+        "验证码",
+        "密码",
+        "口令",
+        "密钥",
+    ];
+    const SENSITIVE_VALUES: [&str; 4] = ["sk-", "bearer ", "password=", "api_key="];
+    let lower_label = label.to_ascii_lowercase();
+    let lower_value = value.to_ascii_lowercase();
+    if SENSITIVE_LABELS
+        .iter()
+        .any(|marker| lower_label.contains(*marker))
+        || SENSITIVE_VALUES
+            .iter()
+            .any(|marker| lower_value.contains(*marker))
+    {
+        return None;
+    }
+    // Masked inputs read back as bullet characters; treat them as secrets too.
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| matches!(character, '•' | '*' | '●'))
+    {
+        return None;
+    }
+    Some(
+        value
+            .chars()
+            .take(MAX_DISCLOSED_VALUE_CHARS)
+            .collect::<String>(),
+    )
 }
 
 /// First observation used to bind the task to the foreground window. Error
@@ -2643,7 +2983,10 @@ async fn observe_verified_window() -> Result<Observation, u64> {
 /// Parse exactly one `propose_verified_task` call and rebuild the host task.
 /// Error values are stable diagnostics reasons, never model text: 5 = the model
 /// proposed no verified task, 6 = the proposal failed host validation,
-/// 7 = the task contract could not be built, 8 = more than one verified call.
+/// 7 = the task contract could not be built, 8 = more than one verified call,
+/// 10 = the proposed success condition already holds before any action (the
+/// model cannot prove the goal, and the run would report a zero-action
+/// `completed`).
 fn parse_verified_plan(
     tool_calls: Option<&[ToolCall]>,
     user_goal: &str,
@@ -2664,6 +3007,11 @@ fn parse_verified_plan(
     let proposal =
         parse_verified_task_arguments(&verified[0].function.arguments).map_err(|_| 6u64)?;
     let task = build_task(&proposal, user_goal, &observation.window, true).map_err(|_| 7u64)?;
+    // Reject goals that are already true in the planning observation. The runner
+    // checks the goal before its first decision, so such a proposal could only
+    // produce a "completed" result with zero actions and no evidence that the
+    // requested change happened.
+    verified_task::reject_pre_satisfied_task(&task, observation).map_err(|_| 10u64)?;
     let preview = build_preview(&proposal).into_command_preview(request_id);
     Ok((preview, VerifiedPlan { task, proposal }))
 }
@@ -2918,7 +3266,7 @@ fn start_verified_execution(
     RemoteExecution {
         request_id,
         control: ExecutionControl::new(Instant::now() + VERIFIED_TERMINAL_DEADLINE),
-        task,
+        task: Some(task),
         verified_cancel: Some(cancel_tx),
     }
 }
@@ -3005,12 +3353,25 @@ fn execute_confirm(
             }
         }
         Err(error) => {
-            audit::record("failed", "remote", &plan, Some(&error.to_string()));
-            ExecutionStatus {
-                request_id,
-                state: ExecutionState::Failed,
-                message: error.to_string(),
-                actions_executed: 0,
+            let reason = error.to_string();
+            audit::record("failed", "remote", &plan, Some(&reason));
+            // A cancelled or timed-out plan may have dispatched some or all of
+            // its actions; the honest terminal state is outcome_unknown (see
+            // HARNESS.md), never "cancelled" or "failed, nothing happened".
+            if reason.contains("CANCELLED") || reason.contains("CONFIRM_TIMEOUT") {
+                ExecutionStatus {
+                    request_id,
+                    state: ExecutionState::OutcomeUnknown,
+                    message: "执行被取消或超时，操作可能已经发生，请勿自动重试。".to_string(),
+                    actions_executed: 0,
+                }
+            } else {
+                ExecutionStatus {
+                    request_id,
+                    state: ExecutionState::Failed,
+                    message: reason,
+                    actions_executed: 0,
+                }
             }
         }
     }
@@ -3024,7 +3385,12 @@ async fn send_secure(
     let _ = OBSERVER.try_with(|(hub, id)| hub.observe(id, message));
     let mut outgoing = message.clone();
     if OBSERVER
-        .try_with(|(hub, _)| hub.0.lock().unwrap().mute_speech)
+        .try_with(|(hub, _)| {
+            hub.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .mute_speech
+        })
         .unwrap_or(false)
     {
         if let RemoteMessage::AssistantOutput(output) = &mut outgoing {
@@ -3388,9 +3754,17 @@ impl MdnsRegistration {
 
 fn advertise_mdns(pairing: &PairingInfo) -> Option<MdnsRegistration> {
     if pairing.host.is_empty() {
+        ale_core::diagnostics::record("mdns_unavailable", &[("reason", 1)]);
         return None;
     }
-    let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+    let daemon = match mdns_sd::ServiceDaemon::new() {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            tracing::warn!("mDNS daemon unavailable: {error}");
+            ale_core::diagnostics::record("mdns_unavailable", &[("reason", 2)]);
+            return None;
+        }
+    };
     let properties = [
         ("sid", pairing.session_id.as_str()),
         ("name", pairing.name.as_str()),
@@ -3404,13 +3778,17 @@ fn advertise_mdns(pairing: &PairingInfo) -> Option<MdnsRegistration> {
         &properties[..],
     ) {
         Ok(info) => info,
-        Err(_) => {
+        Err(error) => {
+            tracing::warn!("mDNS service info invalid: {error}");
+            ale_core::diagnostics::record("mdns_unavailable", &[("reason", 3)]);
             let _ = daemon.shutdown();
             return None;
         }
     };
     let fullname = info.get_fullname().to_string();
-    if daemon.register(info).is_err() {
+    if let Err(error) = daemon.register(info) {
+        tracing::warn!("mDNS registration failed: {error}");
+        ale_core::diagnostics::record("mdns_unavailable", &[("reason", 4)]);
         let _ = daemon.shutdown();
         return None;
     }
@@ -3644,16 +4022,20 @@ mod tests {
 
     impl SecretStore for TestSecretStore {
         fn get_api_key(&self) -> ale_core::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().clone())
+            Ok(self
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone())
         }
 
         fn set_api_key(&self, api_key: &str) -> ale_core::Result<()> {
-            *self.0.lock().unwrap() = Some(api_key.to_string());
+            *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(api_key.to_string());
             Ok(())
         }
 
         fn delete_api_key(&self) -> ale_core::Result<()> {
-            *self.0.lock().unwrap() = None;
+            *self.0.lock().unwrap_or_else(|poison| poison.into_inner()) = None;
             Ok(())
         }
     }
@@ -3828,6 +4210,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -3945,7 +4328,11 @@ mod tests {
         };
         assert!(matches!(hello, RemoteMessage::ServerHello(_)));
         assert!(
-            hub.0.lock().unwrap().sessions.is_empty(),
+            hub.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .sessions
+                .is_empty(),
             "listening and Noise reply alone are not an authenticated device"
         );
         for frame in secure
@@ -4010,14 +4397,27 @@ mod tests {
         assert_eq!(rejection.request_id.as_deref(), Some("loopback-request"));
         assert_eq!(rejection.code, "MODEL_SCHEDULER_DISABLED");
         assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
-        let controls = hub.0.lock().unwrap().sessions["test-session"]
+        let controls = hub
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions["test-session"]
             .controls
             .clone();
-        credentials.lock().unwrap().expires = Instant::now();
+        credentials
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .expires = Instant::now();
         controls.send(Control::Pause(true)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if hub.0.lock().unwrap().sessions["test-session"].paused {
+                if hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions["test-session"]
+                    .paused
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4054,7 +4454,13 @@ mod tests {
         controls.send(Control::Pause(false)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                if !hub.0.lock().unwrap().sessions["test-session"].paused {
+                if !hub
+                    .0
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .sessions["test-session"]
+                    .paused
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4065,13 +4471,21 @@ mod tests {
         assert_eq!(platform.executed.load(Ordering::SeqCst), 0);
         controls.send(Control::Disconnect).await.unwrap();
         assert!(server.await.unwrap().is_ok());
-        assert!(hub.0.lock().unwrap().sessions.is_empty());
+        assert!(hub
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions
+            .is_empty());
         for rotate_after_noise in [false, true] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let context = reconnect_context.clone();
             if rotate_after_noise {
-                credentials.lock().unwrap().expires = Instant::now() + Duration::from_secs(120);
+                credentials
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .expires = Instant::now() + Duration::from_secs(120);
             }
             let server = tokio::spawn(async move {
                 let (stream, peer) = listener.accept().await.unwrap();
@@ -4095,7 +4509,14 @@ mod tests {
                     task: None,
                 };
                 handle.refresh_pairing();
-                assert_ne!(credentials.lock().unwrap().info.code, code);
+                assert_ne!(
+                    credentials
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .info
+                        .code,
+                    code
+                );
                 for frame in secure
                     .encrypt_message(&RemoteMessage::ClientHello(ClientHello {
                         protocol_version: REMOTE_PROTOCOL_VERSION,
@@ -4111,7 +4532,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(result.unwrap_err().contains("PAIRING_EXPIRED"));
-            assert!(hub.0.lock().unwrap().sessions.is_empty());
+            assert!(hub
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .sessions
+                .is_empty());
         }
         api_request.abort();
         std::fs::remove_dir_all(dir).unwrap();

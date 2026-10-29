@@ -807,6 +807,11 @@ fn grounding_prompt(target: &str) -> String {
 fn extract_json(text: &str) -> Option<serde_json::Value> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
+    // A model can emit a stray closing brace before the JSON object; slicing
+    // `start..=end` would panic and take down the whole modeld process.
+    if end < start {
+        return None;
+    }
     serde_json::from_str(&text[start..=end]).ok()
 }
 
@@ -1050,6 +1055,18 @@ mod tests {
         assert_eq!(
             normalize_coordinate((820.0, 515.0), 1280, 720),
             Some((0.640625, 0.7152778))
+        );
+    }
+
+    #[test]
+    fn extract_json_tolerates_braces_out_of_order() {
+        // A closing brace before the first opening brace used to panic on the
+        // inverted slice and take down the whole modeld process.
+        assert!(extract_json("} stray {").is_none());
+        assert!(extract_json("} no object {").is_none());
+        assert_eq!(
+            extract_json("prefix {\"point\": [1,2]} suffix"),
+            Some(serde_json::json!({"point": [1, 2]}))
         );
     }
 

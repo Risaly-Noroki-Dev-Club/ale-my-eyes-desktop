@@ -84,6 +84,22 @@ impl Drop for PendingCall {
 
 const MAX_CONSECUTIVE_PROCESS_FAILURES: u8 = 3;
 
+/// Prefix of the error returned when modeld answers `DecisionRequired`. The
+/// reply carries no plan/transcription payload, so callers must turn it into a
+/// user decision instead of deserializing an internal scheduler message.
+const DECISION_REQUIRED_PREFIX: &str = "DECISION_REQUIRED";
+
+fn decision_required_error(code: &str, message: &str) -> String {
+    let detail = if message.is_empty() { code } else { message };
+    format!("{DECISION_REQUIRED_PREFIX}: {detail}")
+}
+
+/// True when a modeld call failed because the local scheduler requires the user
+/// to decide whether to use the remote model.
+pub fn is_decision_required(error: &str) -> bool {
+    error.starts_with(DECISION_REQUIRED_PREFIX)
+}
+
 #[derive(Clone)]
 pub struct SupervisedModeldClient {
     state: Arc<Mutex<SupervisorState>>,
@@ -461,7 +477,10 @@ impl ModeldClient {
         let _: serde_json::Value = self
             .call_json(IpcRequestKind::ConfigureScheduler, &configuration)
             .await?;
-        *self.configuration.lock().unwrap() = Some(configuration);
+        *self
+            .configuration
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(configuration);
         Ok(())
     }
 
@@ -517,7 +536,11 @@ impl ModeldClient {
                         .saturating_duration_since(tokio::time::Instant::now())
                         .as_millis() as i64,
             );
-            let configured = self.configuration.lock().unwrap().clone();
+            let configured = self
+                .configuration
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
             job.runtime_snapshot = REQUEST_CONTEXT
                 .try_with(|(_, _, runtime)| runtime.clone())
                 .ok()
@@ -618,32 +641,87 @@ impl ModeldClient {
         if reply.status == IpcReplyStatus::Error as i32 {
             return Err(format!("{}: {}", reply.error_code, reply.error_message));
         }
+        if reply.status == IpcReplyStatus::DecisionRequired as i32 {
+            // modeld wants a user decision; its payload is a scheduler message,
+            // not a result. Return a typed error so the caller asks the phone
+            // instead of surfacing an internal JSON deserialization error.
+            return Err(decision_required_error(
+                &reply.error_code,
+                &reply.error_message,
+            ));
+        }
         Ok(reply)
     }
 
     async fn terminate(&self) -> bool {
+        // Graceful first: modeld owns the llama-server workers. Force-killing it
+        // straight away leaves those children (and their VRAM) behind on Unix,
+        // because they run in a separate process group.
+        let acknowledged = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.call(
+                &uuid::Uuid::new_v4().to_string(),
+                IpcRequestKind::Shutdown,
+                Vec::new(),
+            ),
+        )
+        .await
+        .map(|result| result.is_ok())
+        .unwrap_or(false);
+        ale_core::diagnostics::record(
+            "modeld_shutdown_requested",
+            &[("acknowledged", u64::from(acknowledged))],
+        );
         self.alive.store(false, Ordering::Release);
-        if let Ok(mut child) = self._process.child.lock() {
-            let _ = child.start_kill();
+        let mut killed = false;
+        if !acknowledged {
+            if let Ok(mut child) = self._process.child.lock() {
+                let _ = child.start_kill();
+            }
+            killed = true;
         }
         for (_, pending) in self.pending.lock().await.drain() {
             let _ = pending
                 .sender
                 .send(Err("MODEL_SCHEDULER_UNAVAILABLE".into()));
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let graceful_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            let exited = self
-                ._process
-                .child
-                .lock()
-                .map(|mut child| matches!(child.try_wait(), Ok(Some(_))))
-                .unwrap_or(false);
-            if exited {
+            if self.process_exited() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= graceful_deadline {
+                if !killed {
+                    if let Ok(mut child) = self._process.child.lock() {
+                        let _ = child.start_kill();
+                    }
+                    if self.wait_for_exit(Duration::from_secs(2)).await {
+                        return true;
+                    }
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        ale_core::diagnostics::record("modeld_reap_unconfirmed", &[]);
+        false
+    }
+
+    fn process_exited(&self) -> bool {
+        self._process
+            .child
+            .lock()
+            .map(|mut child| matches!(child.try_wait(), Ok(Some(_))))
+            .unwrap_or(false)
+    }
+
+    async fn wait_for_exit(&self, wait: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            if self.process_exited() {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
-                ale_core::diagnostics::record("modeld_reap_unconfirmed", &[]);
                 return false;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -801,6 +879,43 @@ impl SupervisedModeldClient {
             client.terminate().await;
         }
         result
+    }
+
+    /// Health check that bypasses the three-second cache. Startup uses this to
+    /// wait (bounded) for modeld's first capability probe, whose asynchronous
+    /// result would otherwise be read as "no local capability" forever.
+    pub async fn health_fresh(&self) -> Result<SchedulerHealth, String> {
+        let _gate = self.health_gate.lock().await;
+        let client = self.connection().await?;
+        let result = tokio::time::timeout(Duration::from_secs(3), client.health())
+            .await
+            .map_err(|_| "MODELD_HEALTH_TIMEOUT".to_string())
+            .and_then(|result| result);
+        let mut state = self.state.lock().await;
+        if state
+            .client
+            .as_ref()
+            .is_some_and(|current| current.instance_id == client.instance_id)
+        {
+            state.last_health = Some((tokio::time::Instant::now(), result.clone()));
+        }
+        result
+    }
+
+    /// Stop the supervised modeld process gracefully. Called on application
+    /// exit so the local llama-server workers are shut down instead of being
+    /// orphaned by a force kill.
+    pub async fn shutdown(&self) {
+        let mut state = self.state.lock().await;
+        if let Some(client) = state.client.take() {
+            if !client.terminate().await {
+                state.retired = Some(client);
+            }
+        }
+        if let Some(client) = state.retired.take() {
+            let _ = client.terminate().await;
+        }
+        state.last_health = None;
     }
 
     pub async fn remote_plan(

@@ -23,10 +23,8 @@ pub(crate) async fn mock_http(
                 let length: usize = headers
                     .lines()
                     .find_map(|line| line.strip_prefix("content-length:"))
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
+                    .map(|value| value.trim().parse().unwrap())
+                    .unwrap_or(0);
                 if request.len() >= end + 4 + length {
                     break;
                 }
@@ -282,4 +280,71 @@ async fn configured_cloud_budget_can_exceed_thirty_seconds() {
             ..
         }))
     ));
+}
+
+/// 无 `Content-Length` 的 chunked 响应，用来验证流式累计上限（DC-05）。
+async fn mock_chunked_http(chunks: Vec<String>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for chunk in chunks {
+            stream
+                .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                .await
+                .unwrap();
+        }
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+    });
+    format!("http://{address}/v1")
+}
+
+#[tokio::test]
+async fn oversized_cloud_responses_are_rejected_without_full_buffering() {
+    // 有 Content-Length：下载前拒绝。
+    let (url, captured) = mock_http("200 OK", json!({"padding": "x".repeat(4096)}), "").await;
+    let client = client(&CloudConfig::default());
+    let response = checked(client.get(format!("{url}/body")).send().await.unwrap())
+        .await
+        .unwrap();
+    let error = super::read_limited_json(response, 1024).await.unwrap_err();
+    assert!(error.to_string().contains("size limit"), "{error}");
+    captured.await.unwrap();
+
+    // 无 Content-Length：流式累计超过上限即失败。
+    let url = mock_chunked_http(vec![
+        "{\"padding\":\"".to_string(),
+        "x".repeat(2048),
+        "\"}".to_string(),
+    ])
+    .await;
+    let response = checked(client.get(format!("{url}/body")).send().await.unwrap())
+        .await
+        .unwrap();
+    let error = super::read_limited_json(response, 1024).await.unwrap_err();
+    assert!(error.to_string().contains("size limit"), "{error}");
+
+    // 小于上限的 chunked 响应正常解析。
+    let url = mock_chunked_http(vec!["{\"ok\":".to_string(), "true}".to_string()]).await;
+    let response = checked(client.get(format!("{url}/body")).send().await.unwrap())
+        .await
+        .unwrap();
+    let body = super::read_limited_json(response, 1024).await.unwrap();
+    assert_eq!(body["ok"], true);
 }

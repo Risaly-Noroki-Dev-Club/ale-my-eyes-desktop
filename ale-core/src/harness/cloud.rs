@@ -6,7 +6,7 @@ use super::*;
 use crate::cloud::{CloudApi, CloudMessage};
 use crate::model_api::ModelRequest;
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub struct CloudPlanner {
     api: Arc<dyn CloudApi>,
@@ -22,8 +22,8 @@ pub fn decision_tool() -> Value {
     decision_tool_for_mode(false)
 }
 
-fn decision_tool_for_mode(allow_observation_steps: bool) -> Value {
-    let predicate = json!({
+fn predicate_schema() -> Value {
+    json!({
         "type": "object", "additionalProperties": false,
         "properties": {
             "role": {"type":"string", "minLength":1},
@@ -32,7 +32,47 @@ fn decision_tool_for_mode(allow_observation_steps: bool) -> Value {
             "equals": {"type":"string", "maxLength":4096}
         },
         "required": ["role", "label", "property", "equals"]
+    })
+}
+
+fn step_schema(operation: Value, expected_min_items: usize, expected_description: &str) -> Value {
+    json!({
+        "type":"object", "additionalProperties":false,
+        "properties": {
+            "target_id":{"type":"string", "minLength":1},
+            "operation": operation,
+            "expected":{"type":"array", "minItems":expected_min_items, "maxItems":16, "items":predicate_schema(),
+                "description": expected_description},
+            "explanation":{"type":"string", "minLength":1}
+        },
+        "required":["target_id","operation","expected","explanation"]
+    })
+}
+
+/// 工具 schema 的两种模式。
+///
+/// 观察模式只放宽 `Invoke` 的 `expected`（允许 `[]` 并在新观察后重规划）；
+/// `SetValue` 在生产与观察模式下都必须给出精确读回条件（DC-02）。
+pub(crate) fn decision_tool_for_mode(allow_observation_steps: bool) -> Value {
+    let invoke_operation = json!({
+        "type":"object", "properties":{"kind":{"const":"invoke", "type":"string"}},
+        "required":["kind"], "additionalProperties":false
     });
+    let set_value_operation = json!({
+        "type":"object",
+        "properties":{"kind":{"const":"set_value", "type":"string"},"value":{"type":"string", "maxLength":4096}},
+        "required":["kind","value"], "additionalProperties":false
+    });
+    let invoke_step = step_schema(
+        invoke_operation,
+        if allow_observation_steps { 0 } else { 1 },
+        "Exact observable postconditions. If the host permits observation steps, Invoke may use [] when the next UI is unknown; then observe and replan. A UI change is not success.",
+    );
+    let set_value_step = step_schema(
+        set_value_operation,
+        1,
+        "SetValue always requires an exact readback of the replacement value.",
+    );
     json!({
         "type": "function",
         "function": {
@@ -45,20 +85,7 @@ fn decision_tool_for_mode(allow_observation_steps: bool) -> Value {
                         "type":"object", "additionalProperties":false,
                         "properties": {
                             "decision":{"const":"act", "type":"string"},
-                            "step": {
-                                "type":"object", "additionalProperties":false,
-                                "properties": {
-                                    "target_id":{"type":"string", "minLength":1},
-                                    "operation":{"oneOf":[
-                                        {"type":"object", "properties":{"kind":{"const":"invoke", "type":"string"}}, "required":["kind"], "additionalProperties":false},
-                                        {"type":"object", "properties":{"kind":{"const":"set_value", "type":"string"},"value":{"type":"string", "maxLength":4096}},"required":["kind","value"],"additionalProperties":false}
-                                    ]},
-                                    "expected":{"type":"array", "minItems":if allow_observation_steps {0} else {1}, "maxItems":16, "items":predicate,
-                                        "description":"Exact observable postconditions. If the host permits observation steps, Invoke may use [] when the next UI is unknown; then observe and replan. SetValue always requires exact value readback."},
-                                    "explanation":{"type":"string", "minLength":1}
-                                },
-                                "required":["target_id","operation","expected","explanation"]
-                            }
+                            "step": {"oneOf": [invoke_step, set_value_step]}
                         },
                         "required":["decision","step"]
                     },
@@ -68,6 +95,27 @@ fn decision_tool_for_mode(allow_observation_steps: bool) -> Value {
             }
         }
     })
+}
+
+/// 决策 schema 只编译一次（按模式各一份），避免每次云端决策重复编译（DC-15）。
+fn decision_validator(
+    allow_observation_steps: bool,
+) -> Result<&'static jsonschema::Validator, String> {
+    static STRICT: OnceLock<std::result::Result<jsonschema::Validator, String>> = OnceLock::new();
+    static OBSERVING: OnceLock<std::result::Result<jsonschema::Validator, String>> =
+        OnceLock::new();
+    let slot = if allow_observation_steps {
+        &OBSERVING
+    } else {
+        &STRICT
+    };
+    slot.get_or_init(|| {
+        let tool = decision_tool_for_mode(allow_observation_steps);
+        jsonschema::validator_for(&tool["function"]["parameters"])
+            .map_err(|_| "Invalid decision schema".to_string())
+    })
+    .as_ref()
+    .map_err(Clone::clone)
 }
 
 #[async_trait]
@@ -116,8 +164,7 @@ impl Planner for CloudPlanner {
         }
         let value: Value = serde_json::from_str(&call.function.arguments)
             .map_err(|_| "Malformed planner arguments")?;
-        let schema = jsonschema::validator_for(&tool["function"]["parameters"])
-            .map_err(|_| "Invalid decision schema")?;
+        let schema = decision_validator(context.task.allow_observation_steps)?;
         if !schema.is_valid(&value) {
             return Err("Planner arguments do not match decision schema".into());
         }

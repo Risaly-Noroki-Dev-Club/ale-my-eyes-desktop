@@ -698,18 +698,20 @@ pub async fn run(
             // Only a confirmed dispatch may use this evidence to replan. A
             // changed UI cannot resolve an Uncertain receipt or widen a grant.
             observation_changed = !same_ui_state(&request.observation, &after);
+            let dispatch_confirmed = matches!(receipt, Receipt::Dispatched);
             if observation_step {
+                // 进度事件只在回执为 Dispatched 时报告“界面已变化”；NotApplied /
+                // Uncertain 时 changed 必须为 false，避免 GUI 文案与最终结论矛盾
+                // （DC-06）。Attempt.observation_changed 仍保留原始观察证据。
                 run.report.events.push(Event::ObservationChecked {
                     action_id: request.id.clone(),
                     sequence: after.sequence,
-                    changed: observation_changed,
+                    changed: dispatch_confirmed && observation_changed,
                 });
             }
             if goal_met
                 || verdict == Verdict::Satisfied
-                || (observation_step
-                    && matches!(receipt, Receipt::Dispatched)
-                    && observation_changed)
+                || (observation_step && dispatch_confirmed && observation_changed)
             {
                 break;
             }

@@ -8,9 +8,11 @@ API implementation and no `retry_count` setting.
 
 Known presets map to exactly one protocol: `openai` → `openai_chat_completions`,
 `anthropic` → `anthropic_messages`, `google` → `google_generate_content`.
-`custom` (or an unknown/empty provider) must set `wire_api` explicitly; a preset
-paired with a conflicting explicit protocol is rejected by configuration
-validation instead of being silently normalized.
+`custom` (or an unknown/empty provider) must set `wire_api` explicitly; loading a
+configuration file that omits `wire_api` for a custom/unknown provider is rejected
+instead of being silently treated as OpenAI Chat Completions. A preset paired with
+a conflicting explicit protocol is rejected by configuration validation instead of
+being silently normalized.
 
 | `wire_api` | Path appended to the base URL | Authentication |
 | --- | --- | --- |
@@ -38,7 +40,8 @@ The adapters collect visible text and multiple tool calls, including tool-only
 responses. Missing completion markers, truncation, refusals, unknown tools,
 duplicate call IDs, malformed JSON arguments, and schema-invalid arguments fail
 before an action plan reaches desktop confirmation. JSON Schema validation uses
-the `jsonschema` crate with external HTTP/file schema resolution disabled.
+the `jsonschema` crate with external HTTP/file schema resolution disabled; the
+cloud decision schema is compiled once per mode instead of once per decision.
 Existing action validation and desktop-derived risk checks still apply.
 
 ## Capabilities and Transcription
@@ -57,8 +60,12 @@ demonstrates handling of that sample, not general task quality or reliability.
 
 `transcription.enabled` defaults to false for new configurations. Its `endpoint`
 has an independent base URL, key, model (default `whisper-1`), and timeout, using
-the OpenAI-compatible `/audio/transcriptions` multipart API. SenseVoice remains
-the scheduler's first attempt; authorized cloud transcription is its fallback.
+the OpenAI-compatible `/audio/transcriptions` multipart API. That path only exists
+on `openai_chat_completions` endpoints: `openai_responses` (and the other wire
+protocols) are rejected for enabled transcription instead of silently issuing a
+404 request. Disabled transcription endpoints are not validated, so stale values
+do not block saving the rest of the configuration. SenseVoice remains
+ the scheduler's first attempt; authorized cloud transcription is its fallback.
 The CLI `transcribe` command and the model scheduler also use the independent
 transcription endpoint when local SenseVoice is unavailable.
 
@@ -73,8 +80,12 @@ Subsequent changes to the primary provider do not alter transcription credential
   ASR, planning, IPC, and retries, leaving room inside the existing phone wait.
   Confirmation and execution retain their separate timing and cancellation rules.
 - Each remote endpoint defaults to 30 seconds; settings accept 1-80 seconds.
-  Connection establishment is capped at five seconds. Local model stages are
-  capped at 30 seconds; cloud stages may consume the remaining processing budget.
+  Connection establishment is capped at five seconds. Remote response bodies are
+  capped at 16 MiB, enforced while streaming, so a hostile or broken endpoint
+  cannot exhaust memory (`ale_core::model_api::MAX_RESPONSE_BYTES`). Local model
+  stages are capped at 60 seconds, above the 45-second model start timeout so a
+  cold start is not cut short by the stage cap; cloud stages may consume the
+  remaining processing budget.
 - Without backup, transient network, timeout, rate-limit, and server errors may
   retry once. Jitter is 200-400 ms; `Retry-After` takes precedence when supplied.
   No attempt starts if the shared deadline has elapsed or the delay cannot fit.

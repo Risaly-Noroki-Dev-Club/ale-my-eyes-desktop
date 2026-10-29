@@ -219,14 +219,15 @@ impl CloudApi for RemoteCloudApi {
         })
     }
     async fn transcribe(&self, audio_data: &[u8]) -> Result<CloudResponse> {
+        // `/audio/transcriptions` 是 OpenAI Chat Completions 兼容端点的路径；
+        // Responses-only 端点没有该路径，必须配置独立转写端点（DC-05）。
         if !matches!(
             self.config.wire_api,
             crate::model_api::WireApi::OpenaiChatCompletions
-                | crate::model_api::WireApi::OpenaiResponses
         ) {
             return Err(crate::model_api::ModelCallError::new(
                 crate::model_api::ErrorKind::Unsupported,
-                "Configure an independent OpenAI-compatible transcription endpoint",
+                "Transcription requires an OpenAI Chat Completions endpoint (/audio/transcriptions)",
             )
             .into());
         }
@@ -251,11 +252,8 @@ impl CloudApi for RemoteCloudApi {
             .send()
             .await
             .map_err(crate::model_api::network_error)?;
-        let body = crate::model_api::checked(response)
-            .await?
-            .json()
-            .await
-            .map_err(crate::model_api::response_error)?;
+        let body =
+            crate::model_api::response_json(crate::model_api::checked(response).await?).await?;
         Ok(CloudResponse {
             content: Self::transcription_text(&body)?,
             tokens_used: 0,
@@ -383,6 +381,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.content, "heard");
+    }
+
+    #[tokio::test]
+    async fn transcribe_requires_chat_completions_endpoint() {
+        let api = RemoteCloudApi::new(CloudConfig {
+            wire_api: crate::model_api::WireApi::OpenaiResponses,
+            api_key: "test".into(),
+            api_url: "http://127.0.0.1:1".into(),
+            ..Default::default()
+        });
+        let error = api
+            .transcribe(b"RIFF-test-wav")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unsupported"), "{error}");
+        assert!(error.contains("audio/transcriptions"), "{error}");
     }
 
     #[tokio::test]

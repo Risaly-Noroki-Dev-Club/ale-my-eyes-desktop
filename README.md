@@ -51,7 +51,7 @@ The phone connection uses **Misaka-Network v4**: pairing QR scheme `misaka-netwo
 - Linux: `./scripts/package-linux.sh` (run on Linux) produces `ale-my-eyes-linux.tar.gz`.
 - Windows: `./scripts/build-windows.cmd` or `./scripts/package-windows.sh` on Windows/MSVC produces `ale-my-eyes-windows.zip` plus a symbols archive.
 - Source: `./scripts/create-release.sh` produces `release/ale-my-eyes-source.tar.gz` and quickstart archives.
-- CI: [`.github/workflows/build.yml`](.github/workflows/build.yml) runs fmt/check/test/clippy, the offline harness matrix, packaging smoke tests, and release assembly.
+- CI: [`.github/workflows/build.yml`](.github/workflows/build.yml) defines fmt/check/test/clippy, the offline harness matrix, packaging smoke tests, and release assembly. The workflow pins the Rust toolchain to **1.96.0** and triggers on `main`/`master` pushes, PRs, tags and manual dispatch; the current `refactor/misaka-network-v4` work branch has not been pushed, so there is no green CI run for it yet — treat these definitions as the gate, not as evidence of a passing build.
 
 macOS and Android packaging are not part of this repository; the Android client lives in the [companion repository](https://github.com/Risaly-Noroki-Dev-Club/ale-my-eyes-mobile).
 

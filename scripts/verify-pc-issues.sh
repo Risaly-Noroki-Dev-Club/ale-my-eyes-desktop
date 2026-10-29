@@ -49,6 +49,13 @@ require 'provider_presets_map_to_effective_wire_api' ale-core/src/config.rs prov
 require 'test_validate_cloud_api_rejects_public_http' ale-core/src/config.rs P1-4-url-test
 require 'mock_openai_timeout_is_reported' ale-core/src/cloud.rs P1-5-http-tests
 
+# Cloud safety, headless credentials, and observation-mode guards.
+require 'MAX_RESPONSE_BYTES' ale-core/src/model_api.rs P2-1-cloud-response-size-cap
+require 'fn backend_available' ale-core/src/secret_store.rs P2-1-headless-credential-degrade
+require 'allow_observation_steps' ale-core/src/config.rs P2-1-observation-host-optin
+require 'observation_mode_schema_still_requires_set_value_readback' ale-core/src/harness/tests.rs P2-1-observation-set-value-schema
+require 'fn require_explicit_wire_api' ale-core/src/config.rs P2-1-custom-provider-wire-api
+
 # Misaka-Network v4 protocol.
 require 'REMOTE_PROTOCOL_VERSION: u32 = 4' ale-core/src/remote.rs misaka-v4-version
 require 'misaka_v4_matches_golden_fixture' ale-core/src/remote.rs misaka-v4-golden-fixture

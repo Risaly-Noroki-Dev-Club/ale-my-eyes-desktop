@@ -51,7 +51,7 @@ pub struct UiHub(pub Arc<Mutex<Snapshot>>);
 
 impl UiHub {
     pub fn log(&self, id: &str, event: &str) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         state.logs.push_front(Activity {
             time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -64,7 +64,7 @@ impl UiHub {
     }
 
     pub fn observe(&self, id: &str, message: &RemoteMessage) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(session) = state.sessions.get_mut(id) else {
             return;
         };
@@ -152,7 +152,12 @@ impl UiHub {
 pub struct SessionGuard(pub UiHub, pub String);
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0 .0.lock().unwrap().sessions.remove(&self.1);
+        self.0
+             .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions
+            .remove(&self.1);
         self.0.log(&self.1, "Disconnected");
     }
 }
@@ -168,25 +173,29 @@ mod tests {
     fn unrelated_error_does_not_dismiss_a_pending_confirmation() {
         let hub = UiHub::default();
         let (controls, _) = mpsc::channel(8);
-        hub.0.lock().unwrap().sessions.insert(
-            "phone".into(),
-            Session {
-                name: "Phone".into(),
-                address: "127.0.0.1".into(),
-                paused: false,
-                task: "AwaitingDecision".into(),
-                output: String::new(),
-                latency: None,
-                controls,
-                decision: Some(Decision {
-                    request: "current".into(),
-                    id: None,
-                    kind: "HighRiskPlan".into(),
-                    text: "Confirm the complete plan".into(),
-                    expires: Instant::now() + Duration::from_secs(120),
-                }),
-            },
-        );
+        hub.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions
+            .insert(
+                "phone".into(),
+                Session {
+                    name: "Phone".into(),
+                    address: "127.0.0.1".into(),
+                    paused: false,
+                    task: "AwaitingDecision".into(),
+                    output: String::new(),
+                    latency: None,
+                    controls,
+                    decision: Some(Decision {
+                        request: "current".into(),
+                        id: None,
+                        kind: "HighRiskPlan".into(),
+                        text: "Confirm the complete plan".into(),
+                        expires: Instant::now() + Duration::from_secs(120),
+                    }),
+                },
+            );
         let error = |request: &str| {
             RemoteMessage::Error(ale_core::remote::RemoteError {
                 request_id: Some(request.into()),
@@ -195,9 +204,21 @@ mod tests {
             })
         };
         hub.observe("phone", &error("old-request"));
-        assert!(hub.0.lock().unwrap().sessions["phone"].decision.is_some());
+        assert!(hub
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions["phone"]
+            .decision
+            .is_some());
         hub.observe("phone", &error("current"));
-        assert!(hub.0.lock().unwrap().sessions["phone"].decision.is_none());
+        assert!(hub
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions["phone"]
+            .decision
+            .is_none());
     }
 
     #[test]
@@ -206,22 +227,38 @@ mod tests {
         for _ in 0..250 {
             hub.log("one", "Connected");
         }
-        assert_eq!(hub.0.lock().unwrap().logs.len(), 200);
-        let (controls, _) = mpsc::channel(8);
-        hub.0.lock().unwrap().sessions.insert(
-            "one".into(),
-            Session {
-                name: "Phone".into(),
-                address: "127.0.0.1".into(),
-                paused: false,
-                task: "Ready".into(),
-                output: String::new(),
-                latency: None,
-                decision: None,
-                controls,
-            },
+        assert_eq!(
+            hub.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .logs
+                .len(),
+            200
         );
+        let (controls, _) = mpsc::channel(8);
+        hub.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions
+            .insert(
+                "one".into(),
+                Session {
+                    name: "Phone".into(),
+                    address: "127.0.0.1".into(),
+                    paused: false,
+                    task: "Ready".into(),
+                    output: String::new(),
+                    latency: None,
+                    decision: None,
+                    controls,
+                },
+            );
         drop(SessionGuard(hub.clone(), "one".into()));
-        assert!(hub.0.lock().unwrap().sessions.is_empty());
+        assert!(hub
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .sessions
+            .is_empty());
     }
 }

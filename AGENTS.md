@@ -11,7 +11,7 @@
 - Ignore build/runtime artifacts: `target/`, `dist/`, `release/`, `Ale, My Eyes!.app/`, `*.dmg`, `*.apk` (not produced here), `ale-my-eyes-*` package dirs/archives, model files, and `config/config.json`.
 
 ## Verification Commands
-- CI is real: `.github/workflows/build.yml` (jobs: `check`, `harness-evaluation`, `build-windows`, `build-linux`, `nix`, `source-package`, `release`). Cite it; do not claim there is no workflow.
+- CI definitions are real: `.github/workflows/build.yml` (jobs: `check` incl. clippy, `harness-evaluation`, `build-windows`, `build-linux`, `nix`, `source-package`, `release`), with the toolchain pinned to Rust 1.96.0. It triggers on `main`/`master` pushes, PRs, tags and manual dispatch. The current `refactor/misaka-network-v4` branch is **not pushed**, so no CI run exists for it: cite the workflow as the intended gate, never as a green build result for this branch.
 - Format: `cargo fmt --all -- --check`.
 - Whole workspace: `cargo check --workspace --locked`; tests: `cargo test --workspace --locked`; lint: `cargo clippy --workspace --all-targets --locked -- -D warnings`.
 - Focused: `cargo test -p ale-core`, `cargo test -p ale-core <test_name>`, `cargo check -p ale-gui`, `cargo check -p ale-modeld`.
@@ -32,12 +32,12 @@
 
 ## Task Harness and Verified Tasks
 - Runtime: `ale-core/src/harness/`; simulation/CLI reference: `harness-demo`; production wiring: `ale-gui/src/{verified_task,verified_planner,verified_authorizer,uia_environment}.rs` and `remote_server.rs`.
-- Verified mode is opt-in via `verified_tasks.enabled` (default `true`) and only activates when the request may disclose the screen to the cloud and the platform exposes UI Automation (Windows). Otherwise the legacy plan-then-execute path is used and `verified_task_unavailable` is recorded in diagnostics.
+- Verified mode is opt-in via `verified_tasks.enabled` (default `true`) and only activates when the request may disclose the screen to the cloud and the platform exposes UI Automation (Windows). Otherwise the legacy plan-then-execute path is used and `verified_task_unavailable` is recorded in diagnostics. Observation-driven replanning is a separate host opt-in: `verified_tasks.allow_observation_steps` (serde default `false`) maps to `Task.allow_observation_steps`; the fixed-step production flow and `harness-demo` keep it off.
 - The model may only propose semantic steps with verifiable postconditions (`propose_verified_task`); the host builds the `Task`, owns success criteria/budgets, and the runner requires user confirmation, re-observation, authorization, and post-action verification. Terminal states include `completed`, `needs_user`, `outcome_unknown`, `cancelled`, `failed`.
 - Windows UIA real-device acceptance is **not done**; offline tests use mock bridges. Do not claim production success rates, UIA reliability, or real-task quality from the 24-case offline matrix.
 
 ## Architecture Notes
-- Long-lived app config is created under the user config directory at `ale-my-eyes/config.json`; API keys use the system credential store. Model scheduler runtime config points at `models/.runtime` (llama-server + GGUF files and the calibrated `runtime-capabilities.json`).
+- Long-lived app config is created under the user config directory at `ale-my-eyes/config.json`; API keys use the system credential store. When that backend is unavailable (headless/container, no D-Bus/Secret Service), loading and saving degrade to warnings (`ConfigManager::credential_warnings`) instead of failing, so read-only CLI commands still work; credentials then only live in memory. Model scheduler runtime config points at `models/.runtime` (llama-server + GGUF files and the calibrated `runtime-capabilities.json`).
 - `ale-core/src/cloud.rs` has one `RemoteCloudApi` implementing four wire protocols. `provider` is only a UI preset (`openai`, `anthropic`, `google`, custom); `wire_api` is the transport truth, and preset/protocol conflicts are rejected by config validation. Custom providers must set an explicit `wire_api`. There is no `retry_count` field and no desktop TTS.
 - `ale-modeld` protocol: protobuf-framed IPC (`ale-core/src/model_ipc.rs`, version 2, 32 MiB frame cap) over a Unix socket/named pipe. GUI spawns it, pins configuration snapshots per request, enforces health/restart backoff, and falls back to cloud paths when local capabilities are unavailable.
 - Screen/automation: `ale-core/src/actions.rs` defines actions; desktop execution lives in `ale-gui/src/automation.rs` and `platform/`. Verified-task execution goes through the UIA adapter instead of the legacy automation path.

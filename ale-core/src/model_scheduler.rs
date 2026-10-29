@@ -9,7 +9,11 @@ pub const MIN_DEFAULT_VRAM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MIN_LARGE_VRAM_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const MODEL_IDLE_TTL: Duration = Duration::from_secs(120);
 pub const MODEL_START_TIMEOUT: Duration = Duration::from_secs(45);
-pub const MODEL_STAGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单个本地模型阶段（可能包含冷启动/首个 token 预热）的最长等待。
+///
+/// 必须大于 [`MODEL_START_TIMEOUT`]（45s），否则冷启动阶段会先被阶段超时
+/// 中止，而启动超时形同虚设（P1-10）。
+pub const MODEL_STAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

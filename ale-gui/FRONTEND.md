@@ -68,10 +68,12 @@ screenshots. Fixture values, including QR codes, are not production state.
 The interactive fixture supports navigation, pause, and confirmation only;
 settings persistence and connection testing belong to the real application.
 
-Phone testing was reported complete by the user. This desktop change was checked
-locally on macOS; these checks do not establish Windows/Linux native model or
-screen-reader acceptance. The real-display capture test remains opt-in because
-it requires screen-recording permission. Slint's current Parley/ICU dependency
+Phone end-to-end testing against this build has **not** been completed: the
+cross-end preview/confirm/terminal sequence is covered only by the desktop-side
+protocol tests. These desktop checks were run locally on macOS and do not
+establish Windows/Linux native model, phone, or screen-reader acceptance. The
+real-display capture test remains opt-in because it requires screen-recording
+permission. Slint's current Parley/ICU dependency
 prints a missing Chinese/Japanese segmentation-model diagnostic in debug visual
 runs; text and wrapping were visually inspected, without changing vendored code
 or suppressing the diagnostic.

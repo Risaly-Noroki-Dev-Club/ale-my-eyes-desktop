@@ -74,18 +74,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Transcribe { audio, output } => {
             let engine = AleEngineFactory::create_default().await?;
+            print_config_warnings(&engine);
             let audio_data = tokio::fs::read(&audio).await?;
             let text = engine.transcribe(&audio_data).await?;
             write_or_print(output, &text).await?;
         }
         Commands::Describe { image, output } => {
             let engine = AleEngineFactory::create_default().await?;
+            print_config_warnings(&engine);
             let image_data = tokio::fs::read(&image).await?;
             let description = engine.describe_image(&image_data).await?;
             write_or_print(output, &description).await?;
         }
         Commands::TestConnection => {
             let engine = AleEngineFactory::create_default().await?;
+            print_config_warnings(&engine);
             match engine.test_cloud_api().await {
                 Ok(true) => {
                     println!("云端连接测试成功");
@@ -105,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Status => {
             let engine = AleEngineFactory::create_default().await?;
+            print_config_warnings(&engine);
             let status = engine.status().await;
             let config = engine.config();
             println!("Ale, My Eyes! CLI");
@@ -117,6 +121,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// headless/无 D-Bus 环境下凭据读取降级为警告；只读命令仍可运行（DC-03）。
+fn print_config_warnings(engine: &ale_core::AleEngine) {
+    for warning in engine.credential_warnings() {
+        eprintln!("warning: {warning}");
+    }
 }
 
 async fn write_or_print(output: Option<PathBuf>, text: &str) -> anyhow::Result<()> {

@@ -1,12 +1,17 @@
 use crate::cloud::{CloudConfig, CloudMessage, FunctionCall, ToolCall};
 use crate::{AleError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 #[cfg(test)]
 #[path = "model_api_tests.rs"]
 pub(crate) mod tests;
+
+/// 单次云响应体的字节上限（流式累计）。恶意/异常端点不能把进程内存拖垮
+/// （本机 4GB 内存场景风险尤其明显，DC-05）。
+pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 tokio::task_local! { pub static DEADLINE: tokio::time::Instant; }
 pub fn deadline() -> tokio::time::Instant {
     DEADLINE
@@ -560,8 +565,44 @@ pub async fn generate(
         _ => builder.bearer_auth(&config.api_key),
     };
     let response = checked(builder.send().await.map_err(network_error)?).await?;
-    let body = response.json().await.map_err(response_error)?;
+    let body = response_json(response).await?;
     parse_response(config, &request, body)
+}
+
+/// 以流式累计方式读取响应并解析 JSON，超过 `limit` 字节立即放弃。
+///
+/// 同时尊重 `Content-Length`（可在下载前拒绝），并对 chunked/无长度响应做
+/// 累计上限，避免先完整缓冲再检查。
+pub(crate) async fn read_limited_json(response: reqwest::Response, limit: usize) -> Result<Value> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ModelCallError::new(
+            ErrorKind::InvalidOutput,
+            "Model response exceeds the size limit",
+        )
+        .into());
+    }
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(response_error)?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(ModelCallError::new(
+                ErrorKind::InvalidOutput,
+                "Model response exceeds the size limit",
+            )
+            .into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| invalid("Malformed model response"))
+}
+
+/// 读取并解析云端 JSON 响应，使用默认的 [`MAX_RESPONSE_BYTES`] 上限。
+pub(crate) async fn response_json(response: reqwest::Response) -> Result<Value> {
+    read_limited_json(response, MAX_RESPONSE_BYTES).await
 }
 pub fn client(config: &CloudConfig) -> reqwest::Client {
     reqwest::Client::builder()

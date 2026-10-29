@@ -206,9 +206,20 @@ impl ContextManager {
     }
 
     /// 简单的 token 估算（1 中文字符 ≈ 2 tokens，1 英文单词 ≈ 1 token）
+    ///
+    /// 必须统一按字符而不是按字节计算：`text.len()` 是 UTF-8 字节数，与 CJK
+    /// 字符数混算会让中文/日文/emoji 文本的估算成倍偏高，导致上下文提前压缩
+    /// 并丢弃仍可容纳的历史（DC-11）。
     fn estimate_tokens(&self, text: &str) -> usize {
-        let chinese_chars = text.chars().filter(|c| *c as u32 > 0x4E00).count();
-        let other_chars = text.len() - chinese_chars;
+        let mut chinese_chars = 0usize;
+        let mut other_chars = 0usize;
+        for character in text.chars() {
+            if character as u32 > 0x4E00 {
+                chinese_chars += 1;
+            } else {
+                other_chars += 1;
+            }
+        }
         chinese_chars * 2 + other_chars / 4
     }
 
@@ -286,5 +297,17 @@ mod tests {
         ctx.clear();
         assert_eq!(ctx.conversation_turns(), 0);
         assert_eq!(ctx.estimated_tokens(), 0);
+    }
+
+    #[test]
+    fn token_estimate_counts_characters_not_utf8_bytes() {
+        let ctx = ContextManager::new(4000);
+        // 纯 ASCII：4 字符 ≈ 1 token。
+        assert_eq!(ctx.estimate_tokens("abcd"), 1);
+        // 纯中文：2 字符 × 2 tokens；旧实现按字节会得到 7（3n - n + 2n）。
+        assert_eq!(ctx.estimate_tokens("中文"), 4);
+        assert_eq!(ctx.estimate_tokens("中文中文"), 8);
+        // 混合文本不按 UTF-8 字节膨胀。
+        assert_eq!(ctx.estimate_tokens("中abcd"), 3);
     }
 }

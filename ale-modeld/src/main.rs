@@ -72,7 +72,17 @@ async fn run_endpoint(endpoint: String, token: Vec<u8>) -> Result<()> {
     let result = async {
         let (stream, _) =
             tokio::time::timeout(std::time::Duration::from_secs(45), listener.accept()).await??;
-        serve_connection(stream, token).await
+        // A panic on an unexpected input must not abort the process mid-connection
+        // without cleanup; a spawned task boundary turns it into a normal error
+        // so the socket is removed and the GUI supervisor can restart modeld.
+        match tokio::spawn(serve_connection(stream, token)).await {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => {
+                tracing::error!(event = "modeld_connection_panicked");
+                anyhow::bail!("modeld connection task panicked")
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     .await;
     let _ = std::fs::remove_file(path);

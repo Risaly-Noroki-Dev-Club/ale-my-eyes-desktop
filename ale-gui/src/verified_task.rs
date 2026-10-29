@@ -12,8 +12,8 @@
 //! a model decision later.
 
 use ale_core::harness::{
-    Approval, Decision, Event, Limits, Operation, OperationKind, Predicate, Receipt, Report,
-    Status, Task, Verdict, WindowIdentity,
+    Approval, Decision, Event, Limits, Observation, Operation, OperationKind, Predicate, Receipt,
+    Report, Status, Task, Verdict, WindowIdentity,
 };
 use ale_core::remote::{CommandPreview, ExecutionState, ExecutionStatus, ProgressStage};
 use serde::Deserialize;
@@ -141,11 +141,15 @@ impl VerifiedStep {
         }
     }
 
-    /// Human readable postcondition for the confirmation screen.
+    /// Human readable postcondition for the confirmation screen. It names the
+    /// control the host will actually read back (`expected`), not the action
+    /// target: the two may differ, and the user must confirm the condition the
+    /// runner verifies rather than the element that receives the input.
     pub fn verification_text(&self) -> String {
         format!(
-            "{}的{}应为「{}」",
-            self.target.describe(),
+            "{}「{}」的{}应为「{}」",
+            role_label(&self.expected.role),
+            self.expected.label,
             property_label(&self.expected.property),
             self.expected.equals
         )
@@ -407,8 +411,9 @@ fn validate_wire_step(index: usize, step: WireStep) -> Result<VerifiedStep, Veri
             ))
         }
         (OperationKind::SetValue, Some(value)) => {
-            let value = validated_text(&field("value"), value, MAX_VALUE_CHARS, false)?;
-            Some(value)
+            // The value is written exactly as confirmed; trimming it here would
+            // desynchronize the input from the untrimmed `expected.equals`.
+            Some(validated_exact_value(&field("value"), value)?)
         }
     };
     let expected = validate_expected(index, step.expected)?;
@@ -480,6 +485,22 @@ fn validated_text(
     Ok(trimmed.to_string())
 }
 
+/// Length check for a value that is written literally (set_value). Leading and
+/// trailing whitespace is meaningful here and is never stripped.
+fn validated_exact_value(field: &str, value: String) -> Result<String, VerifiedTaskError> {
+    if value.is_empty() {
+        return Err(invalid("EMPTY_FIELD", field, "must not be empty"));
+    }
+    if value.chars().count() > MAX_VALUE_CHARS {
+        return Err(invalid(
+            "FIELD_TOO_LONG",
+            field,
+            format!("exceeds {MAX_VALUE_CHARS} characters"),
+        ));
+    }
+    Ok(value)
+}
+
 fn default_summary(
     operation: OperationKind,
     target: &VerifiedTarget,
@@ -541,6 +562,33 @@ pub fn build_task(
         allow_observation_steps: false,
         limits: Limits::default(),
     })
+}
+
+/// True when the host's own success postcondition already holds in the planning
+/// observation. The runner checks the goal before the first decision, so such a
+/// task could report `Completed` with zero actions; the model could also derive
+/// the predicate from the control properties disclosed for planning.
+pub fn task_goal_already_satisfied(task: &Task, observation: &Observation) -> bool {
+    ale_core::harness::verify(observation, &task.success) == Verdict::Satisfied
+}
+
+/// Reject a proposal whose goal is already true before any input is issued.
+///
+/// The host refuses the proposal instead of showing a confirmation card that can
+/// only produce a zero-action "completed" claim. The caller records the stable
+/// diagnostic reason and transparently falls back to the legacy path.
+pub fn reject_pre_satisfied_task(
+    task: &Task,
+    observation: &Observation,
+) -> Result<(), VerifiedTaskError> {
+    if task_goal_already_satisfied(task, observation) {
+        return Err(VerifiedTaskError::new(
+            "GOAL_ALREADY_SATISFIED",
+            "the task success condition already holds in the planning observation; \
+             an action cannot verify it",
+        ));
+    }
+    Ok(())
 }
 
 /// Readable step summaries for `CommandPreview.action_steps`.
@@ -1053,6 +1101,98 @@ mod tests {
         assert_eq!(message.verification.as_ref().map(Vec::len), Some(3));
         assert!(message.requires_confirmation);
         assert!(message.has_plan);
+    }
+
+    #[test]
+    fn verification_text_names_the_expected_control_not_the_action_target() {
+        let proposal = parse(valid_json()).unwrap();
+        // Step 0 clicks the "设置" button but verifies the "当前缩放" text; the
+        // confirmation card must describe the condition the host will read back.
+        assert_eq!(
+            proposal.steps[0].verification_text(),
+            "文本「当前缩放」的值应为「100」"
+        );
+        assert!(!proposal.steps[0]
+            .verification_text()
+            .contains("按钮「设置」"));
+        // When target and expected coincide the text is still correct.
+        assert_eq!(
+            proposal.steps[1].verification_text(),
+            "输入框「缩放」的值应为「125」"
+        );
+    }
+
+    fn observation(nodes: Vec<ale_core::harness::Node>) -> Observation {
+        Observation {
+            sequence: 1,
+            window: window(),
+            nodes,
+        }
+    }
+
+    fn node(
+        id: &str,
+        role: &str,
+        label: &str,
+        property: &str,
+        value: &str,
+    ) -> ale_core::harness::Node {
+        let mut properties = std::collections::BTreeMap::new();
+        properties.insert(property.to_string(), value.to_string());
+        ale_core::harness::Node {
+            id: id.to_string(),
+            role: role.to_string(),
+            label: label.to_string(),
+            enabled: true,
+            properties,
+        }
+    }
+
+    #[test]
+    fn pre_satisfied_goal_is_rejected_before_confirmation() {
+        let proposal = parse(valid_json()).unwrap();
+        let task = build_task(&proposal, "把缩放调到 125 并保存", &window(), true).unwrap();
+        // The success postcondition of the last step ("已保存" text is 125) is
+        // already readable in the planning observation: the model just copied a
+        // current value, so no action could prove the goal.
+        let already_true = observation(vec![node(
+            "1",
+            "ControlType.Text",
+            "已保存",
+            "value",
+            "125",
+        )]);
+        assert!(task_goal_already_satisfied(&task, &already_true));
+        assert_eq!(
+            reject_pre_satisfied_task(&task, &already_true)
+                .unwrap_err()
+                .code,
+            "GOAL_ALREADY_SATISFIED"
+        );
+
+        // A goal that is not readable yet passes the pre-satisfied check.
+        let pending = observation(vec![node(
+            "1",
+            "ControlType.Text",
+            "已保存",
+            "value",
+            "100",
+        )]);
+        assert!(!task_goal_already_satisfied(&task, &pending));
+        assert!(reject_pre_satisfied_task(&task, &pending).is_ok());
+
+        // An invisible goal is unknown, not satisfied, so it is not rejected.
+        let invisible = observation(Vec::new());
+        assert!(reject_pre_satisfied_task(&task, &invisible).is_ok());
+    }
+
+    #[test]
+    fn set_value_keeps_the_confirmed_text_exactly() {
+        let mut value = valid_json();
+        value["steps"][1]["value"] = json!(" 125 ");
+        value["steps"][1]["expected"]["equals"] = json!(" 125 ");
+        let proposal = parse(value).expect("valid proposal");
+        assert_eq!(proposal.steps[1].value.as_deref(), Some(" 125 "));
     }
 
     #[test]

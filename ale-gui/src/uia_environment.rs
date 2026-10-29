@@ -437,7 +437,12 @@ impl UiaBridge for WindowsUiaBridge {
                 )
             }
             Err(error) => {
-                return BridgeReceipt::NotApplied(format!("uia execute helper failed: {error}"))
+                // The helper process may already have been running, so its
+                // failure does not prove that no input was issued. NotApplied is
+                // reserved for errors raised before the helper starts.
+                return BridgeReceipt::Uncertain(format!(
+                    "uia execute helper failed after start: {error}; input state unknown"
+                ));
             }
         };
         if !output.status.success() {
@@ -634,7 +639,7 @@ try {
     $node = $found
   }
   if ([string]$node.Current.ControlType.ProgrammaticName -ne [string]$request.role) { Reply 'not_applied' 'target role changed' }
-  if ([string]$node.Current.Name -ne [string]$request.label) { Reply 'not_applied' 'target label changed' }
+  if (([string]$node.Current.Name).Trim() -ne [string]$request.label) { Reply 'not_applied' 'target label changed' }
   if (-not $node.Current.IsEnabled) { Reply 'not_applied' 'target disabled' }
   if ([string]$request.operation -eq 'invoke') {
     $pattern = $null

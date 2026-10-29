@@ -19,7 +19,7 @@
 
 - 运行器：`ale-core/src/harness/`，不依赖 GUI、Windows、手机或模型守护进程。
 - 生产接线：`ale-gui/src/remote_server.rs` 选择 verified 或 legacy 路径，`verified_task.rs`（schema/校验/Task/预览/状态映射）、`verified_planner.rs`（ScriptedPlanner）、`verified_authorizer.rs`（ConfirmedTaskAuthorizer）、`uia_environment.rs`（Environment + 可注入 `UiaBridge`，Windows 用 PowerShell UIA 桥；非 Windows 返回不可用）。
-- 开关：设置页“已验证任务（实验）”对应 `AppConfig.verified_tasks.enabled`，默认 `true`，仅在平台 UIA 可用、可向云端披露屏幕且请求走云端规划时生效。
+- 开关：设置页“已验证任务（实验）”对应 `AppConfig.verified_tasks.enabled`，默认 `true`，仅在平台 UIA 可用、可向云端披露屏幕且请求走云端规划时生效。观察驱动重规划的宿主开关是 `AppConfig.verified_tasks.allow_observation_steps`（默认 `false`，当前固定步骤生产流程未开启；本版只提供库/配置接线，真实 Windows 验收仍待做）。
 - 预览：verified 模式回给手机的 `CommandPreview` 带 `task_mode="verified"` 与 `verification`（每步可验证后置条件的人类可读列表），手机确认卡据此展示；桌面 Work 页沿用 `confirmation_text` 与 `action_steps`。所有用户可见文本在发送前脱敏。
 - 离线参考实现：`harness-demo` + 确定性模拟器；这不是生产路径。
 
@@ -37,6 +37,7 @@ verified 模式是“配置开关 × 平台能力 × 请求上下文”的组合
 | `6` | 工具参数解析/校验失败（越权操作、非法 property、长度/步数超限等） |
 | `7` | 宿主构建 `Task` 失败 |
 | `8` | 云端返回多个 `propose_verified_task` 调用（必须唯一） |
+| `10` | 提案的成功条件在规划观察中已经成立（操作前即真，无法用动作证明目标），宿主拒绝该提案 |
 
 设置页关闭该功能、或请求本身走本地推理路径时，直接使用 legacy 路径，不记录 unavailable 诊断。回退只影响是否逐步验证，不改变原有问答/确认/执行能力。
 
@@ -52,7 +53,7 @@ verified 模式是“配置开关 × 平台能力 × 请求上下文”的组合
 
 - `Environment::observe` 提供新采集的状态，序号必须递增。窗口使用进程 ID 和窗口 ID（Windows 为 HWND 字符串），不能只用标题。控件 ID 在同一观察内唯一（UIA 实现用树路径）；适配器不能仅依赖可能为空或重复的 UIA AutomationId。
 - `Planner` 接收当前状态、原始任务与此前每次尝试的回执和验证结果。生产 verified 路径使用 `ScriptedPlanner` 按用户确认过的步骤顺序取下一步：目标 0 个或多个匹配、步骤偏离确认内容时返回 `NeedHelp`；离线/云端适配器（`CloudPlanner`）强制一个符合 schema 的 `next_task_step` 工具调用。不接受任意命令、多动作或模型授权。
-- 云端只接收结构化状态（role/label/property 等），不自动发送截图；生产 verified 路径要求本次请求已获得截图/云端披露授权（`allow_full_screenshot`）。宿主负责去除密码、令牌等不应披露的信息。运行器会在调用云端规划器前检查授权；内置云端适配器也独立检查。
+- 云端接收结构化状态（role/label/enabled 与 value/toggle/selected 等属性文本，控件文本属于披露内容）；生产 verified 路径要求本次请求已获得截图/云端披露授权（`allow_full_screenshot`），决策文案会说明上传的是“完整桌面截图与无障碍控件树（含控件文本）”。宿主在发送前过滤不应披露的信息：密码类控件（名称含 password/密码/验证码/令牌等）、掩码值与形似凭据的值整体省略，其余属性值限制为 120 字符；这不能替代用户授权，只缩小已授权范围内的泄露面。运行器会在调用云端规划器前检查授权；内置云端适配器也独立检查。
 - 工具只有 `Invoke` 和精确替换的 `SetValue`，没有追加输入、坐标点击、脚本或文件工具。`SetValue` 的可重试性依赖适配器真正实现“设置为该值”，不能映射成不清空内容的键盘输入。
 - `Authorizer` 是必须提供的宿主接口。生产 `ConfirmedTaskAuthorizer` 只在窗口、操作、目标与已确认步骤完全匹配时 `Allow`，偏离则 `NeedsUser`；没有默认同意实现。任务中的操作种类只是上限；宿主仍需检查目标、内容、后果，以及当前用户授权是否覆盖该动作。模拟器的 `SettingsGrant` 仅用于离线演示，禁止用于真实桌面。
 - 授权之后再次采集。节点发生变化时，旧批准不用于新动作，重新决策和授权。随后 `Environment::execute` 还必须紧贴实际输入检查窗口、目标身份、可用性和状态，覆盖观察与执行之间的竞争。
@@ -61,9 +62,9 @@ verified 模式是“配置开关 × 平台能力 × 请求上下文”的组合
 
 #### 不预知下一页的观察与重规划
 
-宿主可以在 `Task` 中显式启用 `allow_observation_steps`（缺省为 `false`）。这是一项执行策略授权，不是应用的页面转换说明，也不是模型可以修改的权限。启用后，`CloudPlanner` 对未知下一页的 `Invoke` 可以返回 `expected: []`，避免臆造尚未看到的控件名称；`SetValue` 仍必须提供精确读回条件。已有固定步骤的生产 `ScriptedPlanner` / `ConfirmedTaskAuthorizer` 保持严格模式，不自动启用此选项。
+宿主可以在 `Task` 中显式启用 `allow_observation_steps`（缺省为 `false`）。这是一项执行策略授权，不是应用的页面转换说明，也不是模型可以修改的权限。宿主接线点：`AppConfig.verified_tasks.allow_observation_steps`（serde default `false`，见 `ale-core/src/config.rs`）由生产宿主在构建 `Task` 时传入；当前固定步骤的生产流程与 CLI `harness-demo` 都保持关闭。启用后，`CloudPlanner` 对未知下一页的 `Invoke` 可以返回 `expected: []`，避免臆造尚未看到的控件名称；`SetValue` 仍必须提供精确读回条件，且该约束在 `next_task_step` 工具 schema 层就强制（观察模式只放宽 Invoke 的 `expected.minItems`，SetValue 分支始终为 1），不会再把 schema 合法的空 `expected` 交回运行器。
 
-这种步骤仍须逐次通过宿主授权、固定窗口检查和执行前重新观察。仅当回执为 `Dispatched`，且新观察的语义状态确实变化，运行器才继续决策；下一次决策接收实际的新页面及尝试历史。比较忽略采集序号、节点临时 ID 和枚举顺序，避免把重新采集本身算成进展。`Attempt.observation_changed` / `ObservationChecked` 记录界面变化，步骤 `verdict` 仍为 `Unknown`，不会伪造已验证的后置条件。界面变化不证明特定动作效果，更不能代替 `Task.success` 的最终目标核验。
+这种步骤仍须逐次通过宿主授权、固定窗口检查和执行前重新观察。仅当回执为 `Dispatched`，且新观察的语义状态确实变化，运行器才继续决策；下一次决策接收实际的新页面及尝试历史。比较忽略采集序号、节点临时 ID 和枚举顺序，避免把重新采集本身算成进展。`Attempt.observation_changed` 记录原始观察差异（任何回执）；进度事件 `ObservationChecked.changed` 只在回执为 `Dispatched` 时为 `true`，`NotApplied` / `Uncertain` 时固定为 `false`，避免与最终结论矛盾的“界面已变化”文案。步骤 `verdict` 仍为 `Unknown`，不会伪造已验证的后置条件。界面变化不证明特定动作效果，更不能代替 `Task.success` 的最终目标核验。
 
 点击后始终没有变化、执行回执不确定、输入后读不到界面、窗口变化时仍停止。已发出的观察型点击，如果再次回到相同语义状态并选择相同 role/label 的目标，会交还用户；改写节点 ID 或补写一个预测条件不能绕过这个检查。明确 `NotApplied` 的动作仍可在预算内重新决策。动作、决策、期限与连续无进展上限继续生效；动态界面变化不提供任意脚本或额外操作权限。
 
@@ -104,7 +105,7 @@ bash scripts/verify-pc-issues.sh
 cargo check -p ale-gui --target x86_64-pc-windows-gnu
 ```
 
-CLI 输出 JSON，包含任务契约、观察、决策、授权、工具回执、步骤/目标验证、耗时和终止原因。完成退出码为 0，其他任务结果为 2，参数/文件错误为 1。
+CLI 输出 JSON，包含任务契约、观察、决策、授权、工具回执、步骤/目标验证、耗时和终止原因。退出码与 clap/实际路径一致：任务完成（`Status::Completed`）为 0；任务未完成（`needs_user` / `outcome_unknown` 等非 completed 终态）为 2；clap 参数解析错误（未知参数、缺少必填参数）为 2；其他运行错误（未知 task/scenario、文件读写、配置/凭据错误）为 1。`harness-demo --help` 只列出默认值，合法 task/scenario 取值不在 help 中枚举。
 
 评测运行三个任务 × 八种环境，共 24 个案例；保存每次轨迹及 `target/harness-evaluation/summary.json`。报告区分“符合预期的停止”与“任务完成”，不能把 24 个预期结果都当作 24 个用户任务成功。模拟任务分别为保存缩放、主题和静音设置，均经过菜单、设置页、修改草稿、保存及已生效值读回。CI 的 `harness-evaluation` job 会构建 `ale-cli` 并运行同一脚本；`target/` 下的轨迹与日志是生成产物，不提交。
 

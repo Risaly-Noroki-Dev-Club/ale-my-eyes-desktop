@@ -7,6 +7,14 @@ const TRANSCRIPTION_ACCOUNT: &str = "transcription";
 
 /// Stores credentials outside the application configuration file.
 pub trait SecretStore: Send + Sync {
+    /// Whether the OS credential backend is currently reachable.
+    ///
+    /// Hosts on headless/container systems (no D-Bus/Secret Service) return
+    /// `false`; configuration loading and saving then degrade to warnings instead
+    /// of failing, so read-only commands keep working (DC-03).
+    fn backend_available(&self) -> bool {
+        true
+    }
     fn get_transcription_api_key(&self) -> Result<Option<String>> {
         Ok(None)
     }
@@ -50,6 +58,24 @@ impl SystemSecretStore {
 }
 
 impl SecretStore for SystemSecretStore {
+    /// Probe the default credential store with a read-only lookup.
+    ///
+    /// `NoEntry` (or a recovered/ambiguous entry) proves the backend is reachable;
+    /// platform/storage failures and a missing default store indicate the headless
+    /// environments that must degrade instead of failing configuration loading.
+    fn backend_available(&self) -> bool {
+        match Self::entry(ACCOUNT) {
+            Ok(entry) => !matches!(
+                entry.get_password(),
+                Err(keyring::Error::PlatformFailure(_)
+                    | keyring::Error::NoStorageAccess(_)
+                    | keyring::Error::NoDefaultStore
+                    | keyring::Error::NotSupportedByStore(_))
+            ),
+            Err(_) => false,
+        }
+    }
+
     fn get_transcription_api_key(&self) -> Result<Option<String>> {
         match Self::entry(TRANSCRIPTION_ACCOUNT)?.get_password() {
             Ok(key) => Ok(Some(key)),

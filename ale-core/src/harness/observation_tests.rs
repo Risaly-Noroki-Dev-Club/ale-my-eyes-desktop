@@ -380,3 +380,41 @@ async fn invented_postconditions_cannot_bypass_the_exploration_replay_guard() {
     assert_eq!(environment.0.actions, 2);
     assert!(report.reason.contains("already visited state"));
 }
+
+/// `NotApplied` 回执即使伴随界面变化，也不能被报告为“界面已变化”进度（DC-06）。
+struct NotAppliedButChanged(Desktop);
+
+#[async_trait]
+impl Environment for NotAppliedButChanged {
+    async fn observe(&mut self) -> Result<Observation, String> {
+        self.0.observe().await
+    }
+    async fn execute(&mut self, request: &ActionRequest) -> Receipt {
+        self.0.execute(request).await;
+        Receipt::NotApplied("input refused by adapter".into())
+    }
+}
+
+#[tokio::test]
+async fn observation_checked_reports_changed_only_for_dispatched_receipts() {
+    let mut environment = NotAppliedButChanged(Desktop::new(Scenario::Normal));
+    let report = run_synthetic(&mut environment).await;
+    let observation_events: Vec<_> = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ObservationChecked { changed, .. } => Some(*changed),
+            _ => None,
+        })
+        .collect();
+    assert!(!observation_events.is_empty());
+    assert!(
+        observation_events.iter().all(|changed| !changed),
+        "NotApplied receipts must not report a UI change as progress: {observation_events:?}"
+    );
+    // 原始观察证据仍然保留（Attempt 字段语义不变）。
+    assert!(report
+        .attempts
+        .iter()
+        .any(|attempt| attempt.observation_changed));
+}

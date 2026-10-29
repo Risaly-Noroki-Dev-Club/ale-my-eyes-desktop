@@ -88,8 +88,8 @@ impl AleEngine {
     }
 
     fn build_transcription_api(config: &config::TranscriptionConfig) -> Option<RemoteCloudApi> {
-        config
-            .enabled
+        // headless 无凭据后端时 key 为空：不构造端点，转写按未初始化明确报错。
+        (config.enabled && !config.endpoint.api_key.trim().is_empty())
             .then(|| RemoteCloudApi::new(Self::cloud_config_from_app(&config.endpoint)))
     }
 
@@ -97,6 +97,26 @@ impl AleEngine {
         self.cloud_api
             .as_ref()
             .ok_or(AleError::NotInitialized("Cloud API"))
+    }
+
+    /// 云端调用前统一的 API key 前置校验，给出明确错误而不是 `Not initialized`。
+    fn require_cloud_api_key(&self) -> Result<()> {
+        if self
+            .config_manager
+            .config()
+            .cloud_api
+            .api_key
+            .trim()
+            .is_empty()
+        {
+            return Err(AleError::ConfigError("API key is required".to_string()));
+        }
+        Ok(())
+    }
+
+    /// 凭据后端不可用等非致命配置警告（headless/无 D-Bus 环境）。
+    pub fn credential_warnings(&self) -> &[String] {
+        self.config_manager.credential_warnings()
     }
 
     fn vision_question_with_context(&self, question: &str) -> String {
@@ -130,37 +150,21 @@ impl AleEngine {
 
     /// 检查云端 API 是否可用。
     pub async fn test_cloud_api(&self) -> Result<bool> {
-        if self
-            .config_manager
-            .config()
-            .cloud_api
-            .api_key
-            .trim()
-            .is_empty()
-        {
-            return Err(AleError::ConfigError("API key is required".to_string()));
-        }
+        self.require_cloud_api_key()?;
         self.cloud()?.health_check().await
     }
 
     /// 纯文本问答（无屏幕截图或相机画面时使用）。
     pub async fn ask_text(&self, question: &str) -> Result<cloud::CloudResponse> {
-        if self
-            .config_manager
-            .config()
-            .cloud_api
-            .api_key
-            .trim()
-            .is_empty()
-        {
-            return Err(AleError::ConfigError("API key is required".to_string()));
-        }
+        self.require_cloud_api_key()?;
         let messages = self.context_manager.build_messages(question);
         self.cloud()?.chat(messages).await
     }
 
     /// 图像描述（云端视觉模型）。
     pub async fn describe_image(&self, image_data: &[u8]) -> Result<String> {
+        // 与 ask_text/test_cloud_api 一致：未配置 key 时给出明确错误（DC-12）。
+        self.require_cloud_api_key()?;
         let response = self
             .cloud()?
             .vision(image_data, "请描述这张图片的内容")
@@ -175,6 +179,7 @@ impl AleEngine {
         question: &str,
         tools: Vec<serde_json::Value>,
     ) -> Result<cloud::VisionResponse> {
+        self.require_cloud_api_key()?;
         let question = self.vision_question_with_context(question);
         self.cloud()?
             .vision_ask(image_data, &question, Some(tools))
@@ -414,5 +419,35 @@ mod tests {
     fn test_engine_status_default() {
         let status = EngineStatus { cloud_ready: false };
         assert!(!status.cloud_ready);
+    }
+
+    #[tokio::test]
+    async fn describe_image_without_api_key_reports_configuration_error() {
+        struct EmptyStore;
+        impl secret_store::SecretStore for EmptyStore {
+            fn get_api_key(&self) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn set_api_key(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn delete_api_key(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ale-no-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&config::AppConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let engine = AleEngine::new_with_secret_store(&path, Arc::new(EmptyStore))
+            .await
+            .unwrap();
+        let error = engine.describe_image(b"not-an-image").await.unwrap_err();
+        assert!(error.to_string().contains("API key is required"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

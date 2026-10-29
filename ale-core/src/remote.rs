@@ -8,6 +8,29 @@ pub const MAX_RECORDING_SECONDS: u64 = 60;
 pub const MIN_SAMPLE_RATE_HZ: u32 = 8_000;
 pub const MAX_SAMPLE_RATE_HZ: u32 = 96_000;
 
+/// Number of characters in a Misaka-Network v4 pairing code.
+pub const PAIRING_CODE_CHARS: usize = 8;
+/// Crockford Base32 alphabet; deliberately excludes `I`, `L`, `O` and `U`.
+pub const PAIRING_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Canonicalize a pairing code: exactly [`PAIRING_CODE_CHARS`] ASCII
+/// Crockford Base32 characters, case-insensitive, returned upper-case.
+/// Ambiguous characters (`I`, `L`, `O`, `U`) and every other byte are rejected.
+pub fn normalize_pairing_code(code: &str) -> Option<String> {
+    if code.len() != PAIRING_CODE_CHARS {
+        return None;
+    }
+    let mut normalized = String::with_capacity(PAIRING_CODE_CHARS);
+    for byte in code.bytes() {
+        let upper = byte.to_ascii_uppercase();
+        if !PAIRING_CODE_ALPHABET.contains(&upper) {
+            return None;
+        }
+        normalized.push(char::from(upper));
+    }
+    Some(normalized)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteMessage {
@@ -289,9 +312,8 @@ impl PairingInfo {
         let session_id = session_id.ok_or_else(|| "缺少 sid".to_string())?;
         Uuid::parse_str(&session_id).map_err(|_| "sid 无效".to_string())?;
         let code = code.ok_or_else(|| "缺少配对码".to_string())?;
-        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("配对码必须是六位数字".to_string());
-        }
+        let code = normalize_pairing_code(&code)
+            .ok_or_else(|| "配对码必须是 8 位 Crockford Base32 字符".to_string())?;
         let name = name.unwrap_or_else(|| "Desktop".to_string());
         if name.trim().is_empty() || name.len() > 128 {
             return Err("设备名称无效".to_string());
@@ -321,7 +343,7 @@ mod tests {
             host: "192.168.1.2".to_string(),
             port: 37654,
             session_id: Uuid::new_v4().to_string(),
-            code: "123456".to_string(),
+            code: "7Q2M9X4B".to_string(),
             name: "MacBook".to_string(),
         };
 
@@ -331,20 +353,70 @@ mod tests {
     #[test]
     fn pairing_uri_rejects_missing_or_weak_credentials() {
         assert!(PairingInfo::from_uri(
-            "misaka-network://pair?host=192.168.1.2&port=37654&code=123456"
+            "misaka-network://pair?host=192.168.1.2&port=37654&code=7Q2M9X4B"
         )
         .is_err());
-        assert!(PairingInfo::from_uri(&format!(
-            "misaka-network://pair?host=192.168.1.2&port=37654&sid={}&code=12345x",
+        for code in [
+            "7Q2M9X4",
+            "7Q2M9X4BB",
+            "7Q2M-9X4",
+            "7Q2M9X4I",
+            "7Q2M9X4L",
+            "7Q2M9X4O",
+            "7Q2M9X4U",
+            "7q2m9x4!",
+        ] {
+            let uri = format!(
+                "misaka-network://pair?host=192.168.1.2&port=37654&sid={}&code={code}",
+                Uuid::new_v4()
+            );
+            assert!(
+                PairingInfo::from_uri(&uri).is_err(),
+                "pairing code {code:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pairing_uri_normalizes_lowercase_crockford_code() {
+        let uri = format!(
+            "misaka-network://pair?host=192.168.1.2&port=37654&sid={}&code=7q2m9x4b",
             Uuid::new_v4()
-        ))
-        .is_err());
+        );
+        let info = PairingInfo::from_uri(&uri).unwrap();
+        assert_eq!(info.code, "7Q2M9X4B");
+        assert_eq!(PairingInfo::from_uri(&info.uri()).unwrap(), info);
+    }
+
+    #[test]
+    fn pairing_code_normalizer_accepts_only_eight_crockford_characters() {
+        assert_eq!(
+            normalize_pairing_code("7q2m9x4b").as_deref(),
+            Some("7Q2M9X4B")
+        );
+        assert_eq!(
+            normalize_pairing_code("01234567").as_deref(),
+            Some("01234567")
+        );
+        assert_eq!(
+            normalize_pairing_code("ABCDEFGH").as_deref(),
+            Some("ABCDEFGH")
+        );
+        assert!(normalize_pairing_code("0123456").is_none());
+        assert!(normalize_pairing_code("012345678").is_none());
+        for ambiguous in ["0123456I", "0123456L", "0123456O", "0123456U"] {
+            assert!(
+                normalize_pairing_code(ambiguous).is_none(),
+                "{ambiguous} must be rejected"
+            );
+        }
+        assert!(normalize_pairing_code("0123456-").is_none());
     }
 
     #[test]
     fn pairing_uri_rejects_legacy_scheme() {
         let legacy = format!(
-            "ale-my-eyes://pair?host=192.168.1.2&port=37654&sid={}&code=123456",
+            "ale-my-eyes://pair?host=192.168.1.2&port=37654&sid={}&code=7Q2M9X4B",
             Uuid::new_v4()
         );
         assert!(PairingInfo::from_uri(&legacy).is_err());
